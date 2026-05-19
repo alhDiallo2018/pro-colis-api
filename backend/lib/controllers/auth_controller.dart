@@ -1,17 +1,17 @@
 import 'dart:convert';
+
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
 import 'package:uuid/uuid.dart';
+
+import '../services/database_service.dart';
 import '../services/email_service.dart';
 
 class AuthController {
   final EmailService emailService;
-  final Map<String, Map<String, dynamic>> users;
   final _uuid = const Uuid();
-  
-  final Map<String, Map<String, dynamic>> _otps = {};
 
-  AuthController({required this.emailService, required this.users});
+  AuthController({required this.emailService});
 
   Router get router {
     final router = Router();
@@ -28,26 +28,64 @@ class AuthController {
       final body = await request.readAsString();
       final data = jsonDecode(body);
       
-      final userId = _uuid.v4();
-      final user = {
-        'id': userId,
-        'email': data['email'],
-        'phone': data['phone'],
-        'fullName': data['fullName'],
-        'password': data['password'],
-        'role': 'client',
-        'createdAt': DateTime.now().toIso8601String(),
-      };
+      // Validation des champs requis
+      final requiredFields = ['email', 'phone', 'fullName', 'password'];
+      for (var field in requiredFields) {
+        if (data[field] == null || data[field].toString().isEmpty) {
+          return Response.badRequest(body: jsonEncode({
+            'success': false,
+            'message': 'Le champ $field est requis',
+          }));
+        }
+      }
       
-      users[userId] = user;
+      final userId = _uuid.v4();
+      final pin = (100000 + DateTime.now().millisecondsSinceEpoch % 900000).toString();
+      
+      final db = await DatabaseService.getInstance();
+      
+      // Vérifier si l'utilisateur existe déjà
+      final existingUser = await db.connection.execute(
+        'SELECT id FROM users WHERE email = \$1 OR phone = \$2',
+        parameters: [data['email'], data['phone']],
+      );
+      
+      if (existingUser.isNotEmpty) {
+        return Response(409, body: jsonEncode({
+          'success': false,
+          'message': 'Un utilisateur avec cet email ou téléphone existe déjà',
+        }));
+      }
+      
+      // Insérer l'utilisateur dans PostgreSQL
+      await db.connection.execute('''
+        INSERT INTO users (id, email, phone, full_name, password_hash, role, pin, created_at, updated_at)
+        VALUES (\$1, \$2, \$3, \$4, \$5, \$6, \$7, NOW(), NOW())
+      ''', parameters: [
+        userId,
+        data['email'],
+        data['phone'],
+        data['fullName'],
+        data['password'],
+        'client',
+        pin,
+      ]);
       
       // Générer et envoyer OTP
       final otpCode = (100000 + DateTime.now().millisecondsSinceEpoch % 900000).toString();
-      _otps[userId] = {
-        'code': otpCode,
-        'expiresAt': DateTime.now().add(const Duration(minutes: 10)).toIso8601String(),
-        'attempts': 0,
-      };
+      final expiresAt = DateTime.now().add(const Duration(minutes: 10));
+      
+      // Stocker l'OTP dans la base de données
+      await db.connection.execute('''
+        INSERT INTO otps (id, user_id, code, type, expires_at, created_at)
+        VALUES (\$1, \$2, \$3, \$4, \$5, NOW())
+      ''', parameters: [
+        _uuid.v4(),
+        userId,
+        otpCode,
+        'verification',
+        expiresAt.toIso8601String(),
+      ]);
       
       await emailService.sendOtpCode(data['email'], otpCode, 'verification');
       
@@ -55,8 +93,10 @@ class AuthController {
         'success': true,
         'message': 'Compte créé avec succès',
         'userId': userId,
+        'pin': pin,
       }));
     } catch (e) {
+      print('❌ Erreur inscription: $e');
       return Response.internalServerError(body: jsonEncode({
         'success': false,
         'message': 'Erreur lors de l\'inscription: $e',
@@ -70,32 +110,45 @@ class AuthController {
       final data = jsonDecode(body);
       final identifier = data['identifier'];
       
-      String? userId;
-      String? email;
+      final db = await DatabaseService.getInstance();
       
-      for (var entry in users.entries) {
-        if (entry.value['email'] == identifier || entry.value['phone'] == identifier) {
-          userId = entry.key;
-          email = entry.value['email'];
-          break;
-        }
-      }
+      // Chercher l'utilisateur par email ou téléphone
+      final result = await db.connection.execute('''
+        SELECT id, email FROM users WHERE email = \$1 OR phone = \$1
+      ''', parameters: [identifier]);
       
-      if (userId == null) {
+      if (result.isEmpty) {
         return Response.notFound(jsonEncode({
           'success': false,
           'message': 'Utilisateur non trouvé',
         }));
       }
       
-      final otpCode = (100000 + DateTime.now().millisecondsSinceEpoch % 900000).toString();
-      _otps[userId] = {
-        'code': otpCode,
-        'expiresAt': DateTime.now().add(const Duration(minutes: 10)).toIso8601String(),
-        'attempts': 0,
-      };
+      final userId = result.first[0] as String;
+      final email = result.first[1] as String;
       
-      await emailService.sendOtpCode(email!, otpCode, 'login');
+      final otpCode = (100000 + DateTime.now().millisecondsSinceEpoch % 900000).toString();
+      final expiresAt = DateTime.now().add(const Duration(minutes: 10));
+      
+      // Supprimer les anciens OTP
+      await db.connection.execute(
+        'DELETE FROM otps WHERE user_id = \$1',
+        parameters: [userId],
+      );
+      
+      // Stocker le nouvel OTP
+      await db.connection.execute('''
+        INSERT INTO otps (id, user_id, code, type, expires_at, created_at)
+        VALUES (\$1, \$2, \$3, \$4, \$5, NOW())
+      ''', parameters: [
+        _uuid.v4(),
+        userId,
+        otpCode,
+        'login',
+        expiresAt.toIso8601String(),
+      ]);
+      
+      await emailService.sendOtpCode(email, otpCode, 'login');
       
       return Response.ok(jsonEncode({
         'success': true,
@@ -103,6 +156,7 @@ class AuthController {
         'userId': userId,
       }));
     } catch (e) {
+      print('❌ Erreur envoi OTP: $e');
       return Response.internalServerError(body: jsonEncode({
         'success': false,
         'message': 'Erreur lors de l\'envoi: $e',
@@ -117,52 +171,121 @@ class AuthController {
       final userId = data['userId'];
       final code = data['code'];
       
-      final otpData = _otps[userId];
+      print('🔐 Vérification OTP - UserId: $userId, Code: $code');
       
-      if (otpData == null) {
+      final db = await DatabaseService.getInstance();
+      
+      // Récupérer l'OTP
+      final otpResult = await db.connection.execute('''
+        SELECT code, expires_at, attempts FROM otps 
+        WHERE user_id = \$1 
+        ORDER BY created_at DESC 
+        LIMIT 1
+      ''', parameters: [userId]);
+      
+      if (otpResult.isEmpty) {
         return Response.badRequest(body: jsonEncode({
           'success': false,
           'message': 'Aucun code OTP trouvé',
         }));
       }
       
-      if (DateTime.now().isAfter(DateTime.parse(otpData['expiresAt']))) {
+      final storedCode = otpResult.first[0] as String;
+      final expiresAtValue = otpResult.first[1];
+      int attempts = otpResult.first[2] as int;
+      
+      // Gérer le cas où expires_at peut être DateTime ou String
+      DateTime expiresAt;
+      if (expiresAtValue is DateTime) {
+        expiresAt = expiresAtValue;
+      } else if (expiresAtValue is String) {
+        expiresAt = DateTime.parse(expiresAtValue);
+      } else {
+        return Response.badRequest(body: jsonEncode({
+          'success': false,
+          'message': 'Format de date invalide',
+        }));
+      }
+      
+      print('🔐 Stored code: $storedCode, Expires at: $expiresAt, Attempts: $attempts');
+      
+      if (DateTime.now().isAfter(expiresAt)) {
         return Response.badRequest(body: jsonEncode({
           'success': false,
           'message': 'Le code OTP a expiré',
         }));
       }
       
-      if (otpData['attempts'] >= 5) {
+      if (attempts >= 5) {
         return Response.badRequest(body: jsonEncode({
           'success': false,
           'message': 'Trop de tentatives',
         }));
       }
       
-      if (otpData['code'] != code) {
-        _otps[userId] = {
-          ...otpData,
-          'attempts': otpData['attempts'] + 1,
-        };
+      if (storedCode != code) {
+        attempts++;
+        await db.connection.execute(
+          'UPDATE otps SET attempts = \$1 WHERE user_id = \$2',
+          parameters: [attempts, userId],
+        );
         return Response.badRequest(body: jsonEncode({
           'success': false,
           'message': 'Code OTP incorrect',
         }));
       }
       
-      _otps.remove(userId);
+      // Supprimer l'OTP utilisé
+      await db.connection.execute(
+        'DELETE FROM otps WHERE user_id = \$1',
+        parameters: [userId],
+      );
       
-      final user = users[userId];
+      // Récupérer l'utilisateur
+      final userResult = await db.connection.execute('''
+        SELECT id, email, phone, full_name, role, pin, created_at 
+        FROM users WHERE id = \$1
+      ''', parameters: [userId]);
+      
+      if (userResult.isEmpty) {
+        return Response.notFound(jsonEncode({
+          'success': false,
+          'message': 'Utilisateur non trouvé',
+        }));
+      }
+      
+      final createdAtValue = userResult.first[6];
+      DateTime createdAt;
+      if (createdAtValue is DateTime) {
+        createdAt = createdAtValue;
+      } else if (createdAtValue is String) {
+        createdAt = DateTime.parse(createdAtValue);
+      } else {
+        createdAt = DateTime.now();
+      }
+      
+      final user = {
+        'id': userResult.first[0] as String,
+        'email': userResult.first[1] as String,
+        'phone': userResult.first[2] as String,
+        'fullName': userResult.first[3] as String,
+        'role': userResult.first[4] as String,
+        'pin': userResult.first[5] as String,
+        'createdAt': createdAt.toIso8601String(),
+      };
+      
+      print('✅ OTP vérifié avec succès pour user: ${user['email']}');
       
       return Response.ok(jsonEncode({
         'success': true,
         'message': 'Authentification réussie',
-        'accessToken': 'token_${user!['id']}',
+        'accessToken': 'token_${user['id']}',
         'refreshToken': 'refresh_${user['id']}',
         'user': user,
       }));
     } catch (e) {
+      print('❌ Erreur vérification OTP: $e');
+      print('Stack trace: ${StackTrace.current}');
       return Response.internalServerError(body: jsonEncode({
         'success': false,
         'message': 'Erreur lors de la vérification: $e',

@@ -30,29 +30,37 @@ class AuthNotifier extends StateNotifier<AuthState> {
   }
 
   Future<Map<String, dynamic>> verifyOtp({
-    required String userId,
-    required String code,
-    required String type,
-  }) async {
-    try {
-      final result = await _apiService.verifyOtp(userId, code, type);
-      if (result['success'] == true) {
-        final userData = result['user'];
-        if (userData != null) {
-          final user = User.fromJson(userData);
-          state = AuthState.authenticated(user);
-        } else {
-          state = AuthState.authenticated(null);
-        }
+  required String userId,
+  required String code,
+  required String type,
+}) async {
+  try {
+    final result = await _apiService.verifyOtp(userId, code, type);
+    print('🔐 Résultat verifyOtp: $result');
+    
+    if (result['success'] == true) {
+      print('✅ OTP vérifié avec succès');
+      print('📦 AccessToken reçu: ${result['accessToken']}');
+      
+      final userData = result['user'];
+      if (userData != null) {
+        final user = User.fromJson(userData);
+        state = AuthState.authenticated(user);
+        print('👤 Utilisateur authentifié: ${user.fullName}');
       } else {
-        state = AuthState.error(result['message'] ?? 'Code invalide');
+        state = AuthState.authenticated(null);
       }
-      return result;
-    } catch (e) {
-      state = AuthState.error(e.toString());
-      return {'success': false, 'message': e.toString()};
+    } else {
+      print('❌ Échec vérification OTP: ${result['message']}');
+      state = AuthState.error(result['message'] ?? 'Code invalide');
     }
+    return result;
+  } catch (e) {
+    print('❌ Exception verifyOtp: $e');
+    state = AuthState.error(e.toString());
+    return {'success': false, 'message': e.toString()};
   }
+}
 
   // MÉTHODE REGISTER COMPLÈTE (avec tous les paramètres optionnels)
   Future<Map<String, dynamic>> register({

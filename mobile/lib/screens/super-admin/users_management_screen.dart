@@ -3,8 +3,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../models/user.dart';
 import '../../services/api_service.dart';
-// ignore: unused_import
-import '../../widgets/custom_button.dart';
 import '../../widgets/custom_text_field.dart';
 
 class UsersManagementScreen extends ConsumerStatefulWidget {
@@ -19,6 +17,7 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
   List<User> _users = [];
   List<User> _filteredUsers = [];
   bool _isLoading = true;
+  bool _isProcessing = false;
   String _searchQuery = '';
   UserRole? _selectedRole;
   UserStatus? _selectedStatus;
@@ -62,10 +61,19 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
 
   Future<void> _loadUsers() async {
     setState(() => _isLoading = true);
-    _users = await _apiService.getAllUsers();
-    _applyFilters();
-    if (mounted) {
-      setState(() => _isLoading = false);
+    try {
+      _users = await _apiService.getAllUsersSuperAdmin();
+      _applyFilters();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Erreur: $e'), backgroundColor: Colors.red),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
     }
   }
 
@@ -129,8 +137,8 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
   void _showUserDialog({required bool isEditing}) {
     showDialog(
       context: context,
-      barrierDismissible: false,
-      builder: (context) => StatefulBuilder(
+      barrierDismissible: !_isProcessing,
+      builder: (dialogContext) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: Text(isEditing ? 'Modifier l\'utilisateur' : 'Nouvel utilisateur'),
           content: SingleChildScrollView(
@@ -189,7 +197,7 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<UserRole>(
-                    initialValue: _selectedRoleForm,
+                    value: _selectedRoleForm,
                     decoration: const InputDecoration(
                       labelText: 'Rôle',
                       prefixIcon: Icon(Icons.admin_panel_settings),
@@ -209,7 +217,7 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<UserStatus>(
-                    initialValue: _selectedStatusForm,
+                    value: _selectedStatusForm,
                     decoration: const InputDecoration(
                       labelText: 'Statut',
                       prefixIcon: Icon(Icons.badge),
@@ -236,7 +244,7 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<Gender>(
-                    initialValue: _selectedGender,
+                    value: _selectedGender,
                     decoration: const InputDecoration(
                       labelText: 'Genre',
                       prefixIcon: Icon(Icons.person_outline),
@@ -269,7 +277,7 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
                     ),
                     const SizedBox(height: 12),
                     DropdownButtonFormField<DriverStatus>(
-                      initialValue: _selectedDriverStatus,
+                      value: _selectedDriverStatus,
                       decoration: const InputDecoration(
                         labelText: 'Statut chauffeur',
                         prefixIcon: Icon(Icons.delivery_dining),
@@ -297,16 +305,11 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
                   ],
                   if (!isEditing) ...[
                     const SizedBox(height: 12),
-                    TextFormField(
+                    CustomTextField(
                       controller: _pinController,
-                      decoration: const InputDecoration(
-                        labelText: 'Code PIN (6 chiffres)',
-                        prefixIcon: Icon(Icons.pin),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(12))),
-                      ),
+                      label: 'Code PIN (6 chiffres)',
+                      prefixIcon: Icons.pin,
                       keyboardType: TextInputType.number,
-                      maxLength: 6,
-                      buildCounter: (context, {required currentLength, required isFocused, maxLength}) => null,
                     ),
                   ],
                 ],
@@ -315,19 +318,21 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
           ),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: _isProcessing ? null : () => Navigator.pop(dialogContext),
               child: const Text('Annuler'),
             ),
             ElevatedButton(
-              onPressed: () async {
+              onPressed: _isProcessing ? null : () async {
                 if (_formKey.currentState!.validate()) {
+                  setDialogState(() => _isProcessing = true);
                   if (isEditing) {
                     await _updateUser();
                   } else {
                     await _createUser();
                   }
+                  setDialogState(() => _isProcessing = false);
                   if (mounted) {
-                    Navigator.pop(context);
+                    Navigator.pop(dialogContext);
                   }
                 }
               },
@@ -342,7 +347,7 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
 
   Future<void> _createUser() async {
     final pin = _pinController.text.isEmpty ? '123456' : _pinController.text;
-    final result = await _apiService.createUserByAdmin(
+    final result = await _apiService.createUserSuperAdmin(
       fullName: _fullNameController.text.trim(),
       email: _emailController.text.trim(),
       phone: _phoneController.text.trim(),
@@ -360,9 +365,11 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
     
     if (result['success'] == true && mounted) {
       await _loadUsers();
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Utilisateur créé avec succès'), backgroundColor: Colors.green),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Utilisateur créé avec succès'), backgroundColor: Colors.green),
+        );
+      }
     } else if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(result['message'] ?? 'Erreur lors de la création'), backgroundColor: Colors.red),
@@ -373,7 +380,7 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
   Future<void> _updateUser() async {
     if (_editingUser == null) return;
     
-    final result = await _apiService.updateUserByAdmin(
+    final result = await _apiService.updateUserSuperAdmin(
       userId: _editingUser!.id,
       fullName: _fullNameController.text.trim(),
       email: _emailController.text.trim(),
@@ -390,9 +397,11 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
     
     if (result['success'] == true && mounted) {
       await _loadUsers();
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Utilisateur modifié avec succès'), backgroundColor: Colors.green),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Utilisateur modifié avec succès'), backgroundColor: Colors.green),
+        );
+      }
     } else if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(result['message'] ?? 'Erreur lors de la modification'), backgroundColor: Colors.red),
@@ -402,13 +411,15 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
 
   Future<void> _toggleUserStatus(User user) async {
     final newStatus = user.status == UserStatus.active ? UserStatus.suspended : UserStatus.active;
-    final result = await _apiService.updateUserStatus(user.id, newStatus.value);
+    final result = await _apiService.updateUserStatusSuperAdmin(user.id, newStatus.value);
     
     if (result['success'] == true && mounted) {
       await _loadUsers();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Utilisateur ${newStatus.label}'), backgroundColor: Colors.green),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Utilisateur ${newStatus.label}'), backgroundColor: Colors.green),
+        );
+      }
     } else if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(result['message'] ?? 'Erreur'), backgroundColor: Colors.red),
@@ -419,13 +430,16 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
   Future<void> _deleteUser(User user) async {
     final confirm = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         title: const Text('Confirmation'),
         content: Text('Voulez-vous vraiment supprimer ${user.fullName} ?'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Annuler')),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false), 
+            child: const Text('Annuler'),
+          ),
           ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
+            onPressed: () => Navigator.pop(dialogContext, true),
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
             child: const Text('Supprimer'),
           ),
@@ -433,13 +447,15 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
       ),
     );
     
-    if (confirm == true) {
-      final result = await _apiService.deleteUser(user.id);
+    if (confirm == true && mounted) {
+      final result = await _apiService.deleteUserSuperAdmin(user.id);
       if (result['success'] == true && mounted) {
         await _loadUsers();
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Utilisateur supprimé'), backgroundColor: Colors.green),
-        );
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Utilisateur supprimé'), backgroundColor: Colors.green),
+          );
+        }
       } else if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(result['message'] ?? 'Erreur lors de la suppression'), backgroundColor: Colors.red),
@@ -451,9 +467,11 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
   Future<void> _resetUserPin(User user) async {
     final result = await _apiService.resetUserPin(user.id);
     if (result['success'] == true && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('PIN réinitialisé à 123456'), backgroundColor: Colors.green),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('PIN réinitialisé à 123456'), backgroundColor: Colors.green),
+        );
+      }
     } else if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(result['message'] ?? 'Erreur lors de la réinitialisation'), backgroundColor: Colors.red),
@@ -472,6 +490,10 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
           IconButton(
             icon: const Icon(Icons.add),
             onPressed: _openCreateDialog,
+          ),
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _loadUsers,
           ),
         ],
       ),
@@ -559,7 +581,7 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
                             margin: const EdgeInsets.only(bottom: 12),
                             child: ExpansionTile(
                               leading: CircleAvatar(
-                                backgroundColor: user.role.color.withValues(alpha: 0.1),
+                                backgroundColor: user.role.color.withAlpha(25),
                                 child: Icon(user.role.icon, color: user.role.color),
                               ),
                               title: Text(user.fullName),
@@ -616,14 +638,16 @@ class _UsersManagementScreenState extends ConsumerState<UsersManagementScreen> {
                                         _InfoRow(label: 'Ville', value: user.city!),
                                       if (user.region != null && user.region!.isNotEmpty) 
                                         _InfoRow(label: 'Région', value: user.region!),
-                                      if (user.garageName != null && user.garageName!.isNotEmpty) 
-                                        _InfoRow(label: 'Garage', value: user.garageName!),
+                                      if (user.garageId != null && user.garageId!.isNotEmpty) 
+                                        _InfoRow(label: 'Garage ID', value: user.garageId!),
                                       if (user.vehiclePlate != null && user.vehiclePlate!.isNotEmpty) 
                                         _InfoRow(label: 'Plaque', value: user.vehiclePlate!),
                                       if (user.vehicleModel != null && user.vehicleModel!.isNotEmpty) 
                                         _InfoRow(label: 'Modèle', value: user.vehicleModel!),
                                       if (user.driverStatus != null) 
                                         _InfoRow(label: 'Statut chauffeur', value: user.driverStatus!.label),
+                                      _InfoRow(label: 'Email vérifié', value: user.isEmailVerified ? 'Oui' : 'Non'),
+                                      _InfoRow(label: 'Téléphone vérifié', value: user.isPhoneVerified ? 'Oui' : 'Non'),
                                       _InfoRow(label: 'Inscription', value: _formatDate(user.createdAt)),
                                       if (user.lastLogin != null) 
                                         _InfoRow(label: 'Dernière connexion', value: _formatDate(user.lastLogin!)),
@@ -686,7 +710,7 @@ class _FilterChip extends StatelessWidget {
       selected: selected,
       onSelected: (_) => onSelected(),
       backgroundColor: Colors.grey.shade100,
-      selectedColor: (color ?? const Color(0xFF0B6E3A)).withValues(alpha: 0.2),
+      selectedColor: (color ?? const Color(0xFF0B6E3A)).withAlpha(51),
       checkmarkColor: color ?? const Color(0xFF0B6E3A),
     );
   }

@@ -1,4 +1,4 @@
-
+// mobile/lib/models/user.dart
 import 'package:flutter/material.dart';
 
 enum UserRole {
@@ -70,12 +70,15 @@ class User {
   final String? garageName;
   final String? vehiclePlate;
   final String? vehicleModel;
+  final String? vehicleColor;
+  final int? vehicleYear;
   final DriverStatus? driverStatus;
   final Gender? gender;
   final DateTime? birthDate;
   final String? nationalId;
   final String? emergencyContact;
   final String? emergencyPhone;
+  final String? fcmToken;
   final bool hasPin;
   final bool isEmailVerified;
   final bool isPhoneVerified;
@@ -104,12 +107,15 @@ class User {
     this.garageName,
     this.vehiclePlate,
     this.vehicleModel,
+    this.vehicleColor,
+    this.vehicleYear,
     this.driverStatus,
     this.gender,
     this.birthDate,
     this.nationalId,
     this.emergencyContact,
     this.emergencyPhone,
+    this.fcmToken,
     this.hasPin = false,
     this.isEmailVerified = false,
     this.isPhoneVerified = false,
@@ -124,45 +130,66 @@ class User {
   });
 
   factory User.fromJson(Map<String, dynamic> json) {
+    DateTime? parseDateTime(dynamic value) {
+      if (value == null) return null;
+      try {
+        return DateTime.parse(value.toString());
+      } catch (e) {
+        return null;
+      }
+    }
+
     return User(
-      id: json['id'],
-      email: json['email'],
-      phone: json['phone'],
-      fullName: json['fullName'],
-      role: UserRole.fromString(json['role']),
+      id: json['id']?.toString() ?? '',
+      email: json['email']?.toString() ?? '',
+      phone: json['phone']?.toString() ?? '',
+      fullName: json['fullName']?.toString() ?? '',
+      role: json['role'] != null ? UserRole.fromString(json['role'].toString()) : UserRole.client,
       status: json['status'] != null 
-          ? UserStatus.values.firstWhere((e) => e.value == json['status'])
+          ? UserStatus.values.firstWhere(
+              (e) => e.value == json['status'].toString(),
+              orElse: () => UserStatus.active,
+            )
           : UserStatus.active,
-      profilePhoto: json['profilePhoto'],
-      address: json['address'],
-      city: json['city'],
-      region: json['region'],
-      country: json['country'] ?? 'Sénégal',
-      garageId: json['garageId'],
-      garageName: json['garageName'],
-      vehiclePlate: json['vehiclePlate'],
-      vehicleModel: json['vehicleModel'],
+      profilePhoto: json['profilePhoto']?.toString(),
+      address: json['address']?.toString(),
+      city: json['city']?.toString(),
+      region: json['region']?.toString(),
+      country: json['country']?.toString() ?? 'Sénégal',
+      garageId: json['garageId']?.toString(),
+      garageName: json['garageName']?.toString(),
+      vehiclePlate: json['vehiclePlate']?.toString(),
+      vehicleModel: json['vehicleModel']?.toString(),
+      vehicleColor: json['vehicleColor']?.toString(),
+      vehicleYear: json['vehicleYear'] != null ? int.tryParse(json['vehicleYear'].toString()) : null,
       driverStatus: json['driverStatus'] != null 
-          ? DriverStatus.values.firstWhere((e) => e.value == json['driverStatus'])
+          ? DriverStatus.values.firstWhere(
+              (e) => e.value == json['driverStatus'].toString(),
+              orElse: () => DriverStatus.offline,
+            )
           : null,
       gender: json['gender'] != null
-          ? Gender.values.firstWhere((e) => e.value == json['gender'])
+          ? Gender.values.firstWhere(
+              (e) => e.value == json['gender'].toString(),
+              orElse: () => Gender.other,
+            )
           : null,
-      birthDate: json['birthDate'] != null ? DateTime.parse(json['birthDate']) : null,
-      nationalId: json['nationalId'],
-      emergencyContact: json['emergencyContact'],
-      emergencyPhone: json['emergencyPhone'],
+      birthDate: parseDateTime(json['birthDate']),
+      nationalId: json['nationalId']?.toString(),
+      emergencyContact: json['emergencyContact']?.toString(),
+      emergencyPhone: json['emergencyPhone']?.toString(),
+      fcmToken: json['fcmToken']?.toString(),
       hasPin: json['hasPin'] ?? false,
       isEmailVerified: json['isEmailVerified'] ?? false,
       isPhoneVerified: json['isPhoneVerified'] ?? false,
       isApproved: json['isApproved'] ?? false,
-      approvedBy: json['approvedBy'],
-      approvedAt: json['approvedAt'] != null ? DateTime.parse(json['approvedAt']) : null,
-      createdBy: json['createdBy'],
-      createdAt: DateTime.parse(json['createdAt']),
-      updatedAt: json['updatedAt'] != null ? DateTime.parse(json['updatedAt']) : null,
-      lastLogin: json['lastLogin'] != null ? DateTime.parse(json['lastLogin']) : null,
-      lastActive: json['lastActive'] != null ? DateTime.parse(json['lastActive']) : null,
+      approvedBy: json['approvedBy']?.toString(),
+      approvedAt: parseDateTime(json['approvedAt']),
+      createdBy: json['createdBy']?.toString(),
+      createdAt: parseDateTime(json['createdAt']) ?? DateTime.now(),
+      updatedAt: parseDateTime(json['updatedAt']),
+      lastLogin: parseDateTime(json['lastLogin']),
+      lastActive: parseDateTime(json['lastActive']),
     );
   }
 
@@ -182,12 +209,15 @@ class User {
     'garageName': garageName,
     'vehiclePlate': vehiclePlate,
     'vehicleModel': vehicleModel,
+    'vehicleColor': vehicleColor,
+    'vehicleYear': vehicleYear,
     'driverStatus': driverStatus?.value,
     'gender': gender?.value,
     'birthDate': birthDate?.toIso8601String(),
     'nationalId': nationalId,
     'emergencyContact': emergencyContact,
     'emergencyPhone': emergencyPhone,
+    'fcmToken': fcmToken,
     'hasPin': hasPin,
     'isEmailVerified': isEmailVerified,
     'isPhoneVerified': isPhoneVerified,
@@ -201,9 +231,108 @@ class User {
     'lastActive': lastActive?.toIso8601String(),
   };
 
+  // Propriétés calculées
   bool get isActive => status == UserStatus.active;
+  bool get isSuspended => status == UserStatus.suspended;
+  bool get isBlocked => status == UserStatus.blocked;
+  
   bool get isSuperAdmin => role == UserRole.superAdmin;
-  bool get isAdmin => role == UserRole.admin || role == UserRole.superAdmin;
+  bool get isAdmin => role == UserRole.admin;
   bool get isDriver => role == UserRole.driver;
   bool get isClient => role == UserRole.client;
+  
+  bool get canManageUsers => isSuperAdmin;
+  bool get canManageGarages => isSuperAdmin;
+  bool get canManageDrivers => isSuperAdmin || isAdmin;
+  bool get canViewAllParcels => isSuperAdmin || isAdmin;
+  bool get canDeliverParcels => isDriver;
+  bool get canCreateParcels => isClient;
+  
+  bool get isDriverAvailable => isDriver && driverStatus == DriverStatus.available;
+  bool get isDriverBusy => isDriver && driverStatus == DriverStatus.busy;
+  bool get isDriverOffline => isDriver && driverStatus == DriverStatus.offline;
+  
+  String get initials {
+    final parts = fullName.split(' ');
+    if (parts.length >= 2) {
+      return '${parts[0][0]}${parts[1][0]}'.toUpperCase();
+    }
+    return fullName.isNotEmpty ? fullName[0].toUpperCase() : '?';
+  }
+
+  User copyWith({
+    String? id,
+    String? email,
+    String? phone,
+    String? fullName,
+    UserRole? role,
+    UserStatus? status,
+    String? profilePhoto,
+    String? address,
+    String? city,
+    String? region,
+    String? country,
+    String? garageId,
+    String? garageName,
+    String? vehiclePlate,
+    String? vehicleModel,
+    String? vehicleColor,
+    int? vehicleYear,
+    DriverStatus? driverStatus,
+    Gender? gender,
+    DateTime? birthDate,
+    String? nationalId,
+    String? emergencyContact,
+    String? emergencyPhone,
+    String? fcmToken,
+    bool? hasPin,
+    bool? isEmailVerified,
+    bool? isPhoneVerified,
+    bool? isApproved,
+    String? approvedBy,
+    DateTime? approvedAt,
+    String? createdBy,
+    DateTime? createdAt,
+    DateTime? updatedAt,
+    DateTime? lastLogin,
+    DateTime? lastActive,
+  }) {
+    return User(
+      id: id ?? this.id,
+      email: email ?? this.email,
+      phone: phone ?? this.phone,
+      fullName: fullName ?? this.fullName,
+      role: role ?? this.role,
+      status: status ?? this.status,
+      profilePhoto: profilePhoto ?? this.profilePhoto,
+      address: address ?? this.address,
+      city: city ?? this.city,
+      region: region ?? this.region,
+      country: country ?? this.country,
+      garageId: garageId ?? this.garageId,
+      garageName: garageName ?? this.garageName,
+      vehiclePlate: vehiclePlate ?? this.vehiclePlate,
+      vehicleModel: vehicleModel ?? this.vehicleModel,
+      vehicleColor: vehicleColor ?? this.vehicleColor,
+      vehicleYear: vehicleYear ?? this.vehicleYear,
+      driverStatus: driverStatus ?? this.driverStatus,
+      gender: gender ?? this.gender,
+      birthDate: birthDate ?? this.birthDate,
+      nationalId: nationalId ?? this.nationalId,
+      emergencyContact: emergencyContact ?? this.emergencyContact,
+      emergencyPhone: emergencyPhone ?? this.emergencyPhone,
+      fcmToken: fcmToken ?? this.fcmToken,
+      hasPin: hasPin ?? this.hasPin,
+      isEmailVerified: isEmailVerified ?? this.isEmailVerified,
+      isPhoneVerified: isPhoneVerified ?? this.isPhoneVerified,
+      isApproved: isApproved ?? this.isApproved,
+      approvedBy: approvedBy ?? this.approvedBy,
+      approvedAt: approvedAt ?? this.approvedAt,
+      createdBy: createdBy ?? this.createdBy,
+      createdAt: createdAt ?? this.createdAt,
+      updatedAt: updatedAt ?? this.updatedAt,
+      lastLogin: lastLogin ?? this.lastLogin,
+      lastActive: lastActive ?? this.lastActive,
+    );
+  }
 }

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:procolis/screens/dashboard/garage_admin_dashboard.dart';
 
 import '../../models/user.dart';
 import '../../providers/auth_provider.dart';
@@ -11,9 +12,9 @@ import '../parcel/new_parcel_screen.dart';
 import '../parcel/track_parcel_screen.dart';
 // ignore: unused_import
 import '../profile/profile_screen.dart';
-import 'admin_dashboard.dart';
 import 'client_dashboard.dart';
 import 'driver_dashboard.dart';
+import 'super_admin_dashboard.dart';
 
 class DashboardScreen extends ConsumerWidget {
   const DashboardScreen({super.key});
@@ -34,8 +35,9 @@ class DashboardScreen extends ConsumerWidget {
       case UserRole.driver:
         return const DriverDashboard();
       case UserRole.admin:
+        return const GarageAdminDashboard();
       case UserRole.superAdmin:
-        return const AdminDashboard();
+        return  const SuperAdminDashboard();
       default:
         return const ClientDashboard();
     }

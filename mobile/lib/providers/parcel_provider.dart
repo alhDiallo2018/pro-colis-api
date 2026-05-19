@@ -1,3 +1,4 @@
+// mobile/lib/providers/parcel_provider.dart
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/parcel.dart';
@@ -29,6 +30,35 @@ class ParcelNotifier extends StateNotifier<ParcelState> {
     state = ParcelState.loading();
     try {
       final parcels = await _apiService.getDriverParcels();
+      state = ParcelState.loaded(parcels);
+    } catch (e) {
+      state = ParcelState.error(e.toString());
+    }
+  }
+
+  // Charger tous les colis (Super Admin)
+  Future<void> loadAllParcels() async {
+    state = state.copyWith(isLoading: true);
+    try {
+      final parcels = await _apiService.getAllParcelsSuperAdmin();
+      state = state.copyWith(
+        parcels: parcels,
+        isLoading: false,
+        error: null,
+      );
+    } catch (e) {
+      state = state.copyWith(
+        error: e.toString(),
+        isLoading: false,
+      );
+    }
+  }
+
+  // Charger les colis d'un garage (Admin Garage)
+  Future<void> loadGarageParcels({String? status}) async {
+    state = ParcelState.loading();
+    try {
+      final parcels = await _apiService.getGarageParcels(status: status);
       state = ParcelState.loaded(parcels);
     } catch (e) {
       state = ParcelState.error(e.toString());
@@ -119,6 +149,23 @@ class ParcelNotifier extends StateNotifier<ParcelState> {
     }
   }
 
+  // Assigner un chauffeur à un colis (Admin Garage)
+  Future<bool> assignDriverToParcel(String parcelId, String driverId) async {
+    state = state.copyWith(isLoading: true);
+    try {
+      final result = await _apiService.assignDriverToParcel(parcelId, driverId);
+      if (result['success'] == true) {
+        await loadGarageParcels();
+        return true;
+      }
+      state = state.copyWith(error: result['message'] ?? 'Erreur lors de l\'assignation', isLoading: false);
+      return false;
+    } catch (e) {
+      state = state.copyWith(error: e.toString(), isLoading: false);
+      return false;
+    }
+  }
+
   // Réinitialiser l'état
   void reset() {
     state = ParcelState.initial();
@@ -127,7 +174,7 @@ class ParcelNotifier extends StateNotifier<ParcelState> {
   // Effacer les erreurs
   void clearError() {
     if (state.error != null) {
-      state = ParcelState.initial();
+      state = state.copyWith(error: null);
     }
   }
 }
@@ -193,6 +240,23 @@ class ParcelState {
     isSuccess: false,
   );
 
+  // Méthode copyWith pour créer une nouvelle instance avec des champs modifiés
+  ParcelState copyWith({
+    bool? isLoading,
+    List<Parcel>? parcels,
+    Parcel? trackedParcel,
+    String? error,
+    bool? isSuccess,
+  }) {
+    return ParcelState(
+      isLoading: isLoading ?? this.isLoading,
+      parcels: parcels ?? this.parcels,
+      trackedParcel: trackedParcel ?? this.trackedParcel,
+      error: error ?? this.error,
+      isSuccess: isSuccess ?? this.isSuccess,
+    );
+  }
+
   // Getter pour vérifier si la liste est vide
   bool get hasParcels => parcels.isNotEmpty;
   
@@ -224,5 +288,23 @@ class ParcelState {
     return parcels.where((parcel) => 
       parcel.status == ParcelStatus.delivered
     ).toList();
+  }
+
+  // Getter pour les colis annulés
+  List<Parcel> get cancelledParcels {
+    return parcels.where((parcel) => 
+      parcel.status == ParcelStatus.cancelled
+    ).toList();
+  }
+
+  // Getter pour les statistiques
+  Map<String, int> get stats {
+    return {
+      'total': parcels.length,
+      'pending': pendingParcels.length,
+      'inProgress': inProgressParcels.length,
+      'delivered': completedParcels.length,
+      'cancelled': cancelledParcels.length,
+    };
   }
 }
