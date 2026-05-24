@@ -33,6 +33,7 @@ dependencies:
   video_player: ^2.8.1
   universal_html: ^2.2.4 
   http_parser: ^4.1.2
+  chewie: ^1.8.1
 
 dev_dependencies:
   flutter_test:

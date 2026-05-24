@@ -15,6 +15,7 @@ import '../../providers/parcel_provider.dart';
 import '../../services/api_service.dart';
 import '../../widgets/custom_button.dart';
 import '../../widgets/custom_text_field.dart';
+import 'parcel_detail_screen.dart';
 
 class NewParcelScreen extends ConsumerStatefulWidget {
   const NewParcelScreen({super.key});
@@ -57,11 +58,13 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
   bool _insurance = false;
   
   // Médias - Support Web et Mobile
-  final List<dynamic> _photos = [];
-  final List<String> _photoUrls = [];
-  final List<dynamic> _videos = [];
-  final List<String> _videoUrls = [];
+  final List<XFile> _photos = [];
+  final List<XFile> _videos = [];
   final ImagePicker _picker = ImagePicker();
+  
+  // URLs uploadées
+  List<String> _uploadedPhotoUrls = [];
+  List<String> _uploadedVideoUrls = [];
   
   // Contrôleurs vidéo pour mobile
   final Map<String, VideoPlayerController> _videoControllers = {};
@@ -114,14 +117,12 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     }
   }
 
-  // Récupérer les chauffeurs via l'API publique
   Future<void> _loadAvailableDrivers() async {
     setState(() {
       _isSearchingDrivers = true;
     });
     
     try {
-      // Utiliser l'API publique pour rechercher des chauffeurs
       final drivers = await _apiService.searchDriversPublic();
       setState(() {
         _availableDrivers = drivers;
@@ -137,7 +138,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     }
   }
 
-  // Rechercher un chauffeur par critères (ID, email, téléphone)
   Future<void> _searchDriver() async {
     final query = _driverSearchController.text.trim();
     
@@ -151,7 +151,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     });
     
     try {
-      // Utiliser l'API publique pour rechercher des chauffeurs par critères
       final drivers = await _apiService.searchDriversPublic(query: query);
       
       setState(() {
@@ -183,7 +182,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
       if (photo != null) {
         setState(() {
           _photos.add(photo);
-          _photoUrls.add(photo.path);
         });
       }
     } catch (e) {
@@ -205,7 +203,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
       if (photo != null) {
         setState(() {
           _photos.add(photo);
-          _photoUrls.add(photo.path);
         });
       }
     } catch (e) {
@@ -226,7 +223,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
       if (video != null) {
         setState(() {
           _videos.add(video);
-          _videoUrls.add(video.path);
           if (!kIsWeb) {
             _initializeVideoController(video);
           }
@@ -250,7 +246,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
       if (video != null) {
         setState(() {
           _videos.add(video);
-          _videoUrls.add(video.path);
           if (!kIsWeb) {
             _initializeVideoController(video);
           }
@@ -282,7 +277,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
   void _removePhoto(int index) {
     setState(() {
       _photos.removeAt(index);
-      _photoUrls.removeAt(index);
     });
   }
 
@@ -290,7 +284,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     final videoPath = _videos[index].path;
     setState(() {
       _videos.removeAt(index);
-      _videoUrls.removeAt(index);
     });
     if (!kIsWeb) {
       _videoControllers[videoPath]?.dispose();
@@ -353,32 +346,32 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
           ),
           const SizedBox(height: 16),
           
-          if (_photoUrls.isNotEmpty) ...[
+          if (_photos.isNotEmpty) ...[
             const Text('Photos', style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             SizedBox(
               height: 100,
               child: ListView.builder(
                 scrollDirection: Axis.horizontal,
-                itemCount: _photoUrls.length,
+                itemCount: _photos.length,
                 itemBuilder: (context, index) {
-                  return _buildPhotoThumbnail(_photoUrls[index], index);
+                  return _buildPhotoThumbnail(_photos[index], index);
                 },
               ),
             ),
             const SizedBox(height: 12),
           ],
           
-          if (_videoUrls.isNotEmpty) ...[
+          if (_videos.isNotEmpty) ...[
             const Text('Vidéos', style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             SizedBox(
               height: 100,
               child: ListView.builder(
                 scrollDirection: Axis.horizontal,
-                itemCount: _videoUrls.length,
+                itemCount: _videos.length,
                 itemBuilder: (context, index) {
-                  return _buildVideoThumbnail(_videoUrls[index], index);
+                  return _buildVideoThumbnail(_videos[index], index);
                 },
               ),
             ),
@@ -405,7 +398,7 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     );
   }
 
-  Widget _buildPhotoThumbnail(String url, int index) {
+  Widget _buildPhotoThumbnail(XFile photo, int index) {
     return Stack(
       children: [
         Container(
@@ -415,7 +408,7 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(8),
             image: DecorationImage(
-              image: _getImageProvider(url),
+              image: _getImageProvider(photo.path),
               fit: BoxFit.cover,
             ),
           ),
@@ -438,9 +431,9 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     );
   }
 
-  Widget _buildVideoThumbnail(String url, int index) {
-    final isInitialized = _videoInitialized[url] ?? false;
-    final controller = _videoControllers[url];
+  Widget _buildVideoThumbnail(XFile video, int index) {
+    final isInitialized = _videoInitialized[video.path] ?? false;
+    final controller = _videoControllers[video.path];
     
     return Stack(
       children: [
@@ -475,7 +468,7 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
                 : Stack(
                     children: [
                       Image.network(
-                        url,
+                        video.path,
                         width: 100,
                         height: 100,
                         fit: BoxFit.cover,
@@ -521,23 +514,20 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     );
   }
 
-  ImageProvider _getImageProvider(String url) {
+  ImageProvider _getImageProvider(String path) {
     if (kIsWeb) {
-      return NetworkImage(url);
+      return NetworkImage(path);
     } else {
-      return FileImage(File(url));
+      return FileImage(File(path));
     }
   }
 
   // ==================== SECTION CHAUFFEUR ====================
-  // La section chauffeur n'est affichée QUE pour les clients
   
   Widget _buildDriverSection() {
     final authState = ref.watch(authProvider);
     final isClient = authState.user?.role == UserRole.client;
     
-    // Seuls les clients peuvent choisir un chauffeur
-    // Les chauffeurs seront assignés automatiquement par l'admin garage
     if (!isClient) {
       return const SizedBox.shrink();
     }
@@ -548,7 +538,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
       color: Colors.amber,
       child: Column(
         children: [
-          // Message d'information
           Container(
             padding: const EdgeInsets.all(8),
             margin: const EdgeInsets.only(bottom: 12),
@@ -570,7 +559,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
             ),
           ),
           
-          // Champ de recherche
           Row(
             children: [
               Expanded(
@@ -590,7 +578,6 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
           ),
           const SizedBox(height: 12),
           
-          // Liste des chauffeurs disponibles
           if (_isSearchingDrivers)
             const Center(child: CircularProgressIndicator())
           else if (_availableDrivers.isEmpty)
@@ -674,6 +661,44 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     );
   }
 
+  // ==================== UPLOAD DES MÉDIAS ====================
+  
+  Future<List<String>> _uploadPhotos() async {
+    List<String> uploadedUrls = [];
+    
+    for (var photo in _photos) {
+      try {
+        final url = await _apiService.uploadParcelPhoto(photo, 'temp');
+        if (url != null) {
+          uploadedUrls.add(url);
+          debugPrint('✅ Photo uploadée: $url');
+        }
+      } catch (e) {
+        debugPrint('❌ Erreur upload photo: $e');
+      }
+    }
+    
+    return uploadedUrls;
+  }
+  
+  Future<List<String>> _uploadVideos() async {
+    List<String> uploadedUrls = [];
+    
+    for (var video in _videos) {
+      try {
+        final url = await _apiService.uploadParcelVideo(video, 'temp');
+        if (url != null) {
+          uploadedUrls.add(url);
+          debugPrint('✅ Vidéo uploadée: $url');
+        }
+      } catch (e) {
+        debugPrint('❌ Erreur upload vidéo: $e');
+      }
+    }
+    
+    return uploadedUrls;
+  }
+
   // ==================== CRÉATION DU COLIS ====================
   
   Future<void> _createParcel() async {
@@ -688,43 +713,47 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     
     setState(() => _isLoading = true);
     
-    final departureGarage = _garages.firstWhere((g) => g.id == _selectedDepartureGarageId);
-    final arrivalGarage = _selectedArrivalGarageId != null 
-        ? _garages.firstWhere((g) => g.id == _selectedArrivalGarageId)
-        : departureGarage;
-    
-    // Récupérer les informations du chauffeur sélectionné
-    User? selectedDriver;
-    if (_selectedDriverId != null) {
-      selectedDriver = _availableDrivers.firstWhere(
-        (d) => d.id == _selectedDriverId,
-        orElse: () => throw Exception('Chauffeur non trouvé'),
-      );
-    }
-    
-    final data = {
-      'receiverName': _receiverNameController.text.trim(),
-      'receiverPhone': _receiverPhoneController.text.trim(),
-      'receiverEmail': _receiverEmailController.text.trim().isEmpty ? null : _receiverEmailController.text.trim(),
-      'description': _descriptionController.text.trim(),
-      'weight': double.parse(_weightController.text),
-      'type': _selectedType.value,
-      'departureGarageId': _selectedDepartureGarageId,
-      'departureGarageName': departureGarage.name,
-      'arrivalGarageId': _selectedArrivalGarageId,
-      'arrivalGarageName': arrivalGarage.name,
-      'price': double.tryParse(_priceController.text) ?? 0,
-      'urgent': _urgentDelivery,
-      'insurance': _insurance,
-      'photoUrls': _photoUrls,
-      'videoUrls': _videoUrls,
-      // Ajouter le chauffeur si sélectionné
-      'driverId': selectedDriver?.id,
-      'driverName': selectedDriver?.fullName,
-      'driverPhone': selectedDriver?.phone,
-    };
-    
     try {
+      // 1. Uploader les photos
+      final photoUrls = await _uploadPhotos();
+      
+      // 2. Uploader les vidéos
+      final videoUrls = await _uploadVideos();
+      
+      final departureGarage = _garages.firstWhere((g) => g.id == _selectedDepartureGarageId);
+      final arrivalGarage = _selectedArrivalGarageId != null 
+          ? _garages.firstWhere((g) => g.id == _selectedArrivalGarageId)
+          : departureGarage;
+      
+      User? selectedDriver;
+      if (_selectedDriverId != null) {
+        selectedDriver = _availableDrivers.firstWhere(
+          (d) => d.id == _selectedDriverId,
+          orElse: () => throw Exception('Chauffeur non trouvé'),
+        );
+      }
+      
+      final data = {
+        'receiverName': _receiverNameController.text.trim(),
+        'receiverPhone': _receiverPhoneController.text.trim(),
+        'receiverEmail': _receiverEmailController.text.trim().isEmpty ? null : _receiverEmailController.text.trim(),
+        'description': _descriptionController.text.trim(),
+        'weight': double.parse(_weightController.text),
+        'type': _selectedType.value,
+        'departureGarageId': _selectedDepartureGarageId,
+        'departureGarageName': departureGarage.name,
+        'arrivalGarageId': _selectedArrivalGarageId,
+        'arrivalGarageName': arrivalGarage.name,
+        'price': double.tryParse(_priceController.text) ?? 0,
+        'isUrgent': _urgentDelivery,
+        'isInsured': _insurance,
+        'photoUrls': photoUrls,
+        'videoUrls': videoUrls,
+        'driverId': selectedDriver?.id,
+        'driverName': selectedDriver?.fullName,
+        'driverPhone': selectedDriver?.phone,
+      };
+      
       final result = await ref.read(parcelProvider.notifier).createParcel(data);
       
       if (mounted) {
@@ -732,7 +761,7 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
       }
       
       if (result != null && mounted) {
-        _showSuccessDialog(result);
+        _navigateToParcelDetail(result);
       } else if (mounted) {
         final errorState = ref.read(parcelProvider);
         ScaffoldMessenger.of(context).showSnackBar(
@@ -749,62 +778,12 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
     }
   }
 
-  void _showSuccessDialog(Parcel parcel) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('✅ Colis créé !'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.check_circle, size: 64, color: Colors.green),
-            const SizedBox(height: 16),
-            Text(
-              'Numéro de suivi',
-              style: TextStyle(color: Colors.grey[600]),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              parcel.trackingNumber,
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, fontFamily: 'monospace'),
-            ),
-            if (_selectedDriverId != null) ...[
-              const SizedBox(height: 12),
-              const Divider(),
-              const SizedBox(height: 8),
-              const Text('Chauffeur assigné :'),
-              const SizedBox(height: 4),
-              Text(
-                _availableDrivers.firstWhere((d) => d.id == _selectedDriverId).fullName,
-                style: const TextStyle(fontWeight: FontWeight.bold),
-              ),
-            ],
-            const SizedBox(height: 16),
-            const Text(
-              'Un email de confirmation a été envoyé',
-              textAlign: TextAlign.center,
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              Navigator.pop(context, parcel);
-            },
-            child: const Text('OK'),
-          ),
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              _resetForm();
-            },
-            child: const Text('Nouveau colis'),
-          ),
-        ],
+  void _navigateToParcelDetail(Parcel parcel) {
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(
+        builder: (context) => ParcelDetailScreen(parcel: parcel),
       ),
+      (route) => route.isFirst,
     );
   }
 
@@ -825,8 +804,8 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
       _insurance = false;
       _photos.clear();
       _videos.clear();
-      _photoUrls.clear();
-      _videoUrls.clear();
+      _uploadedPhotoUrls.clear();
+      _uploadedVideoUrls.clear();
     });
     _loadAvailableDrivers();
     if (!kIsWeb) {
@@ -997,7 +976,7 @@ class _NewParcelScreenState extends ConsumerState<NewParcelScreen> {
                     ),
                     const SizedBox(height: 16),
                     
-                    // Section Chauffeur (visible uniquement pour les clients)
+                    // Section Chauffeur
                     _buildDriverSection(),
                     const SizedBox(height: 16),
                     

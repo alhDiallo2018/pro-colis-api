@@ -13,8 +13,6 @@ import '../models/garage.dart';
 import '../models/parcel.dart';
 import '../models/user.dart';
 
-
-
 class ApiService {
   static const String baseUrl = 'http://localhost:8080';
   final Dio _dio = Dio();
@@ -38,11 +36,13 @@ class ApiService {
         return handler.next(options);
       },
       onResponse: (response, handler) {
-        debugPrint('✅ Réponse reçue: ${response.statusCode} - ${response.requestOptions.path}');
+        debugPrint(
+            '✅ Réponse reçue: ${response.statusCode} - ${response.requestOptions.path}');
         return handler.next(response);
       },
       onError: (error, handler) async {
-        debugPrint('❌ Erreur API: ${error.response?.statusCode} - ${error.requestOptions.path}');
+        debugPrint(
+            '❌ Erreur API: ${error.response?.statusCode} - ${error.requestOptions.path}');
         if (error.response?.statusCode == 401) {
           debugPrint('🔐 Token expiré, déconnexion...');
           await clearToken();
@@ -55,7 +55,8 @@ class ApiService {
   Future<String?> getToken() async => await _storage.read(key: 'token');
 
   Future<void> setToken(String token) async {
-    debugPrint('🔐 Token stocké: ${token.substring(0, token.length > 20 ? 20 : token.length)}...');
+    debugPrint(
+        '🔐 Token stocké: ${token.substring(0, token.length > 20 ? 20 : token.length)}...');
     await _storage.write(key: 'token', value: token);
   }
 
@@ -69,6 +70,13 @@ class ApiService {
       return jsonDecode(response.data as String);
     }
     return response.data as Map<String, dynamic>;
+  }
+
+  String _getContentType(String path) {
+    if (path.endsWith('.png')) return 'image/png';
+    if (path.endsWith('.jpg') || path.endsWith('.jpeg')) return 'image/jpeg';
+    if (path.endsWith('.gif')) return 'image/gif';
+    return 'image/jpeg';
   }
 
   // ==================== MÉTHODES D'AUTHENTIFICATION ====================
@@ -152,6 +160,87 @@ class ApiService {
     }
   }
 
+  // ==================== AUTHENTIFICATION AVANCÉE ====================
+
+  Future<Map<String, dynamic>> refreshToken() async {
+    try {
+      final refreshToken = await _storage.read(key: 'refresh_token');
+      if (refreshToken == null) {
+        return {'success': false, 'message': 'No refresh token'};
+      }
+      final response = await _dio.post('/auth/refresh', data: {
+        'refreshToken': refreshToken,
+      });
+      final responseData = _handleResponse(response);
+      if (responseData['success'] == true && responseData['accessToken'] != null) {
+        await setToken(responseData['accessToken']);
+        if (responseData['refreshToken'] != null) {
+          await _storage.write(key: 'refresh_token', value: responseData['refreshToken']);
+        }
+      }
+      return responseData;
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> forgotPassword(String email) async {
+    try {
+      final response = await _dio.post('/auth/forgot-password', data: {'email': email});
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> resetPassword({
+    required String token,
+    required String newPassword,
+  }) async {
+    try {
+      final response = await _dio.post('/auth/reset-password', data: {
+        'token': token,
+        'newPassword': newPassword,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> changePassword({
+    required String currentPassword,
+    required String newPassword,
+  }) async {
+    try {
+      final response = await _dio.post('/auth/change-password', data: {
+        'currentPassword': currentPassword,
+        'newPassword': newPassword,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> verifyEmail(String otpCode) async {
+    try {
+      final response = await _dio.post('/auth/verify-email', data: {'otpCode': otpCode});
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> resendVerificationEmail() async {
+    try {
+      final response = await _dio.post('/auth/resend-verification');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
   // ==================== MÉTHODES UTILISATEUR ====================
 
   Future<User> getCurrentUser() async {
@@ -168,8 +257,6 @@ class ApiService {
     }
   }
 
-  
-
   Future<Map<String, dynamic>> updateProfile({
     required String fullName,
     required String email,
@@ -185,7 +272,7 @@ class ApiService {
     try {
       final currentUser = await getCurrentUser();
       final role = currentUser.role;
-      
+
       String endpoint;
       switch (role) {
         case UserRole.client:
@@ -201,7 +288,7 @@ class ApiService {
           endpoint = '/super-admin/profile';
           break;
       }
-      
+
       final response = await _dio.put(endpoint, data: {
         'fullName': fullName,
         'email': email,
@@ -232,12 +319,64 @@ class ApiService {
     }
   }
 
+  Future<Map<String, dynamic>> updateProfileByRole(String endpoint, Map<String, dynamic> data) async {
+    try {
+      final response = await _dio.put(
+        endpoint,
+        data: data,
+        options: Options(
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        ),
+      );
+      return _handleResponse(response);
+    } catch (e) {
+      debugPrint('❌ Erreur updateProfileByRole: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> deleteAccount() async {
+    try {
+      final response = await _dio.delete(
+        '/users/account',
+        options: Options(
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        ),
+      );
+      return _handleResponse(response);
+    } catch (e) {
+      debugPrint('❌ Erreur deleteAccount: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getUserStats() async {
+    try {
+      final response = await _dio.get(
+        '/users/stats',
+        options: Options(
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        ),
+      );
+      return _handleResponse(response);
+    } catch (e) {
+      debugPrint('❌ Erreur getUserStats: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
   // ==================== MÉTHODES PARCELS ====================
 
   Future<List<Parcel>> getMyParcels({String? status}) async {
     try {
       final queryParams = status != null ? {'status': status} : <String, dynamic>{};
-      final response = await _dio.get('/client/my-parcels', queryParameters: queryParams);
+      final response = await _dio.get('/client/parcels/my-parcels', queryParameters: queryParams);
       final responseData = _handleResponse(response);
 
       final List<dynamic> parcelsData = responseData['parcels'] ?? [];
@@ -270,7 +409,8 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>> confirmDelivery(String parcelId, {String? signature, String? photoUrl}) async {
+  Future<Map<String, dynamic>> confirmDelivery(String parcelId,
+      {String? signature, String? photoUrl}) async {
     try {
       final response = await _dio.put('/driver/parcels/$parcelId/deliver', data: {
         'signature': signature,
@@ -282,40 +422,108 @@ class ApiService {
     }
   }
 
-  Future<Parcel> createParcel(Map<String, dynamic> data) async {
-    try {
-      final currentUser = await getCurrentUser();
-      final role = currentUser.role;
-      
-      String endpoint;
-      switch (role) {
-        case UserRole.client:
-          endpoint = '/client/parcels/create';
-          break;
-        case UserRole.driver:
-          endpoint = '/driver/parcels/create';
-          break;
-        case UserRole.admin:
-          endpoint = '/garage-admin/parcels/create';
-          break;
-        case UserRole.superAdmin:
-          endpoint = '/super-admin/parcels/create';
-          break;
-      }
-      
-      final response = await _dio.post(endpoint, data: data);
-      final responseData = _handleResponse(response);
-
-      if (responseData['success'] == true && responseData['parcel'] != null) {
-        return Parcel.fromMinimalJson(responseData['parcel'] as Map<String, dynamic>);
-      } else {
-        throw Exception(responseData['message'] ?? 'Erreur lors de la création');
-      }
-    } catch (e) {
-      debugPrint('❌ Erreur createParcel: $e');
-      rethrow;
+  Future<String?> uploadParcelPhoto(XFile file, String parcelId) async {
+  try {
+    final bytes = await file.readAsBytes();
+    final base64Image = base64Encode(bytes);
+    
+    final response = await _dio.post('/upload/parcel-photo', data: {
+      'file': base64Image,
+      'parcelId': parcelId,
+      'filename': file.name,
+    });
+    
+    final responseData = _handleResponse(response);
+    if (responseData['success'] == true && responseData['url'] != null) {
+      return responseData['url'];
     }
+    return null;
+  } catch (e) {
+    debugPrint('❌ Erreur uploadParcelPhoto: $e');
+    return null;
   }
+}
+
+Future<String?> uploadParcelVideo(XFile file, String parcelId) async {
+  try {
+    final bytes = await file.readAsBytes();
+    final base64Video = base64Encode(bytes);
+    
+    final response = await _dio.post('/upload/parcel-video', data: {
+      'file': base64Video,
+      'parcelId': parcelId,
+      'filename': file.name,
+    });
+    
+    final responseData = _handleResponse(response);
+    if (responseData['success'] == true && responseData['url'] != null) {
+      return responseData['url'];
+    }
+    return null;
+  } catch (e) {
+    debugPrint('❌ Erreur uploadParcelVideo: $e');
+    return null;
+  }
+}
+
+// Version simplifiée de createParcel (SANS upload)
+Future<Parcel> createParcel(Map<String, dynamic> data) async {
+  try {
+    final currentUser = await getCurrentUser();
+    final role = currentUser.role;
+
+    String endpoint;
+    switch (role) {
+      case UserRole.client:
+        endpoint = '/client/parcels/create';
+        break;
+      case UserRole.driver:
+        endpoint = '/driver/parcels/create';
+        break;
+      case UserRole.admin:
+        endpoint = '/garage-admin/parcels/create';
+        break;
+      case UserRole.superAdmin:
+        endpoint = '/super-admin/parcels/create';
+        break;
+    }
+
+    // Nettoyer les données (les URLs sont déjà uploadées)
+    final cleanedData = {
+      'receiverName': data['receiverName'],
+      'receiverPhone': data['receiverPhone'],
+      'receiverEmail': data['receiverEmail'],
+      'description': data['description'],
+      'weight': data['weight'],
+      'type': data['type'] ?? 'package',
+      'departureGarageId': data['departureGarageId'],
+      'departureGarageName': data['departureGarageName'],
+      'arrivalGarageId': data['arrivalGarageId'],
+      'arrivalGarageName': data['arrivalGarageName'],
+      'price': data['price'],
+      'isUrgent': data['isUrgent'] ?? false,
+      'isInsured': data['isInsured'] ?? false,
+      'photoUrls': data['photoUrls'] ?? [],  // Déjà des URLs uploadées
+      'videoUrls': data['videoUrls'] ?? [],  // Déjà des URLs uploadées
+      'driverId': data['driverId'],
+      'driverName': data['driverName'],
+      'driverPhone': data['driverPhone'],
+    };
+    
+    cleanedData.removeWhere((key, value) => value == null);
+
+    print('📦 Envoi au backend: ${jsonEncode(cleanedData)}');
+
+    final response = await _dio.post(endpoint, data: cleanedData);
+    final responseData = _handleResponse(response);
+    
+    return Parcel.fromMinimalJson(responseData);
+    
+  } catch (e) {
+    debugPrint('❌ Erreur createParcel: $e');
+    rethrow;
+  }
+}
 
   Future<Parcel> trackParcel(String trackingNumber) async {
     try {
@@ -350,7 +558,7 @@ class ApiService {
     try {
       final currentUser = await getCurrentUser();
       final role = currentUser.role;
-      
+
       String endpoint;
       switch (role) {
         case UserRole.client:
@@ -366,7 +574,7 @@ class ApiService {
           endpoint = '/super-admin/parcels/$parcelId/status';
           break;
       }
-      
+
       final response = await _dio.put(endpoint, data: {
         'status': status,
         'location': location,
@@ -392,17 +600,108 @@ class ApiService {
   }
 
   Future<Parcel?> getParcelById(String parcelId) async {
+  try {
+    final currentUser = await getCurrentUser();
+    final role = currentUser.role;
+    
+    // Construire le bon endpoint selon le rôle
+    String endpoint;
+    switch (role) {
+      case UserRole.client:
+        endpoint = '/client/parcels/$parcelId';
+        break;
+      case UserRole.driver:
+        endpoint = '/driver/parcels/$parcelId';
+        break;
+      case UserRole.admin:
+        endpoint = '/garage-admin/parcels/$parcelId';
+        break;
+      case UserRole.superAdmin:
+        endpoint = '/super-admin/parcels/$parcelId';
+        break;
+    }
+    
+    final response = await _dio.get(endpoint);
+    final responseData = _handleResponse(response);
+    
+    print('📦 getParcelById réponse: $responseData');
+
+    // Ton backend retourne directement le colis, pas un wrapper
+    if (responseData['id'] != null) {
+      return Parcel.fromJson(responseData);
+    }
+    
+    // Si jamais il y a un wrapper
+    if (responseData['success'] == true && responseData['parcel'] != null) {
+      return Parcel.fromJson(responseData['parcel'] as Map<String, dynamic>);
+    }
+    
+    return null;
+  } catch (e) {
+    debugPrint('❌ Erreur getParcelById: $e');
+    return null;
+  }
+}
+
+  Future<Map<String, dynamic>> estimateDeliveryPrice({
+    required double weight,
+    required String departureGarageId,
+    required String arrivalGarageId,
+    required String type,
+    bool urgent = false,
+    bool insured = false,
+  }) async {
     try {
-      final response = await _dio.get('/parcels/$parcelId');
-      final responseData = _handleResponse(response);
-      
-      if (responseData['success'] == true && responseData['parcel'] != null) {
-        return Parcel.fromJson(responseData['parcel'] as Map<String, dynamic>);
-      }
-      return null;
+      final response = await _dio.post('/parcels/estimate', data: {
+        'weight': weight,
+        'departureGarageId': departureGarageId,
+        'arrivalGarageId': arrivalGarageId,
+        'type': type,
+        'urgent': urgent,
+        'insured': insured,
+      });
+      return _handleResponse(response);
     } catch (e) {
-      debugPrint('❌ Erreur getParcelById: $e');
-      return null;
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getParcelTimeline(String parcelId) async {
+    try {
+      final response = await _dio.get('/parcels/$parcelId/timeline');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> addParcelNote(String parcelId, String note) async {
+    try {
+      final response = await _dio.post('/parcels/$parcelId/notes', data: {'note': note});
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getParcelNotes(String parcelId) async {
+    try {
+      final response = await _dio.get('/parcels/$parcelId/notes');
+      final responseData = _handleResponse(response);
+      final List<dynamic> notesData = responseData['notes'] ?? [];
+      return notesData.map((json) => json as Map<String, dynamic>).toList();
+    } catch (e) {
+      debugPrint('❌ Erreur getParcelNotes: $e');
+      return [];
+    }
+  }
+
+  Future<Map<String, dynamic>> downloadDeliveryProof(String parcelId) async {
+    try {
+      final response = await _dio.get('/parcels/$parcelId/proof');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
     }
   }
 
@@ -448,6 +747,61 @@ class ApiService {
   Future<Map<String, dynamic>> deleteParcelAdmin(String parcelId) async {
     try {
       final response = await _dio.delete('/garage-admin/parcels/$parcelId');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getGarageDailyReport(DateTime date) async {
+    try {
+      final response = await _dio.get('/garage-admin/reports/daily', queryParameters: {
+        'date': date.toIso8601String().split('T').first,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getGarageMonthlyReport(int year, int month) async {
+    try {
+      final response = await _dio.get('/garage-admin/reports/monthly', queryParameters: {
+        'year': year,
+        'month': month,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> exportGarageReport({
+    required String format,
+    DateTime? startDate,
+    DateTime? endDate,
+  }) async {
+    try {
+      final queryParams = <String, dynamic>{'format': format};
+      if (startDate != null) {
+        queryParams['startDate'] = startDate.toIso8601String().split('T').first;
+      }
+      if (endDate != null) {
+        queryParams['endDate'] = endDate.toIso8601String().split('T').first;
+      }
+
+      final response = await _dio.get('/garage-admin/reports/export', queryParameters: queryParams);
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> bulkAssignDrivers(List<Map<String, String>> assignments) async {
+    try {
+      final response = await _dio.post('/garage-admin/parcels/bulk-assign', data: {
+        'assignments': assignments,
+      });
       return _handleResponse(response);
     } catch (e) {
       return {'success': false, 'message': e.toString()};
@@ -753,48 +1107,666 @@ class ApiService {
     }
   }
 
-  // ==================== RECHERCHE PUBLIQUE DE CHAUFFEURS ====================
-
-  Future<List<User>> searchDriversPublic({String? query}) async {
+  Future<Map<String, dynamic>> getSystemHealth() async {
     try {
-      final queryParams = <String, dynamic>{};
-      if (query != null && query.isNotEmpty) {
-        queryParams['query'] = query;
-      }
-      final response = await _dio.get('/public/drivers/search', queryParameters: queryParams);
-      final responseData = _handleResponse(response);
-      final List<dynamic> driversData = responseData['drivers'] ?? [];
-      return driversData.map((json) => User.fromJson(json as Map<String, dynamic>)).toList();
+      final response = await _dio.get('/super-admin/system/health');
+      return _handleResponse(response);
     } catch (e) {
-      debugPrint('❌ Erreur searchDriversPublic: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getAuditLogs({
+    int page = 1,
+    int limit = 50,
+    String? userId,
+    String? action,
+    DateTime? startDate,
+    DateTime? endDate,
+  }) async {
+    try {
+      final queryParams = <String, dynamic>{
+        'page': page,
+        'limit': limit,
+      };
+      if (userId != null) queryParams['userId'] = userId;
+      if (action != null) queryParams['action'] = action;
+      if (startDate != null) {
+        queryParams['startDate'] = startDate.toIso8601String().split('T').first;
+      }
+      if (endDate != null) {
+        queryParams['endDate'] = endDate.toIso8601String().split('T').first;
+      }
+
+      final response = await _dio.get('/super-admin/audit-logs', queryParameters: queryParams);
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getSystemConfig() async {
+    try {
+      final response = await _dio.get('/super-admin/config');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> updateSystemConfig(Map<String, dynamic> config) async {
+    try {
+      final response = await _dio.put('/super-admin/config', data: config);
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> backupDatabase() async {
+    try {
+      final response = await _dio.post('/super-admin/backup');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> restoreDatabase(String backupId) async {
+    try {
+      final response = await _dio.post('/super-admin/restore', data: {'backupId': backupId});
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getBackups() async {
+    try {
+      final response = await _dio.get('/super-admin/backups');
+      final responseData = _handleResponse(response);
+      final List<dynamic> backupsData = responseData['backups'] ?? [];
+      return backupsData.map((json) => json as Map<String, dynamic>).toList();
+    } catch (e) {
+      debugPrint('❌ Erreur getBackups: $e');
       return [];
     }
   }
 
-  Future<User?> getDriverByIdPublic(String driverId) async {
+  // ==================== GESTION DES ADMINS GARAGE (SUPER ADMIN) ====================
+
+  Future<Map<String, dynamic>> createGarageAdminSuperAdmin({
+    required String email,
+    required String phone,
+    required String fullName,
+    required String garageId,
+    String pin = '123456',
+  }) async {
     try {
-      final response = await _dio.get('/public/drivers/$driverId');
+      final response = await _dio.post('/super-admin/garage-admins', data: {
+        'email': email,
+        'phone': phone,
+        'fullName': fullName,
+        'garageId': garageId,
+        'pin': pin,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<List<User>> getAllGarageAdminsSuperAdmin() async {
+    try {
+      final response = await _dio.get('/super-admin/garage-admins');
       final responseData = _handleResponse(response);
-      if (responseData['success'] == true && responseData['driver'] != null) {
-        return User.fromJson(responseData['driver']);
+      final List<dynamic> adminsData = responseData['admins'] ?? [];
+      return adminsData.map((json) => User.fromJson(json as Map<String, dynamic>)).toList();
+    } catch (e) {
+      debugPrint('❌ Erreur getAllGarageAdminsSuperAdmin: $e');
+      return [];
+    }
+  }
+
+  Future<Map<String, dynamic>> updateGarageAdminSuperAdmin({
+    required String adminId,
+    required String garageId,
+  }) async {
+    try {
+      final response = await _dio.put('/super-admin/garage-admins/$adminId', data: {
+        'garageId': garageId,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> deleteGarageAdminSuperAdmin(String adminId) async {
+    try {
+      final response = await _dio.delete('/super-admin/garage-admins/$adminId');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  // ==================== GESTION DES CHAUFFEURS ====================
+
+  Future<List<User>> getAllDriversSuperAdmin() async {
+    try {
+      final response = await _dio.get('/super-admin/users', queryParameters: {
+        'role': 'driver',
+      });
+      final responseData = _handleResponse(response);
+      final List<dynamic> usersData = responseData['users'] ?? [];
+      return usersData
+          .map((json) => User.fromJson(json as Map<String, dynamic>))
+          .where((user) => user.role == UserRole.driver)
+          .toList();
+    } catch (e) {
+      debugPrint('❌ Erreur getAllDriversSuperAdmin: $e');
+      return [];
+    }
+  }
+
+  Future<Map<String, dynamic>> updateDriverStatusSuperAdmin(String driverId, String status) async {
+    try {
+      final response = await _dio.patch('/super-admin/users/$driverId/status', data: {
+        'status': status,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> updateDriverDocument({
+    required String type,
+    required String documentUrl,
+  }) async {
+    try {
+      final response = await _dio.put('/driver/documents', data: {
+        'type': type,
+        'documentUrl': documentUrl,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getDriverDocuments() async {
+    try {
+      final response = await _dio.get('/driver/documents');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getDriverSchedule(DateTime date) async {
+    try {
+      final response = await _dio.get('/driver/schedule', queryParameters: {
+        'date': date.toIso8601String().split('T').first,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> updateDriverSchedule({
+    required DateTime date,
+    required bool isAvailable,
+  }) async {
+    try {
+      final response = await _dio.post('/driver/schedule', data: {
+        'date': date.toIso8601String().split('T').first,
+        'isAvailable': isAvailable,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getDriverPerformance() async {
+    try {
+      final response = await _dio.get('/driver/performance');
+      final responseData = _handleResponse(response);
+      final List<dynamic> performanceData = responseData['performance'] ?? [];
+      return performanceData.map((json) => json as Map<String, dynamic>).toList();
+    } catch (e) {
+      debugPrint('❌ Erreur getDriverPerformance: $e');
+      return [];
+    }
+  }
+
+  // ==================== GESTION DES CLIENTS ====================
+
+  Future<List<User>> getAllClientsSuperAdmin() async {
+    try {
+      final response = await _dio.get('/super-admin/clients');
+      final responseData = _handleResponse(response);
+      final List<dynamic> clientsData = responseData['clients'] ?? [];
+      return clientsData.map((json) => User.fromJson(json as Map<String, dynamic>)).toList();
+    } catch (e) {
+      debugPrint('❌ Erreur getAllClientsSuperAdmin: $e');
+      return [];
+    }
+  }
+
+  // ==================== STATISTIQUES ====================
+
+  Future<Map<String, dynamic>> getDashboardStats() async {
+    try {
+      final response = await _dio.get('/admin/stats/dashboard');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getGarageStats(String garageId) async {
+    try {
+      final response = await _dio.get('/garage-admin/stats');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> getDriverStats() async {
+    try {
+      final response = await _dio.get('/driver/stats');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  // ==================== NOTIFICATIONS ====================
+
+  Future<List<Map<String, dynamic>>> getNotifications() async {
+    try {
+      final response = await _dio.get('/notifications');
+      final responseData = _handleResponse(response);
+      final List<dynamic> notificationsData = responseData['notifications'] ?? [];
+      return notificationsData.map((json) => json as Map<String, dynamic>).toList();
+    } catch (e) {
+      debugPrint('❌ Erreur getNotifications: $e');
+      return [];
+    }
+  }
+
+  Future<Map<String, dynamic>> markNotificationAsRead(String notificationId) async {
+    try {
+      final response = await _dio.patch('/notifications/$notificationId/read');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> markAllNotificationsAsRead() async {
+    try {
+      final response = await _dio.patch('/notifications/read-all');
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> registerFcmToken(String token) async {
+    try {
+      final response = await _dio.post('/notifications/fcm-token', data: {'token': token});
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  // ==================== PAIEMENTS ====================
+
+  Future<Map<String, dynamic>> initiatePayment({
+    required double amount,
+    required String method,
+    String? parcelId,
+    String? phoneNumber,
+  }) async {
+    try {
+      final response = await _dio.post('/payments/initiate', data: {
+        'amount': amount,
+        'method': method,
+        'parcelId': parcelId,
+        'phoneNumber': phoneNumber,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> confirmPayment(String paymentId, {String? transactionId}) async {
+    try {
+      final response = await _dio.post('/payments/$paymentId/confirm', data: {
+        'transactionId': transactionId,
+      });
+      return _handleResponse(response);
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getPaymentHistory() async {
+    try {
+      final response = await _dio.get('/payments/history');
+      final responseData = _handleResponse(response);
+      final List<dynamic> paymentsData = responseData['payments'] ?? [];
+      return paymentsData.map((json) => json as Map<String, dynamic>).toList();
+    } catch (e) {
+      debugPrint('❌ Erreur getPaymentHistory: $e');
+      return [];
+    }
+  }
+
+  // ==================== UPLOAD ====================
+
+  Future<String?> uploadXFile(XFile file, String type) async {
+    try {
+      final bytes = await file.readAsBytes();
+      final base64Image = base64Encode(bytes);
+
+      final response = await _dio.post('/upload/base64', data: {
+        'file': base64Image,
+        'type': type,
+        'filename': file.name,
+        'contentType': _getContentType(file.name),
+      });
+
+      final responseData = _handleResponse(response);
+      if (responseData['success'] == true && responseData['url'] != null) {
+        return responseData['url'];
       }
       return null;
     } catch (e) {
-      debugPrint('❌ Erreur getDriverByIdPublic: $e');
+      debugPrint('❌ Erreur uploadXFile: $e');
       return null;
     }
   }
 
-  Future<List<User>> getDriversByGaragePublic(String garageId) async {
+  Future<String?> uploadFile(File file, String type) async {
+    if (kIsWeb) {
+      debugPrint('⚠️ uploadFile ne fonctionne pas sur Web, utilisez uploadXFile à la place');
+      return null;
+    }
+
     try {
-      final response = await _dio.get('/public/drivers/garage/$garageId');
+      final formData = FormData.fromMap({
+        'file': await MultipartFile.fromFile(
+          file.path,
+          filename: file.path.split('/').last,
+          contentType: MediaType('image', 'jpeg'),
+        ),
+        'type': type,
+      });
+
+      final response = await _dio.post('/upload', data: formData);
       final responseData = _handleResponse(response);
-      final List<dynamic> driversData = responseData['drivers'] ?? [];
-      return driversData.map((json) => User.fromJson(json as Map<String, dynamic>)).toList();
+      if (responseData['success'] == true && responseData['url'] != null) {
+        return responseData['url'];
+      }
+      return null;
     } catch (e) {
-      debugPrint('❌ Erreur getDriversByGaragePublic: $e');
+      debugPrint('❌ Erreur uploadFile: $e');
+      return null;
+    }
+  }
+
+  Future<String?> uploadFileFromXFile(XFile file, String type) async {
+    try {
+      if (kIsWeb) {
+        final bytes = await file.readAsBytes();
+        final formData = FormData.fromMap({
+          'file': MultipartFile.fromBytes(
+            bytes,
+            filename: file.name,
+            contentType: MediaType('image', 'jpeg'),
+          ),
+          'type': type,
+        });
+
+        final response = await _dio.post('/upload', data: formData);
+        final responseData = _handleResponse(response);
+        if (responseData['success'] == true && responseData['url'] != null) {
+          return responseData['url'];
+        }
+        return null;
+      } else {
+        final formData = FormData.fromMap({
+          'file': await MultipartFile.fromFile(
+            file.path,
+            filename: file.name,
+            contentType: MediaType('image', 'jpeg'),
+          ),
+          'type': type,
+        });
+
+        final response = await _dio.post('/upload', data: formData);
+        final responseData = _handleResponse(response);
+        if (responseData['success'] == true && responseData['url'] != null) {
+          return responseData['url'];
+        }
+        return null;
+      }
+    } catch (e) {
+      debugPrint('❌ Erreur uploadFileFromXFile: $e');
+      return null;
+    }
+  }
+
+  Future<List<String>> uploadMultipleFiles(List<XFile> files, String type) async {
+    try {
+      final List<String> urls = [];
+
+      for (final file in files) {
+        final url = await uploadXFile(file, type);
+        if (url != null) {
+          urls.add(url);
+        }
+      }
+
+      return urls;
+    } catch (e) {
+      debugPrint('❌ Erreur uploadMultipleFiles: $e');
       return [];
     }
+  }
+
+  Future<List<String>> uploadMultipleFilesFromXFile(List<XFile> files, String type) async {
+    try {
+      final List<String> urls = [];
+
+      for (final file in files) {
+        final url = await uploadFileFromXFile(file, type);
+        if (url != null) {
+          urls.add(url);
+        }
+      }
+
+      return urls;
+    } catch (e) {
+      debugPrint('❌ Erreur uploadMultipleFilesFromXFile: $e');
+      return [];
+    }
+  }
+
+  Future<String?> uploadProfilePhoto(XFile file) async {
+    return uploadXFile(file, 'profile');
+  }
+
+  Future<String?> uploadProfilePhotoFromFile(dynamic file) async {
+    try {
+      if (kIsWeb && file is XFile) {
+        final bytes = await file.readAsBytes();
+        final formData = FormData.fromMap({
+          'file': MultipartFile.fromBytes(
+            bytes,
+            filename: file.name,
+          ),
+          'type': 'profile',
+        });
+
+        final response = await _dio.post(
+          '/upload',
+          data: formData,
+          options: Options(
+            headers: {
+              'Content-Type': 'multipart/form-data',
+            },
+          ),
+        );
+
+        final responseData = _handleResponse(response);
+        if (responseData['success'] == true && responseData['url'] != null) {
+          return responseData['url'];
+        }
+        return null;
+      } else if (file is XFile) {
+        final formData = FormData.fromMap({
+          'file': await MultipartFile.fromFile(
+            file.path,
+            filename: file.name,
+          ),
+          'type': 'profile',
+        });
+
+        final response = await _dio.post(
+          '/upload',
+          data: formData,
+          options: Options(
+            headers: {
+              'Content-Type': 'multipart/form-data',
+            },
+          ),
+        );
+
+        final responseData = _handleResponse(response);
+        if (responseData['success'] == true && responseData['url'] != null) {
+          return responseData['url'];
+        }
+        return null;
+      }
+      return null;
+    } catch (e) {
+      debugPrint('❌ Erreur uploadProfilePhotoFromFile: $e');
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>> uploadFileDirect(FormData formData) async {
+    try {
+      final response = await _dio.post(
+        '/upload',
+        data: formData,
+        options: Options(
+          headers: {
+            'Content-Type': 'multipart/form-data',
+          },
+        ),
+      );
+      return _handleResponse(response);
+    } catch (e) {
+      debugPrint('❌ Erreur uploadFileDirect: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  // Future<String?> uploadParcelPhoto(XFile file, String parcelId) async {
+  //   return uploadXFile(file, 'parcel/$parcelId');
+  // }
+
+  Future<Map<String, dynamic>> updateProfilePhoto(String photoUrl) async {
+    try {
+      final currentUser = await getCurrentUser();
+      final role = currentUser.role;
+
+      String endpoint;
+      switch (role) {
+        case UserRole.client:
+          endpoint = '/client/profile-photo';
+          break;
+        case UserRole.driver:
+          endpoint = '/driver/profile-photo';
+          break;
+        case UserRole.admin:
+          endpoint = '/garage-admin/profile-photo';
+          break;
+        case UserRole.superAdmin:
+          endpoint = '/super-admin/profile-photo';
+          break;
+      }
+
+      final response = await _dio.put(
+        endpoint,
+        data: {'photoUrl': photoUrl},
+      );
+      return _handleResponse(response);
+    } catch (e) {
+      debugPrint('❌ Erreur updateProfilePhoto: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> updateProfilePhotoUrl(String photoUrl) async {
+    try {
+      final currentUser = await getCurrentUser();
+      final role = currentUser.role;
+
+      String endpoint;
+      switch (role) {
+        case UserRole.client:
+          endpoint = '/client/profile-photo';
+          break;
+        case UserRole.driver:
+          endpoint = '/driver/profile-photo';
+          break;
+        case UserRole.admin:
+          endpoint = '/garage-admin/profile-photo';
+          break;
+        case UserRole.superAdmin:
+          endpoint = '/super-admin/profile-photo';
+          break;
+      }
+
+      final response = await _dio.put(endpoint, data: {'photoUrl': photoUrl});
+      return _handleResponse(response);
+    } catch (e) {
+      debugPrint('❌ Erreur updateProfilePhotoUrl: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<Map<String, dynamic>> uploadAndUpdateProfilePhoto(XFile file) async {
+    try {
+      final photoUrl = await uploadProfilePhoto(file);
+
+      if (photoUrl == null) {
+        return {'success': false, 'message': 'Erreur lors de l\'upload'};
+      }
+
+      final response = await updateProfilePhotoUrl(photoUrl);
+
+      return response;
+    } catch (e) {
+      debugPrint('❌ Erreur uploadAndUpdateProfilePhoto: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  Future<String?> uploadProfilePhotoFile(File file) async {
+    return uploadFile(file, 'profile');
   }
 
   // ==================== MÉTHODES ADMIN STANDARD ====================
@@ -1000,345 +1972,49 @@ class ApiService {
     }
   }
 
-  // ==================== GESTION DES ADMINS GARAGE (SUPER ADMIN) ====================
+  // ==================== RECHERCHE PUBLIQUE DE CHAUFFEURS ====================
 
-  Future<Map<String, dynamic>> createGarageAdminSuperAdmin({
-    required String email,
-    required String phone,
-    required String fullName,
-    required String garageId,
-    String pin = '123456',
-  }) async {
+  Future<List<User>> searchDriversPublic({String? query}) async {
     try {
-      final response = await _dio.post('/super-admin/garage-admins', data: {
-        'email': email,
-        'phone': phone,
-        'fullName': fullName,
-        'garageId': garageId,
-        'pin': pin,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<List<User>> getAllGarageAdminsSuperAdmin() async {
-    try {
-      final response = await _dio.get('/super-admin/garage-admins');
+      final queryParams = <String, dynamic>{};
+      if (query != null && query.isNotEmpty) {
+        queryParams['query'] = query;
+      }
+      final response = await _dio.get('/public/drivers/search', queryParameters: queryParams);
       final responseData = _handleResponse(response);
-      final List<dynamic> adminsData = responseData['admins'] ?? [];
-      return adminsData.map((json) => User.fromJson(json as Map<String, dynamic>)).toList();
+      final List<dynamic> driversData = responseData['drivers'] ?? [];
+      return driversData.map((json) => User.fromJson(json as Map<String, dynamic>)).toList();
     } catch (e) {
-      debugPrint('❌ Erreur getAllGarageAdminsSuperAdmin: $e');
+      debugPrint('❌ Erreur searchDriversPublic: $e');
       return [];
     }
   }
 
-  Future<Map<String, dynamic>> updateGarageAdminSuperAdmin({
-    required String adminId,
-    required String garageId,
-  }) async {
+  Future<User?> getDriverByIdPublic(String driverId) async {
     try {
-      final response = await _dio.put('/super-admin/garage-admins/$adminId', data: {
-        'garageId': garageId,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> deleteGarageAdminSuperAdmin(String adminId) async {
-    try {
-      final response = await _dio.delete('/super-admin/garage-admins/$adminId');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  // ==================== GESTION DES CHAUFFEURS (SUPER ADMIN) ====================
-
-  Future<List<User>> getAllDriversSuperAdmin() async {
-    try {
-      final response = await _dio.get('/super-admin/users', queryParameters: {
-        'role': 'driver',
-      });
+      final response = await _dio.get('/public/drivers/$driverId');
       final responseData = _handleResponse(response);
-      final List<dynamic> usersData = responseData['users'] ?? [];
-      return usersData
-          .map((json) => User.fromJson(json as Map<String, dynamic>))
-          .where((user) => user.role == UserRole.driver)
-          .toList();
-    } catch (e) {
-      debugPrint('❌ Erreur getAllDriversSuperAdmin: $e');
-      return [];
-    }
-  }
-
-  Future<Map<String, dynamic>> updateDriverStatusSuperAdmin(String driverId, String status) async {
-    try {
-      final response = await _dio.patch('/super-admin/users/$driverId/status', data: {
-        'status': status,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  // ==================== GESTION DES CLIENTS (SUPER ADMIN) ====================
-
-  Future<List<User>> getAllClientsSuperAdmin() async {
-    try {
-      final response = await _dio.get('/super-admin/clients');
-      final responseData = _handleResponse(response);
-      final List<dynamic> clientsData = responseData['clients'] ?? [];
-      return clientsData.map((json) => User.fromJson(json as Map<String, dynamic>)).toList();
-    } catch (e) {
-      debugPrint('❌ Erreur getAllClientsSuperAdmin: $e');
-      return [];
-    }
-  }
-
-  // ==================== STATISTIQUES AVANCÉES ====================
-
-  Future<Map<String, dynamic>> getDashboardStats() async {
-    try {
-      final response = await _dio.get('/admin/stats/dashboard');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> getGarageStats(String garageId) async {
-    try {
-      final response = await _dio.get('/garage-admin/stats');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> getDriverStats() async {
-    try {
-      final response = await _dio.get('/driver/stats');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  // ==================== NOTIFICATIONS ====================
-
-  Future<List<Map<String, dynamic>>> getNotifications() async {
-    try {
-      final response = await _dio.get('/notifications');
-      final responseData = _handleResponse(response);
-      final List<dynamic> notificationsData = responseData['notifications'] ?? [];
-      return notificationsData.map((json) => json as Map<String, dynamic>).toList();
-    } catch (e) {
-      debugPrint('❌ Erreur getNotifications: $e');
-      return [];
-    }
-  }
-
-  Future<Map<String, dynamic>> markNotificationAsRead(String notificationId) async {
-    try {
-      final response = await _dio.patch('/notifications/$notificationId/read');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> markAllNotificationsAsRead() async {
-    try {
-      final response = await _dio.patch('/notifications/read-all');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> registerFcmToken(String token) async {
-    try {
-      final response = await _dio.post('/notifications/fcm-token', data: {'token': token});
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  // ==================== PAIEMENTS ====================
-
-  Future<Map<String, dynamic>> initiatePayment({
-    required double amount,
-    required String method,
-    String? parcelId,
-    String? phoneNumber,
-  }) async {
-    try {
-      final response = await _dio.post('/payments/initiate', data: {
-        'amount': amount,
-        'method': method,
-        'parcelId': parcelId,
-        'phoneNumber': phoneNumber,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> confirmPayment(String paymentId, {String? transactionId}) async {
-    try {
-      final response = await _dio.post('/payments/$paymentId/confirm', data: {
-        'transactionId': transactionId,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<List<Map<String, dynamic>>> getPaymentHistory() async {
-    try {
-      final response = await _dio.get('/payments/history');
-      final responseData = _handleResponse(response);
-      final List<dynamic> paymentsData = responseData['payments'] ?? [];
-      return paymentsData.map((json) => json as Map<String, dynamic>).toList();
-    } catch (e) {
-      debugPrint('❌ Erreur getPaymentHistory: $e');
-      return [];
-    }
-  }
-
-  // ==================== UPLOAD ====================
-
-Future<String?> uploadXFile(XFile file, String type) async {
-    try {
-      final bytes = await file.readAsBytes();
-      final base64Image = base64Encode(bytes);
-      
-      final response = await _dio.post('/upload/base64', data: {
-        'file': base64Image,
-        'type': type,
-        'filename': file.name,
-        'contentType': _getContentType(file.name),
-      });
-      
-      final responseData = _handleResponse(response);
-      if (responseData['success'] == true && responseData['url'] != null) {
-        return responseData['url'];
+      if (responseData['success'] == true && responseData['driver'] != null) {
+        return User.fromJson(responseData['driver']);
       }
       return null;
     } catch (e) {
-      debugPrint('❌ Erreur uploadXFile: $e');
+      debugPrint('❌ Erreur getDriverByIdPublic: $e');
       return null;
     }
   }
 
-
-  Future<String?> uploadFile(File file, String type) async {
-    if (kIsWeb) {
-      debugPrint('⚠️ uploadFile ne fonctionne pas sur Web, utilisez uploadXFile à la place');
-      return null;
-    }
-    
+  Future<List<User>> getDriversByGaragePublic(String garageId) async {
     try {
-      final formData = FormData.fromMap({
-        'file': await MultipartFile.fromFile(
-          file.path,
-          filename: file.path.split('/').last,
-          contentType: MediaType('image', 'jpeg'),
-        ),
-        'type': type,
-      });
-      
-      final response = await _dio.post('/upload', data: formData);
+      final response = await _dio.get('/public/drivers/garage/$garageId');
       final responseData = _handleResponse(response);
-      if (responseData['success'] == true && responseData['url'] != null) {
-        return responseData['url'];
-      }
-      return null;
+      final List<dynamic> driversData = responseData['drivers'] ?? [];
+      return driversData.map((json) => User.fromJson(json as Map<String, dynamic>)).toList();
     } catch (e) {
-      debugPrint('❌ Erreur uploadFile: $e');
-      return null;
-    }
-  }
-
-  Future<List<String>> uploadMultipleFiles(List<XFile> files, String type) async {
-    try {
-      final List<String> urls = [];
-      
-      for (final file in files) {
-        final url = await uploadXFile(file, type);
-        if (url != null) {
-          urls.add(url);
-        }
-      }
-      
-      return urls;
-    } catch (e) {
-      debugPrint('❌ Erreur uploadMultipleFiles: $e');
+      debugPrint('❌ Erreur getDriversByGaragePublic: $e');
       return [];
     }
   }
-
-  Future<String?> uploadProfilePhoto(XFile file) async {
-    return uploadXFile(file, 'profile');
-  }
-
-  Future<String?> uploadParcelPhoto(XFile file, String parcelId) async {
-    return uploadXFile(file, 'parcel/$parcelId');
-  }
-
-  Future<Map<String, dynamic>> updateProfilePhoto(String photoUrl) async {
-    try {
-      final currentUser = await getCurrentUser();
-      final role = currentUser.role;
-      
-      String endpoint;
-      switch (role) {
-        case UserRole.client:
-          endpoint = '/client/profile-photo';
-          break;
-        case UserRole.driver:
-          endpoint = '/driver/profile-photo';
-          break;
-        case UserRole.admin:
-          endpoint = '/garage-admin/profile-photo';
-          break;
-        case UserRole.superAdmin:
-          endpoint = '/super-admin/profile-photo';
-          break;
-      }
-      
-      final response = await _dio.put(
-        endpoint,
-        data: {'photoUrl': photoUrl},
-      );
-      return _handleResponse(response);
-    } catch (e) {
-      debugPrint('❌ Erreur updateProfilePhoto: $e');
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-Future<String?> uploadProfilePhotoFile(File file) async {
-  return uploadFile(file, 'profile');
-} 
-  
-
-  String _getContentType(String path) {
-  if (path.endsWith('.png')) return 'image/png';
-  if (path.endsWith('.jpg') || path.endsWith('.jpeg')) return 'image/jpeg';
-  if (path.endsWith('.gif')) return 'image/gif';
-  return 'image/jpeg';
-}
 
   // ==================== VÉHICULES ====================
 
@@ -1457,9 +2133,13 @@ Future<String?> uploadProfilePhotoFile(File file) async {
         'reportType': reportType,
         'format': format,
       };
-      if (startDate != null) queryParams['startDate'] = startDate.toIso8601String().split('T').first;
-      if (endDate != null) queryParams['endDate'] = endDate.toIso8601String().split('T').first;
-      
+      if (startDate != null) {
+        queryParams['startDate'] = startDate.toIso8601String().split('T').first;
+      }
+      if (endDate != null) {
+        queryParams['endDate'] = endDate.toIso8601String().split('T').first;
+      }
+
       final response = await _dio.get('/reports/export', queryParameters: queryParams);
       final responseData = _handleResponse(response);
       if (responseData['success'] == true && responseData['url'] != null) {
@@ -1604,654 +2284,6 @@ Future<String?> uploadProfilePhotoFile(File file) async {
       return _handleResponse(response);
     } catch (e) {
       return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  // ==================== AUTHENTIFICATION AVANCÉE ====================
-
-  Future<Map<String, dynamic>> refreshToken() async {
-    try {
-      final refreshToken = await _storage.read(key: 'refresh_token');
-      if (refreshToken == null) {
-        return {'success': false, 'message': 'No refresh token'};
-      }
-      final response = await _dio.post('/auth/refresh', data: {
-        'refreshToken': refreshToken,
-      });
-      final responseData = _handleResponse(response);
-      if (responseData['success'] == true && responseData['accessToken'] != null) {
-        await setToken(responseData['accessToken']);
-        if (responseData['refreshToken'] != null) {
-          await _storage.write(key: 'refresh_token', value: responseData['refreshToken']);
-        }
-      }
-      return responseData;
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> forgotPassword(String email) async {
-    try {
-      final response = await _dio.post('/auth/forgot-password', data: {'email': email});
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> resetPassword({
-    required String token,
-    required String newPassword,
-  }) async {
-    try {
-      final response = await _dio.post('/auth/reset-password', data: {
-        'token': token,
-        'newPassword': newPassword,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> changePassword({
-    required String currentPassword,
-    required String newPassword,
-  }) async {
-    try {
-      final response = await _dio.post('/auth/change-password', data: {
-        'currentPassword': currentPassword,
-        'newPassword': newPassword,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> verifyEmail(String otpCode) async {
-    try {
-      final response = await _dio.post('/auth/verify-email', data: {'otpCode': otpCode});
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> resendVerificationEmail() async {
-    try {
-      final response = await _dio.post('/auth/resend-verification');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  // ==================== GESTION DES UTILISATEURS (SUITE) ====================
-
-  
-
-  // ==================== PHOTO DE PROFIL ====================
- Future<String?> uploadFileFromXFile(XFile file, String type) async {
-  try {
-    if (kIsWeb) {
-      // Pour le Web - utiliser MultipartFile.fromBytes
-      final bytes = await file.readAsBytes();
-      final formData = FormData.fromMap({
-        'file': MultipartFile.fromBytes(
-          bytes,
-          filename: file.name,
-          contentType: MediaType('image', 'jpeg'),
-        ),
-        'type': type,
-      });
-      
-      final response = await _dio.post('/upload', data: formData);
-      final responseData = _handleResponse(response);
-      if (responseData['success'] == true && responseData['url'] != null) {
-        return responseData['url'];
-      }
-      return null;
-    } else {
-      // Pour Mobile
-      final formData = FormData.fromMap({
-        'file': await MultipartFile.fromFile(
-          file.path,
-          filename: file.name,
-          contentType: MediaType('image', 'jpeg'),
-        ),
-        'type': type,
-      });
-      
-      final response = await _dio.post('/upload', data: formData);
-      final responseData = _handleResponse(response);
-      if (responseData['success'] == true && responseData['url'] != null) {
-        return responseData['url'];
-      }
-      return null;
-    }
-  } catch (e) {
-    debugPrint('❌ Erreur uploadFileFromXFile: $e');
-    return null;
-  }
-}
-
-Future<List<String>> uploadMultipleFilesFromXFile(List<XFile> files, String type) async {
-  try {
-    final List<String> urls = [];
-    
-    for (final file in files) {
-      final url = await uploadFileFromXFile(file, type);
-      if (url != null) {
-        urls.add(url);
-      }
-    }
-    
-    return urls;
-  } catch (e) {
-    debugPrint('❌ Erreur uploadMultipleFilesFromXFile: $e');
-    return [];
-  }
-}
-
-// ==================== PHOTO DE PROFIL ====================
-
-// Future<String?> uploadProfilePhoto(XFile file) async {
-//   return uploadFileFromXFile(file, 'profile');
-// }
-
-Future<Map<String, dynamic>> updateProfilePhotoUrl(String photoUrl) async {
-  try {
-    final currentUser = await getCurrentUser();
-    final role = currentUser.role;
-    
-    String endpoint;
-    switch (role) {
-      case UserRole.client:
-        endpoint = '/client/profile-photo';
-        break;
-      case UserRole.driver:
-        endpoint = '/driver/profile-photo';
-        break;
-      case UserRole.admin:
-        endpoint = '/garage-admin/profile-photo';
-        break;
-      case UserRole.superAdmin:
-        endpoint = '/super-admin/profile-photo';
-        break;
-    }
-    
-    final response = await _dio.put(endpoint, data: {'photoUrl': photoUrl});
-    return _handleResponse(response);
-  } catch (e) {
-    debugPrint('❌ Erreur updateProfilePhotoUrl: $e');
-    return {'success': false, 'message': e.toString()};
-  }
-}
-
-// ==================== UPLOAD PHOTO DE PROFIL COMPLET ====================
-
-Future<Map<String, dynamic>> uploadAndUpdateProfilePhoto(XFile file) async {
-  try {
-    // 1. Uploader la photo
-    final photoUrl = await uploadProfilePhoto(file);
-    
-    if (photoUrl == null) {
-      return {'success': false, 'message': 'Erreur lors de l\'upload'};
-    }
-    
-    // 2. Mettre à jour le profil avec la nouvelle URL
-    final response = await updateProfilePhotoUrl(photoUrl);
-    
-    return response;
-  } catch (e) {
-    debugPrint('❌ Erreur uploadAndUpdateProfilePhoto: $e');
-    return {'success': false, 'message': e.toString()};
-  }
-}
-// ==================== MISE À JOUR PROFIL PAR RÔLE (CORRIGÉ) ====================
-
-Future<Map<String, dynamic>> updateProfileByRole(String endpoint, Map<String, dynamic> data) async {
-  try {
-    final response = await _dio.put(
-      endpoint,
-      data: data,
-      options: Options(
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      ),
-    );
-    return _handleResponse(response);
-  } catch (e) {
-    debugPrint('❌ Erreur updateProfileByRole: $e');
-    return {'success': false, 'message': e.toString()};
-  }
-}
-
-// ==================== SUPPRESSION DE COMPTE ====================
-
-Future<Map<String, dynamic>> deleteAccount() async {
-  try {
-    final response = await _dio.delete(
-      '/users/account',
-      options: Options(
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      ),
-    );
-    return _handleResponse(response);
-  } catch (e) {
-    debugPrint('❌ Erreur deleteAccount: $e');
-    return {'success': false, 'message': e.toString()};
-  }
-}
-
-// ==================== STATISTIQUES UTILISATEUR ====================
-
-Future<Map<String, dynamic>> getUserStats() async {
-  try {
-    final response = await _dio.get(
-      '/users/stats',
-      options: Options(
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      ),
-    );
-    return _handleResponse(response);
-  } catch (e) {
-    debugPrint('❌ Erreur getUserStats: $e');
-    return {'success': false, 'message': e.toString()};
-  }
-}
-
-// ==================== UPLOAD PHOTO DE PROFIL DEPUIS L'UI ====================
-
-Future<String?> uploadProfilePhotoFromFile(dynamic file) async {
-  try {
-    if (kIsWeb && file is XFile) {
-      // Web
-      final bytes = await file.readAsBytes();
-      final formData = FormData.fromMap({
-        'file': MultipartFile.fromBytes(
-          bytes,
-          filename: file.name,
-        ),
-        'type': 'profile',
-      });
-      
-      final response = await _dio.post(
-        '/upload',
-        data: formData,
-        options: Options(
-          headers: {
-            'Content-Type': 'multipart/form-data',
-          },
-        ),
-      );
-      
-      final responseData = _handleResponse(response);
-      if (responseData['success'] == true && responseData['url'] != null) {
-        return responseData['url'];
-      }
-      return null;
-    } else if (file is XFile) {
-      // Mobile
-      final formData = FormData.fromMap({
-        'file': await MultipartFile.fromFile(
-          file.path,
-          filename: file.name,
-        ),
-        'type': 'profile',
-      });
-      
-      final response = await _dio.post(
-        '/upload',
-        data: formData,
-        options: Options(
-          headers: {
-            'Content-Type': 'multipart/form-data',
-          },
-        ),
-      );
-      
-      final responseData = _handleResponse(response);
-      if (responseData['success'] == true && responseData['url'] != null) {
-        return responseData['url'];
-      }
-      return null;
-    }
-    return null;
-  } catch (e) {
-    debugPrint('❌ Erreur uploadProfilePhotoFromFile: $e');
-    return null;
-  }
-}
-
-Future<Map<String, dynamic>> uploadFileDirect(FormData formData) async {
-  try {
-    final response = await _dio.post(
-      '/upload',
-      data: formData,
-      options: Options(
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-      ),
-    );
-    return _handleResponse(response);
-  } catch (e) {
-    debugPrint('❌ Erreur uploadFileDirect: $e');
-    return {'success': false, 'message': e.toString()};
-  }
-}
-  // ==================== GESTION DES COLIS (SUITE) ====================
-
-  Future<Map<String, dynamic>> estimateDeliveryPrice({
-    required double weight,
-    required String departureGarageId,
-    required String arrivalGarageId,
-    required String type,
-    bool urgent = false,
-    bool insured = false,
-  }) async {
-    try {
-      final response = await _dio.post('/parcels/estimate', data: {
-        'weight': weight,
-        'departureGarageId': departureGarageId,
-        'arrivalGarageId': arrivalGarageId,
-        'type': type,
-        'urgent': urgent,
-        'insured': insured,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> getParcelTimeline(String parcelId) async {
-    try {
-      final response = await _dio.get('/parcels/$parcelId/timeline');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> addParcelNote(String parcelId, String note) async {
-    try {
-      final response = await _dio.post('/parcels/$parcelId/notes', data: {'note': note});
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<List<Map<String, dynamic>>> getParcelNotes(String parcelId) async {
-    try {
-      final response = await _dio.get('/parcels/$parcelId/notes');
-      final responseData = _handleResponse(response);
-      final List<dynamic> notesData = responseData['notes'] ?? [];
-      return notesData.map((json) => json as Map<String, dynamic>).toList();
-    } catch (e) {
-      debugPrint('❌ Erreur getParcelNotes: $e');
-      return [];
-    }
-  }
-
-  Future<Map<String, dynamic>> downloadDeliveryProof(String parcelId) async {
-    try {
-      final response = await _dio.get('/parcels/$parcelId/proof');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  // ==================== GESTION DES CHAUFFEURS (SUITE) ====================
-
-  Future<Map<String, dynamic>> updateDriverDocument({
-    required String type,
-    required String documentUrl,
-  }) async {
-    try {
-      final response = await _dio.put('/driver/documents', data: {
-        'type': type,
-        'documentUrl': documentUrl,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> getDriverDocuments() async {
-    try {
-      final response = await _dio.get('/driver/documents');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> getDriverSchedule(DateTime date) async {
-    try {
-      final response = await _dio.get('/driver/schedule', queryParameters: {
-        'date': date.toIso8601String().split('T').first,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> updateDriverSchedule({
-    required DateTime date,
-    required bool isAvailable,
-  }) async {
-    try {
-      final response = await _dio.post('/driver/schedule', data: {
-        'date': date.toIso8601String().split('T').first,
-        'isAvailable': isAvailable,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<List<Map<String, dynamic>>> getDriverPerformance() async {
-    try {
-      final response = await _dio.get('/driver/performance');
-      final responseData = _handleResponse(response);
-      final List<dynamic> performanceData = responseData['performance'] ?? [];
-      return performanceData.map((json) => json as Map<String, dynamic>).toList();
-    } catch (e) {
-      debugPrint('❌ Erreur getDriverPerformance: $e');
-      return [];
-    }
-  }
-
-  // ==================== GESTION DES GARAGES (SUITE) ====================
-
-  Future<Map<String, dynamic>> getGaragePerformance(String garageId) async {
-    try {
-      final response = await _dio.get('/garages/$garageId/performance');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> getGarageRevenue({
-    required String garageId,
-    DateTime? startDate,
-    DateTime? endDate,
-  }) async {
-    try {
-      final queryParams = <String, dynamic>{};
-      if (startDate != null) queryParams['startDate'] = startDate.toIso8601String().split('T').first;
-      if (endDate != null) queryParams['endDate'] = endDate.toIso8601String().split('T').first;
-      
-      final response = await _dio.get('/garages/$garageId/revenue', queryParameters: queryParams);
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<List<Map<String, dynamic>>> getGarageDriversSchedule(String garageId, DateTime date) async {
-    try {
-      final response = await _dio.get('/garages/$garageId/drivers/schedule', queryParameters: {
-        'date': date.toIso8601String().split('T').first,
-      });
-      final responseData = _handleResponse(response);
-      final List<dynamic> scheduleData = responseData['schedule'] ?? [];
-      return scheduleData.map((json) => json as Map<String, dynamic>).toList();
-    } catch (e) {
-      debugPrint('❌ Erreur getGarageDriversSchedule: $e');
-      return [];
-    }
-  }
-
-  // ==================== ADMIN GARAGE (SUITE) ====================
-
-  Future<Map<String, dynamic>> getGarageDailyReport(DateTime date) async {
-    try {
-      final response = await _dio.get('/garage-admin/reports/daily', queryParameters: {
-        'date': date.toIso8601String().split('T').first,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> getGarageMonthlyReport(int year, int month) async {
-    try {
-      final response = await _dio.get('/garage-admin/reports/monthly', queryParameters: {
-        'year': year,
-        'month': month,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> exportGarageReport({
-    required String format,
-    DateTime? startDate,
-    DateTime? endDate,
-  }) async {
-    try {
-      final queryParams = <String, dynamic>{'format': format};
-      if (startDate != null) queryParams['startDate'] = startDate.toIso8601String().split('T').first;
-      if (endDate != null) queryParams['endDate'] = endDate.toIso8601String().split('T').first;
-      
-      final response = await _dio.get('/garage-admin/reports/export', queryParameters: queryParams);
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> bulkAssignDrivers(List<Map<String, String>> assignments) async {
-    try {
-      final response = await _dio.post('/garage-admin/parcels/bulk-assign', data: {
-        'assignments': assignments,
-      });
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  // ==================== SUPER ADMIN (SUITE) ====================
-
-  Future<Map<String, dynamic>> getSystemHealth() async {
-    try {
-      final response = await _dio.get('/super-admin/system/health');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> getAuditLogs({
-    int page = 1,
-    int limit = 50,
-    String? userId,
-    String? action,
-    DateTime? startDate,
-    DateTime? endDate,
-  }) async {
-    try {
-      final queryParams = <String, dynamic>{
-        'page': page,
-        'limit': limit,
-      };
-      if (userId != null) queryParams['userId'] = userId;
-      if (action != null) queryParams['action'] = action;
-      if (startDate != null) queryParams['startDate'] = startDate.toIso8601String().split('T').first;
-      if (endDate != null) queryParams['endDate'] = endDate.toIso8601String().split('T').first;
-      
-      final response = await _dio.get('/super-admin/audit-logs', queryParameters: queryParams);
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> getSystemConfig() async {
-    try {
-      final response = await _dio.get('/super-admin/config');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> updateSystemConfig(Map<String, dynamic> config) async {
-    try {
-      final response = await _dio.put('/super-admin/config', data: config);
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> backupDatabase() async {
-    try {
-      final response = await _dio.post('/super-admin/backup');
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<Map<String, dynamic>> restoreDatabase(String backupId) async {
-    try {
-      final response = await _dio.post('/super-admin/restore', data: {'backupId': backupId});
-      return _handleResponse(response);
-    } catch (e) {
-      return {'success': false, 'message': e.toString()};
-    }
-  }
-
-  Future<List<Map<String, dynamic>>> getBackups() async {
-    try {
-      final response = await _dio.get('/super-admin/backups');
-      final responseData = _handleResponse(response);
-      final List<dynamic> backupsData = responseData['backups'] ?? [];
-      return backupsData.map((json) => json as Map<String, dynamic>).toList();
-    } catch (e) {
-      debugPrint('❌ Erreur getBackups: $e');
-      return [];
     }
   }
 
@@ -2456,9 +2488,13 @@ Future<Map<String, dynamic>> uploadFileDirect(FormData formData) async {
     try {
       final queryParams = <String, dynamic>{'q': query};
       if (status != null) queryParams['status'] = status;
-      if (startDate != null) queryParams['startDate'] = startDate.toIso8601String().split('T').first;
-      if (endDate != null) queryParams['endDate'] = endDate.toIso8601String().split('T').first;
-      
+      if (startDate != null) {
+        queryParams['startDate'] = startDate.toIso8601String().split('T').first;
+      }
+      if (endDate != null) {
+        queryParams['endDate'] = endDate.toIso8601String().split('T').first;
+      }
+
       final response = await _dio.get('/search/parcels', queryParameters: queryParams);
       final responseData = _handleResponse(response);
       final List<dynamic> parcelsData = responseData['parcels'] ?? [];

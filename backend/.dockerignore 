@@ -1,0 +1,8 @@
+# backend/.dockerignore
+.git
+.gitignore
+.dart_tool
+build
+.DS_Store
+*.md
+test/

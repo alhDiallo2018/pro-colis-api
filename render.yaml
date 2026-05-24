@@ -1,0 +1,38 @@
+# render.yaml
+services:
+  - type: web
+    name: procolis-backend
+    runtime: image
+    repo: https://github.com/alhDiallo2018/pro-colis
+    plan: free
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DB_HOST
+        fromDatabase:
+          name: procolis-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: procolis-db
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: procolis-db
+          property: database
+      - key: DB_USER
+        fromDatabase:
+          name: procolis-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: procolis-db
+          property: password
+
+  - type: database
+    name: procolis-db
+    plan: free
