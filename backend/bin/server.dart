@@ -46,11 +46,11 @@ void main() async {
   final db = await DatabaseService.getInstance();
 
   if (!db.isConnected) {
-    print('❌ Base de données non connectée!');
+    print('❌ Base de données non connectée! Ono');
     // Ne pas quitter, le serveur peut démarrer même sans DB
     print('⚠️ Le serveur démarre sans base de données');
   } else {
-    print('✅ Base de données initialisée');
+    print('✅ Base de données initialisée--on ok');
   }
 
   // ================= EMAIL =================
