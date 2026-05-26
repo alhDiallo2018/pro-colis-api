@@ -1,5 +1,5 @@
-import 'dart:io';
 import 'package:postgres/postgres.dart';
+import 'package:procolis_backend/config/database_config.dart';
 
 class DatabaseService {
   static DatabaseService? _instance;
@@ -20,49 +20,43 @@ class DatabaseService {
   }
 
   Future<void> _init() async {
-    final host = Platform.environment['DB_HOST'];
-    final port = Platform.environment['DB_PORT'];
-    final database = Platform.environment['DB_NAME'];
-    final username = Platform.environment['DB_USER'];
-    final password = Platform.environment['DB_PASSWORD'];
-
-    print('🔍 DB Configuration:');
-    print('  DB_HOST: $host');
-    print('  DB_PORT: $port');
-    print('  DB_NAME: $database');
-    print('  DB_USER: $username');
-
-    if (host == null) {
-      print('❌ DB_HOST non défini');
-      _isConnected = false;
-      return;
-    }
+  try {
+    final config = await DatabaseConfig.getInstance();
 
     final endpoint = Endpoint(
-      host: host,
-      port: int.parse(port ?? '5432'),
-      database: database ?? 'procolis_db',
-      username: username ?? 'procolis_user',
-      password: password ?? '',
+      host: config.host,
+      port: config.port,
+      database: config.database,
+      username: config.username,
+      password: config.password,
     );
 
     final settings = ConnectionSettings(
-      sslMode: SslMode.require,
+      sslMode:
+          config.useSsl
+              ? SslMode.require
+              : SslMode.disable,
     );
 
-    try {
-      print('🔄 Connexion à PostgreSQL...');
-      _connection = await Connection.open(endpoint, settings: settings);
-      _isConnected = true;
-      print('✅ Connecté à PostgreSQL');
-      
-      await _createTables();
-      await _seedInitialData();
-    } catch (e) {
-      print('❌ Erreur PostgreSQL: $e');
-      _isConnected = false;
-    }
+    print('🔄 Connexion PostgreSQL...');
+
+    _connection = await Connection.open(
+      endpoint,
+      settings: settings,
+    );
+
+    _isConnected = true;
+
+    print('✅ PostgreSQL connecté');
+
+    await _createTables();
+    await _seedInitialData();
+
+  } catch (e) {
+    print('❌ Erreur DB: $e');
+    _isConnected = false;
   }
+}
 
   Future<void> _createTables() async {
     try {

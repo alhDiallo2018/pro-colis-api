@@ -260,7 +260,7 @@ class SuperAdminRoutes {
       try {
         final body = await request.readAsString();
         final data = jsonDecode(body);
-        await _parcelService.updateParcel(parcelId, data);
+        await _parcelService.updateParcelInfo(parcelId, data);
         return Response.ok(jsonEncode({'success': true, 'message': 'Colis mis à jour'}));
       } catch (e) {
         return Response.internalServerError(body: jsonEncode({'success': false, 'message': e.toString()}));

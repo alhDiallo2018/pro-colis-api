@@ -462,7 +462,7 @@ class GarageAdminRoutes {
         }
         
         // Annuler le colis
-        await _parcelService.cancelParcelWithReason(parcelId, userId, reason ?? 'Annulation par l\'administrateur');
+        await _parcelService.cancelParcel(parcelId, userId);
         
         print('✅ Colis annulé avec succès');
         

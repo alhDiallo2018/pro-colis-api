@@ -9,7 +9,6 @@ import '../services/driver_service.dart';
 import '../services/parcel_service.dart';
 import '../utils/jwt_helper.dart';
 
-
 class DriverRoutes {
   final ParcelService _parcelService = ParcelService();
   final DriverService _driverService = DriverService();
@@ -21,20 +20,20 @@ class DriverRoutes {
     Future<Response?> _authMiddleware(Request request) async {
       final userId = JwtHelper.extractUserId(request);
       print('🔐 Auth middleware - userId extrait: $userId');
-      
+
       if (userId == null) {
         return Response.forbidden(
             jsonEncode({'success': false, 'message': 'Non authentifié'}));
       }
-      
+
       final isDriver = await JwtHelper.isDriver(userId);
       print('🔐 isDriver: $isDriver');
-      
+
       if (!isDriver) {
         return Response.forbidden(jsonEncode(
             {'success': false, 'message': 'Accès réservé aux chauffeurs'}));
       }
-      
+
       print('✅ Auth OK pour driver: $userId');
       return null;
     }
@@ -327,26 +326,24 @@ class DriverRoutes {
     router.get('/parcels/<parcelId>', (Request request, String parcelId) async {
       final authCheck = await _authMiddleware(request);
       if (authCheck != null) return authCheck;
-      
+
       final userId = JwtHelper.extractUserId(request)!;
       print('🔑 Driver ID: $userId');
       print('🔍 Parcel ID demandé: $parcelId');
-      
+
       try {
         final parcel = await _parcelService.getParcelById(parcelId);
-        
+
         print('📦 Parcel trouvé: ${parcel != null}');
         if (parcel != null) {
           print('📦 Driver ID dans colis: ${parcel['driverId']}');
         }
-        
+
         if (parcel == null) {
-          return Response.notFound(jsonEncode({
-            'success': false,
-            'message': 'Colis non trouvé'
-          }));
+          return Response.notFound(
+              jsonEncode({'success': false, 'message': 'Colis non trouvé'}));
         }
-        
+
         // Vérifier que le colis est assigné à ce chauffeur
         if (parcel['driverId'] != userId) {
           return Response.forbidden(jsonEncode({
@@ -354,17 +351,12 @@ class DriverRoutes {
             'message': 'Vous n\'êtes pas autorisé à voir ce colis'
           }));
         }
-        
-        return Response.ok(jsonEncode({
-          'success': true,
-          'parcel': parcel
-        }));
+
+        return Response.ok(jsonEncode({'success': true, 'parcel': parcel}));
       } catch (e) {
         print('❌ Erreur getParcelById: $e');
-        return Response.internalServerError(body: jsonEncode({
-          'success': false,
-          'message': e.toString()
-        }));
+        return Response.internalServerError(
+            body: jsonEncode({'success': false, 'message': e.toString()}));
       }
     });
 
@@ -405,13 +397,17 @@ class DriverRoutes {
     });
 
     // Mettre à jour le statut d'un colis
+    // Mettre à jour le statut d'un colis
     router.put('/parcels/<parcelId>/status',
         (Request request, String parcelId) async {
       final authCheck = await _authMiddleware(request);
       if (authCheck != null) return authCheck;
 
       final userId = JwtHelper.extractUserId(request);
-      print('🔑 userId extrait: $userId');
+      if (userId == null) {
+        return Response.forbidden(
+            jsonEncode({'success': false, 'message': 'Non authentifié'}));
+      }
 
       try {
         final body = await request.readAsString();
@@ -419,31 +415,29 @@ class DriverRoutes {
         final newStatus = data['status'];
         final location = data['location'];
 
-        final db = await DatabaseService.getInstance();
+        print('🔑 userId extrait: $userId');
+        print('📝 Chauffeur $userId change statut $parcelId -> $newStatus');
 
-        // Vérifier le colis (log seulement)
-        final parcelCheck = await db.connection.execute('''
-          SELECT driver_id, driver_name FROM parcels WHERE id = \$1
-        ''', parameters: [parcelId]);
+        // ✅ CORRECTION : Appeler la méthode du service qui crée l'événement
+        final updatedParcel = await _parcelService.updateParcelStatus(
+          parcelId,
+          newStatus,
+          userId: userId,
+          location: location,
+        );
 
-        if (parcelCheck.isNotEmpty) {
-          print('📦 driver_id dans BD: ${parcelCheck.first[0]}');
-          print('👤 userId connecté: $userId');
+        if (updatedParcel == null) {
+          return Response.notFound(
+              jsonEncode({'success': false, 'message': 'Colis non trouvé'}));
         }
 
-        // Mettre à jour sans vérification (le middleware a déjà vérifié que c'est un chauffeur)
-        await db.connection.execute('''
-          UPDATE parcels 
-          SET status = \$2, updated_at = NOW() 
-          WHERE id = \$1
-        ''', parameters: [parcelId, newStatus]);
-
-        print('✅ Statut mis à jour: $parcelId -> $newStatus');
-
-        return Response.ok(
-            jsonEncode({'success': true, 'message': 'Statut mis à jour'}));
+        return Response.ok(jsonEncode({
+          'success': true,
+          'message': 'Statut mis à jour avec succès',
+          'parcel': updatedParcel
+        }));
       } catch (e) {
-        print('❌ Erreur: $e');
+        print('❌ Erreur update status: $e');
         return Response.internalServerError(
             body: jsonEncode({'success': false, 'message': e.toString()}));
       }
