@@ -20,7 +20,11 @@ class DbHelper {
   Future<void> _init() async {
     var env = DotEnv(includePlatformEnvironment: true)..load();
 
-    final host = env['DB_HOST'] ?? 'localhost';
+    final host = env['DB_HOST'];
+
+    if (host == null || host.isEmpty || host == 'localhost') {
+      throw Exception('❌ DB_HOST invalide ou manquant');
+    }
     final port = int.parse(env['DB_PORT'] ?? '5432');
     final database = env['DB_NAME'] ?? 'procolis';
     final username = env['DB_USER'] ?? 'testad';
