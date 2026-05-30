@@ -34,8 +34,6 @@ void main() async {
   print('\n📊 CONFIGURATION BASE DE DONNÉES');
   print('─────────────────────────────────────────');
   
-  // Priorité 1: Variables d'environnement Render
-  // Priorité 2: Fichier .env (via DatabaseConfig)
   final db = await DatabaseService.getInstance();
 
   if (!db.isConnected) {
@@ -50,65 +48,53 @@ void main() async {
   print('\n📧 CONFIGURATION EMAIL');
   print('─────────────────────────────────────────');
   
-  // Priorité 1: Variables d'environnement Render
-  String smtpHost;
-  int smtpPort;
-  bool smtpSecure;
-  String smtpUser;
-  String smtpPass;
-  String smtpFrom;
+  late EmailService emailService;
   
-  if (isRender) {
-    print('📧 Configuration depuis variables Render:');
-    
-    smtpHost = Platform.environment['SMTP_HOST'] ?? 'smtp.gmail.com';
-    smtpPort = int.parse(Platform.environment['SMTP_PORT'] ?? '587');
-    smtpSecure = Platform.environment['SMTP_SECURE'] == 'true';
-    smtpUser = Platform.environment['SMTP_USER'] ?? 'alhassanegarki2018@gmail.com';
-    smtpPass = Platform.environment['SMTP_PASS'] ?? 'izjbxackbgpdtmam';
-    smtpFrom = Platform.environment['SMTP_FROM'] ?? 'PRO COLIS <noreply@proscolis.sn>';
-    
-    print('   SMTP_HOST: $smtpHost');
-    print('   SMTP_PORT: $smtpPort');
-    print('   SMTP_SECURE: $smtpSecure');
-    print('   SMTP_USER: $smtpUser');
-    print('   SMTP_FROM: $smtpFrom');
-    print('   SMTP_PASS: ${smtpPass.isNotEmpty ? '✅ Configuré' : '❌ Manquant'}');
+  // Priorité 1: Clé API Brevo (Recommandé pour Render)
+  final brevoApiKey = Platform.environment['BREVO_API_KEY'];
+  final brevoFromEmail = Platform.environment['BREVO_FROM_EMAIL'];
+  
+  if (brevoApiKey != null && brevoApiKey.isNotEmpty) {
+    // Utiliser l'API Brevo
+    emailService = EmailService.forBrevo(
+      apiKey: brevoApiKey,
+      fromEmail: brevoFromEmail ?? 'alhassanegarki2018@gmail.com',
+      fromName: Platform.environment['BREVO_FROM_NAME'] ?? 'PRO COLIS',
+    );
+    print('✅ Email configuré avec Brevo API');
+    print('   API Key: ${brevoApiKey.substring(0, 10)}...');
+    print('   From: ${brevoFromEmail ?? 'alhassanegarki2018@gmail.com'}');
   } else {
-    print('📧 Configuration locale - Chargement depuis .env');
+    // Fallback: Configuration SMTP standard
+    print('📧 Configuration SMTP (fallback)');
     
-    // En local, charger depuis .env via DatabaseConfig
-    // Les valeurs par défaut seront utilisées si .env n'existe pas
-    smtpHost = Platform.environment['SMTP_HOST'] ?? 'smtp.gmail.com';
-    smtpPort = int.parse(Platform.environment['SMTP_PORT'] ?? '587');
-    smtpSecure = Platform.environment['SMTP_SECURE'] == 'true';
-    smtpUser = Platform.environment['SMTP_USER'] ?? 'alhassanegarki2018@gmail.com';
-    smtpPass = Platform.environment['SMTP_PASS'] ?? 'izjbxackbgpdtmam';
-    smtpFrom = Platform.environment['SMTP_FROM'] ?? 'PRO COLIS <noreply@proscolis.sn>';
+    final smtpHost = Platform.environment['SMTP_HOST'] ?? 'smtp.gmail.com';
+    final smtpPort = int.parse(Platform.environment['SMTP_PORT'] ?? '587');
+    final smtpSecure = Platform.environment['SMTP_SECURE'] == 'true';
+    final smtpUser = Platform.environment['SMTP_USER'] ?? '';
+    final smtpPass = Platform.environment['SMTP_PASS'] ?? '';
+    final smtpFrom = Platform.environment['SMTP_FROM'] ?? 'PRO COLIS <noreply@proscolis.sn>';
+    
+    if (smtpUser.isEmpty || smtpPass.isEmpty) {
+      print('⚠️ ATTENTION: Credentials SMTP manquants!');
+      print('   Les emails ne pourront pas être envoyés.');
+    }
+    
+    emailService = EmailService.forSmtp(
+      smtpHost: smtpHost,
+      smtpPort: smtpPort,
+      smtpSecure: smtpSecure,
+      smtpUser: smtpUser,
+      smtpPass: smtpPass,
+      smtpFrom: smtpFrom,
+      fromName: Platform.environment['SMTP_FROM_NAME'] ?? 'PRO COLIS',
+    );
     
     print('   SMTP_HOST: $smtpHost');
     print('   SMTP_PORT: $smtpPort');
     print('   SMTP_USER: ${smtpUser.isNotEmpty ? smtpUser : '❌ Non configuré'}');
     print('   SMTP_PASS: ${smtpPass.isNotEmpty ? '✅ Configuré' : '❌ Manquant'}');
   }
-  
-  // Vérification des credentials email
-  if (smtpUser.isEmpty || smtpPass.isEmpty) {
-    print('⚠️ ATTENTION: Credentials SMTP manquants!');
-    print('   Les emails ne pourront pas être envoyés.');
-    print('   Configurez SMTP_USER et SMTP_PASS dans .env ou les variables Render.');
-  } else {
-    print('✅ Configuration email complète');
-  }
-  
-  final emailService = EmailService(
-    smtpHost: smtpHost,
-    smtpPort: smtpPort,
-    smtpSecure: smtpSecure,
-    smtpUser: smtpUser,
-    smtpPass: smtpPass,
-    smtpFrom: smtpFrom,
-  );
   
   print('─────────────────────────────────────────');
 
@@ -129,7 +115,6 @@ void main() async {
     print('📁 Dossier uploads créé');
   }
 
-  // Créer les sous-dossiers
   final parcelsDir = Directory('uploads/parcels');
   if (!await parcelsDir.exists()) {
     await parcelsDir.create(recursive: true);
@@ -155,10 +140,7 @@ void main() async {
     .addMiddleware(staticFilesMiddleware())
     .addHandler(router);
 
-  print('✅ Middlewares configurés:');
-  print('   - Logging');
-  print('   - CORS');
-  print('   - Static files');
+  print('✅ Middlewares configurés');
   print('─────────────────────────────────────────');
 
   // ================= SERVEUR =================
