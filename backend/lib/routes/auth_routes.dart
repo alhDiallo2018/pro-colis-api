@@ -85,20 +85,20 @@ class AuthRoutes {
         final db = await DatabaseService.getInstance();
 
         final result = await db.connection.execute('''
-      SELECT 
-        u.id, u.email, u.phone, u.full_name, u.role, u.status,
-        u.address, u.city, u.region, u.country,
-        u.vehicle_plate, u.vehicle_model, u.vehicle_color, u.vehicle_year,
-        u.driver_status, u.pin, u.gender, u.garage_id,
-        g.name AS garage_name, u.profile_photo,
-        u.is_email_verified, u.is_phone_verified,
-        u.birth_date, u.national_id, u.emergency_contact, u.emergency_phone,
-        u.fcm_token, u.is_approved, u.approved_by, u.approved_at,
-        u.created_by, u.created_at, u.updated_at, u.last_login, u.last_active
-      FROM users u
-      LEFT JOIN garages g ON g.id = u.garage_id
-      WHERE u.id = \$1
-    ''', parameters: [userId]);
+          SELECT 
+            u.id, u.email, u.phone, u.full_name, u.role, u.status,
+            u.address, u.city, u.region, u.country,
+            u.vehicle_plate, u.vehicle_model, u.vehicle_color, u.vehicle_year,
+            u.driver_status, u.pin, u.gender, u.garage_id,
+            g.name AS garage_name, u.profile_photo,
+            u.is_email_verified, u.is_phone_verified,
+            u.birth_date, u.national_id, u.emergency_contact, u.emergency_phone,
+            u.fcm_token, u.is_approved, u.approved_by, u.approved_at,
+            u.created_by, u.created_at, u.updated_at, u.last_login, u.last_active
+          FROM users u
+          LEFT JOIN garages g ON g.id = u.garage_id
+          WHERE u.id = \$1
+        ''', parameters: [userId]);
 
         if (result.isEmpty) {
           return Response.notFound(jsonEncode(
@@ -111,6 +111,23 @@ class AuthRoutes {
           if (v == null) return null;
           if (v is DateTime) return v;
           return DateTime.tryParse(v.toString());
+        }
+
+        // ✅ Gérer l'URL de la photo (Cloudinary ou locale)
+        final profilePhotoRaw = row[19] as String?;
+        String? profilePhotoUrl;
+        
+        if (profilePhotoRaw != null && profilePhotoRaw.isNotEmpty) {
+          if (profilePhotoRaw.startsWith('http')) {
+            // C'est déjà une URL Cloudinary
+            profilePhotoUrl = profilePhotoRaw;
+          } else if (profilePhotoRaw.startsWith('/uploads')) {
+            // C'est une URL locale
+            profilePhotoUrl = profilePhotoRaw;
+          } else {
+            // C'est juste un nom de fichier
+            profilePhotoUrl = '/uploads/profile/$profilePhotoRaw';
+          }
         }
 
         final user = {
@@ -133,7 +150,7 @@ class AuthRoutes {
           'gender': row[16],
           'garageId': row[17],
           'garageName': row[18],
-          'profilePhoto': row[19],
+          'profilePhoto': profilePhotoUrl,
           'isEmailVerified': row[20] ?? false,
           'isPhoneVerified': row[21] ?? false,
           'birthDate': toDate(row[22])?.toIso8601String(),
@@ -152,6 +169,7 @@ class AuthRoutes {
         };
 
         print('✅ Utilisateur chargé: ${user['email']}');
+        print('📸 Photo profil: ${user['profilePhoto']}');
 
         return Response.ok(jsonEncode({'success': true, 'user': user}));
       } catch (e) {
