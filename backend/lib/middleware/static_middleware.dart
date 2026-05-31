@@ -1,50 +1,33 @@
 // backend/lib/middleware/static_middleware.dart
 
+import 'dart:convert';
+// ignore: unused_import
 import 'dart:io';
 
 import 'package:shelf/shelf.dart';
-import 'package:shelf_static/shelf_static.dart';
 
+/// Middleware pour les fichiers statiques (uniquement pour les assets)
+/// Les fichiers uploadés sont maintenant sur Cloudinary
 Middleware staticFilesMiddleware() {
-  final uploadsPath = '${Directory.current.path}/uploads';
-
-  print('📁 STATIC PATH: $uploadsPath');
-
-  final staticHandler = createStaticHandler(
-    uploadsPath,
-    serveFilesOutsidePath: true,
-    listDirectories: true,
-  );
-
   return (Handler inner) {
     return (Request request) async {
       final path = request.url.path;
 
-      // Exemple:
-      // /uploads/profile/test.jpeg
+      // ✅ Rediriger les requêtes d'upload locales vers une notice
       if (path.startsWith('uploads/')) {
-        print('📸 STATIC FILE REQUEST: $path');
-
-        // On enlève juste "uploads/"
-        final relativePath = path.replaceFirst('uploads/', '');
-
-        // Appel direct du fichier
-        final file = File('$uploadsPath/$relativePath');
-
-        print('📂 FILE PATH: ${file.path}');
-        print('📂 EXISTS: ${await file.exists()}');
-
-        if (await file.exists()) {
-          return Response.ok(
-            await file.readAsBytes(),
-            headers: {
-              'Content-Type': 'image/jpeg',
-              'Access-Control-Allow-Origin': '*',
-            },
-          );
-        }
-
-        return Response.notFound('Fichier introuvable');
+        print('⚠️ Fichier local demandé: $path');
+        print('   Les fichiers sont maintenant sur Cloudinary');
+        
+        // Rediriger vers une documentation ou retourner 410 (Gone)
+        return Response(
+          410,
+          body: jsonEncode({
+            'success': false,
+            'message': 'Les fichiers sont maintenant hébergés sur Cloudinary',
+            'migration': 'https://cloudinary.com/console'
+          }),
+          headers: {'Content-Type': 'application/json'},
+        );
       }
 
       return inner(request);
