@@ -306,122 +306,112 @@ Future<Map<String, dynamic>> createParcel(
 
   // Récupérer un colis par ID
   Future<Map<String, dynamic>?> getParcelById(String parcelId) async {
-    final db = await DatabaseService.getInstance();
+  final db = await DatabaseService.getInstance();
 
-    try {
-      final result = await db.connection.execute('''
-        SELECT 
-          id, tracking_number,
-          sender_id, sender_name, sender_phone, sender_email,
-          receiver_name, receiver_phone, receiver_email, receiver_address,
-          description, weight, length, width, height, type, status,
-          departure_garage_id, departure_garage_name,
-          arrival_garage_id, arrival_garage_name,
-          driver_id, driver_name, driver_phone,
-          price, is_urgent, is_insured,
-          payment_method, payment_phone_number, payment_status,
-          total_amount, delivery_fees,
-          photo_urls, video_urls, signature_url,
-          notes, pickup_date, delivery_date, estimated_delivery_date,
-          created_by, created_at, updated_at,
-          cancelled_by, cancellation_reason, cancelled_at
-        FROM parcels WHERE id = \$1
-      ''', parameters: [parcelId]);
+  try {
+    // ✅ N'interroger que les colonnes qui existent
+    final result = await db.connection.execute('''
+      SELECT 
+        id, tracking_number,
+        sender_id, sender_name, sender_phone, sender_email,
+        receiver_name, receiver_phone, receiver_email, receiver_address,
+        description, weight, type, status,
+        departure_garage_id, departure_garage_name,
+        arrival_garage_id, arrival_garage_name,
+        driver_id, driver_name, driver_phone,
+        price, is_urgent, is_insured,
+        payment_method, payment_phone_number, payment_status,
+        total_amount, delivery_fees,
+        photo_urls, video_urls, signature_url,
+        pickup_date, delivery_date, estimated_delivery_date,
+        created_by, created_at, updated_at,
+        cancelled_by, cancellation_reason, cancelled_at
+      FROM parcels WHERE id = \$1
+    ''', parameters: [parcelId]);
 
-      if (result.isEmpty) return null;
+    if (result.isEmpty) return null;
 
-      final row = result.first;
+    final row = result.first;
 
-      double? toDouble(dynamic value) {
-        if (value == null) return null;
-        if (value is double) return value;
-        if (value is int) return value.toDouble();
-        if (value is String && value.isNotEmpty) return double.tryParse(value);
-        return null;
-      }
-
-      bool toBool(dynamic value) {
-        if (value == null) return false;
-        if (value is bool) return value;
-        if (value is String) return value.toLowerCase() == 'true';
-        return false;
-      }
-
-      List<String> safeJsonDecode(dynamic value) {
-        if (value == null) return [];
-        final str = value.toString();
-        if (str.isEmpty || str == 'null' || str == '[]') return [];
-        try {
-          final decoded = jsonDecode(str);
-          if (decoded is List) {
-            return decoded.map((e) => e.toString()).toList();
-          }
-          return [];
-        } catch (e) {
-          return [];
-        }
-      }
-
-      final events = await getParcelEvents(parcelId);
-
-      return {
-        'id': row[0],
-        'trackingNumber': row[1],
-        'senderId': row[2],
-        'senderName': row[3],
-        'senderPhone': row[4],
-        'senderEmail': row[5],
-        'receiverName': row[6],
-        'receiverPhone': row[7],
-        'receiverEmail': row[8],
-        'receiverAddress': row[9],
-        'description': row[10],
-        'weight': toDouble(row[11]),
-        'length': toDouble(row[12]),
-        'width': toDouble(row[13]),
-        'height': toDouble(row[14]),
-        'type': row[15],
-        'status': row[16],
-        'departureGarageId': row[17],
-        'departureGarageName': row[18],
-        'arrivalGarageId': row[19],
-        'arrivalGarageName': row[20],
-        'driverId': row[21],
-        'driverName': row[22],
-        'driverPhone': row[23],
-        'price': toDouble(row[24]),
-        'isUrgent': toBool(row[25]),
-        'isInsured': toBool(row[26]),
-        'paymentMethod': row[27],
-        'paymentPhoneNumber': row[28],
-        'paymentStatus': row[29],
-        'totalAmount': toDouble(row[30]),
-        'deliveryFees': toDouble(row[31]),
-        'photoUrls': safeJsonDecode(row[32]),
-        'videoUrls': safeJsonDecode(row[33]),
-        'signatureUrl': row[34],
-        'notes': row[35],
-        'pickupDate':
-            row[36] != null ? (row[36] as DateTime).toIso8601String() : null,
-        'deliveryDate':
-            row[37] != null ? (row[37] as DateTime).toIso8601String() : null,
-        'estimatedDeliveryDate':
-            row[38] != null ? (row[38] as DateTime).toIso8601String() : null,
-        'createdBy': row[39],
-        'createdAt': (row[40] as DateTime).toIso8601String(),
-        'updatedAt':
-            row[41] != null ? (row[41] as DateTime).toIso8601String() : null,
-        'cancelledBy': row[42],
-        'cancellationReason': row[43],
-        'cancelledAt':
-            row[44] != null ? (row[44] as DateTime).toIso8601String() : null,
-        'events': events,
-      };
-    } catch (e) {
-      print('❌ Erreur getParcelById: $e');
+    // Fonctions de conversion
+    double? toDouble(dynamic value) {
+      if (value == null) return null;
+      if (value is double) return value;
+      if (value is int) return value.toDouble();
+      if (value is String && value.isNotEmpty) return double.tryParse(value);
       return null;
     }
+
+    bool toBool(dynamic value) {
+      if (value == null) return false;
+      if (value is bool) return value;
+      if (value is String) return value.toLowerCase() == 'true';
+      return false;
+    }
+
+    List<String> toList(dynamic value) {
+      if (value == null) return [];
+      if (value is List) return value.map((e) => e.toString()).toList();
+      if (value is String && value.isNotEmpty && value != '[]') {
+        try {
+          final decoded = jsonDecode(value);
+          if (decoded is List) return decoded.map((e) => e.toString()).toList();
+        } catch (e) {}
+      }
+      return [];
+    }
+
+    final events = await getParcelEvents(parcelId);
+
+    return {
+      'id': row[0],
+      'trackingNumber': row[1],
+      'senderId': row[2],
+      'senderName': row[3],
+      'senderPhone': row[4],
+      'senderEmail': row[5],
+      'receiverName': row[6],
+      'receiverPhone': row[7],
+      'receiverEmail': row[8],
+      'receiverAddress': row[9],
+      'description': row[10],
+      'weight': toDouble(row[11]),
+      'type': row[12],
+      'status': row[13],
+      'departureGarageId': row[14],
+      'departureGarageName': row[15],
+      'arrivalGarageId': row[16],
+      'arrivalGarageName': row[17],
+      'driverId': row[18],
+      'driverName': row[19],
+      'driverPhone': row[20],
+      'price': toDouble(row[21]),
+      'isUrgent': toBool(row[22]),
+      'isInsured': toBool(row[23]),
+      'paymentMethod': row[24],
+      'paymentPhoneNumber': row[25],
+      'paymentStatus': row[26],
+      'totalAmount': toDouble(row[27]),
+      'deliveryFees': toDouble(row[28]),
+      'photoUrls': toList(row[29]),
+      'videoUrls': toList(row[30]),
+      'signatureUrl': row[31],
+      'pickupDate': row[32] != null ? (row[32] as DateTime).toIso8601String() : null,
+      'deliveryDate': row[33] != null ? (row[33] as DateTime).toIso8601String() : null,
+      'estimatedDeliveryDate': row[34] != null ? (row[34] as DateTime).toIso8601String() : null,
+      'createdBy': row[35],
+      'createdAt': (row[36] as DateTime).toIso8601String(),
+      'updatedAt': row[37] != null ? (row[37] as DateTime).toIso8601String() : null,
+      'cancelledBy': row[38],
+      'cancellationReason': row[39],
+      'cancelledAt': row[40] != null ? (row[40] as DateTime).toIso8601String() : null,
+      'events': events,
+    };
+  } catch (e) {
+    print('❌ Erreur getParcelById: $e');
+    return null;
   }
+}
 
   // Récupérer les colis d'un chauffeur
   Future<List<Map<String, dynamic>>> getDriverParcels(String driverId) async {
