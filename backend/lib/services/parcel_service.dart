@@ -75,7 +75,10 @@ class ParcelService {
   // ==================== CRÉATION ====================
 
   // Créer un colis avec tous les champs
-  Future<Map<String, dynamic>> createParcel(
+  // backend/lib/services/parcel_service.dart
+// Remplacez la méthode createParcel par celle-ci :
+
+Future<Map<String, dynamic>> createParcel(
     String userId, Map<String, dynamic> data) async {
   final db = await DatabaseService.getInstance();
   final parcelId = _uuid.v4();
