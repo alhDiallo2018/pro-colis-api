@@ -10,24 +10,46 @@ import 'package:uuid/uuid.dart';
 
 class UploadRoutes {
   final _uuid = Uuid();
-  late final CloudinaryService _cloudinary;
+  late final CloudinaryService? _cloudinary;
   late final bool useCloudinary;
 
   UploadRoutes() {
     // Vérifier si Cloudinary est configuré
     final cloudName = Platform.environment['CLOUDINARY_CLOUD_NAME'];
     final uploadPreset = Platform.environment['CLOUDINARY_UPLOAD_PRESET'];
+    final apiKey = Platform.environment['CLOUDINARY_API_KEY'];
+    final apiSecret = Platform.environment['CLOUDINARY_API_SECRET'];
 
     if (cloudName != null && uploadPreset != null) {
-      // Mode Cloudinary
-      _cloudinary = CloudinaryService.unsigned(
-        cloudName: cloudName,
-        uploadPreset: uploadPreset,
-      );
-      useCloudinary = true;
-      print('✅ Cloudinary configuré: $cloudName');
+      try {
+        _cloudinary = CloudinaryService.unsigned(
+          cloudName: cloudName,
+          uploadPreset: uploadPreset,
+        );
+        useCloudinary = true;
+        print('✅ Cloudinary configuré avec upload preset: $cloudName');
+      } catch (e) {
+        print('⚠️ Erreur configuration Cloudinary: $e');
+        useCloudinary = false;
+        _cloudinary = null;
+      }
+    } else if (cloudName != null && apiKey != null && apiSecret != null) {
+      try {
+        _cloudinary = CloudinaryService.signed(
+          cloudName: cloudName,
+          apiKey: apiKey,
+          apiSecret: apiSecret,
+        );
+        useCloudinary = true;
+        print('✅ Cloudinary configuré avec clés API: $cloudName');
+      } catch (e) {
+        print('⚠️ Erreur configuration Cloudinary: $e');
+        useCloudinary = false;
+        _cloudinary = null;
+      }
     } else {
       useCloudinary = false;
+      _cloudinary = null;
       print('⚠️ Cloudinary non configuré, utilisation du stockage local');
     }
   }
@@ -35,7 +57,8 @@ class UploadRoutes {
   Router get router {
     final router = Router();
 
-    // ✅ Upload photo de profil
+    // ==================== PHOTO DE PROFIL ====================
+    
     router.post('/profile-photo', (Request request) async {
       try {
         final body = await request.readAsString();
@@ -47,52 +70,26 @@ class UploadRoutes {
 
         if (base64File == null || base64File.isEmpty) {
           return Response.badRequest(
-              body: jsonEncode(
-                  {'success': false, 'message': 'Fichier manquant'}));
+              body: jsonEncode({'success': false, 'message': 'Fichier manquant'}));
         }
 
-        // Nettoyer le base64
         String cleanBase64 = base64File;
         if (base64File.contains(',')) {
           cleanBase64 = base64File.split(',').last;
         }
 
-        // Décoder le base64
         final bytes = base64Decode(cleanBase64);
-
-        String? publicUrl;
-
-        if (useCloudinary) {
-          // Upload vers Cloudinary
-          publicUrl = await _cloudinary.uploadFile(
-            fileBytes: bytes,
-            fileName: filename,
-            folder: 'profiles/$userId',
-          );
-        } else {
-          // Stockage local
-          final uploadDir = Directory('uploads/profiles');
-          if (!await uploadDir.exists()) {
-            await uploadDir.create(recursive: true);
-          }
-
-          final extension = filename.split('.').last;
-          final uniqueName = '${_uuid.v4()}.$extension';
-          final filePath = '${uploadDir.path}/$uniqueName';
-
-          final file = File(filePath);
-          await file.writeAsBytes(bytes);
-
-          publicUrl = '/uploads/profiles/$uniqueName';
-        }
+        final String? publicUrl = await _uploadToCloudinaryOrLocal(
+          bytes: bytes,
+          filename: filename,
+          folder: 'profiles/$userId',
+        );
 
         if (publicUrl == null) {
           return Response.internalServerError(
-              body: jsonEncode(
-                  {'success': false, 'message': 'Erreur lors de l\'upload'}));
+              body: jsonEncode({'success': false, 'message': 'Erreur lors de l\'upload'}));
         }
 
-        // Mettre à jour la base de données
         final db = await DatabaseService.getInstance();
         await db.connection.execute(
           'UPDATE users SET profile_photo = \$1, updated_at = NOW() WHERE id = \$2',
@@ -106,14 +103,12 @@ class UploadRoutes {
       } catch (e) {
         print('❌ [PROFILE_PHOTO] Erreur: $e');
         return Response.internalServerError(
-            body: jsonEncode({
-          'success': false,
-          'message': e.toString(),
-        }));
+            body: jsonEncode({'success': false, 'message': e.toString()}));
       }
     });
 
-    // ✅ Upload photo de colis
+    // ==================== PHOTO DE COLIS ====================
+    
     router.post('/parcel-photo', (Request request) async {
       try {
         final body = await request.readAsString();
@@ -122,12 +117,16 @@ class UploadRoutes {
         final base64File = data['file'];
         final parcelId = data['parcelId'];
         final filename = data['filename'] ?? 'photo.jpg';
-        final isTemp = data['isTemp'] ?? false;
 
         if (base64File == null || base64File.isEmpty) {
           return Response.badRequest(
-              body: jsonEncode(
-                  {'success': false, 'message': 'Fichier manquant'}));
+              body: jsonEncode({'success': false, 'message': 'Fichier manquant'}));
+        }
+
+        // Vérifier que le parcelId est un UUID valide
+        if (!_isValidUuid(parcelId)) {
+          return Response.badRequest(
+              body: jsonEncode({'success': false, 'message': 'ID de colis invalide'}));
         }
 
         String cleanBase64 = base64File;
@@ -136,101 +135,19 @@ class UploadRoutes {
         }
 
         final bytes = base64Decode(cleanBase64);
-
-        String? publicUrl;
-        String? tempId;
-
-        // ✅ Si c'est un ID temporaire ou "temp", stocker dans un dossier temporaire
-        if (parcelId == 'temp' ||
-            parcelId == null ||
-            parcelId.isEmpty ||
-            isTemp) {
-          final tempDir = Directory('uploads/temp');
-          if (!await tempDir.exists()) {
-            await tempDir.create(recursive: true);
-          }
-
-          final extension = filename.split('.').last;
-          tempId = _uuid.v4().toString();
-          final uniqueName = '$tempId.$extension';
-          final filePath = '${tempDir.path}/$uniqueName';
-
-          final file = File(filePath);
-          await file.writeAsBytes(bytes);
-
-          publicUrl = '/uploads/temp/$uniqueName';
-
-          print('✅ [PARCEL_PHOTO] Photo temporaire stockée: $publicUrl');
-
-          return Response.ok(jsonEncode({
-            'success': true,
-            'url': publicUrl,
-            'tempId': tempId,
-            'isTemp': true
-          }));
-        }
-
-        // ✅ Vérifier si parcelId est un UUID valide
-        final uuidRegex = RegExp(
-            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-            caseSensitive: false);
-        final isValidUuid = uuidRegex.hasMatch(parcelId);
-
-        if (!isValidUuid) {
-          // Stocker comme temporaire aussi
-          final tempDir = Directory('uploads/temp');
-          if (!await tempDir.exists()) {
-            await tempDir.create(recursive: true);
-          }
-
-          final extension = filename.split('.').last;
-          tempId = _uuid.v4().toString();
-          final uniqueName = '$tempId.$extension';
-          final filePath = '${tempDir.path}/$uniqueName';
-
-          final file = File(filePath);
-          await file.writeAsBytes(bytes);
-
-          publicUrl = '/uploads/temp/$uniqueName';
-
-          return Response.ok(jsonEncode({
-            'success': true,
-            'url': publicUrl,
-            'tempId': tempId,
-            'isTemp': true
-          }));
-        }
-
-        // ✅ Upload normal vers Cloudinary ou stockage local
-        if (useCloudinary) {
-          publicUrl = await _cloudinary.uploadFile(
-            fileBytes: bytes,
-            fileName: filename,
-            folder: 'parcels/$parcelId',
-          );
-        } else {
-          final uploadDir = Directory('uploads/parcels/$parcelId');
-          if (!await uploadDir.exists()) {
-            await uploadDir.create(recursive: true);
-          }
-
-          final extension = filename.split('.').last;
-          final uniqueName = '${_uuid.v4()}.$extension';
-          final filePath = '${uploadDir.path}/$uniqueName';
-
-          final file = File(filePath);
-          await file.writeAsBytes(bytes);
-
-          publicUrl = '/uploads/parcels/$parcelId/$uniqueName';
-        }
+        
+        final String? publicUrl = await _uploadToCloudinaryOrLocal(
+          bytes: bytes,
+          filename: filename,
+          folder: 'parcels/$parcelId',
+        );
 
         if (publicUrl == null) {
           return Response.internalServerError(
-              body: jsonEncode(
-                  {'success': false, 'message': 'Erreur lors de l\'upload'}));
+              body: jsonEncode({'success': false, 'message': 'Erreur lors de l\'upload'}));
         }
 
-        // Mettre à jour les photos du colis
+        // Mettre à jour la base de données
         final db = await DatabaseService.getInstance();
         await db.connection.execute(
           'UPDATE parcels SET photo_urls = array_append(photo_urls, \$1) WHERE id = \$2',
@@ -239,77 +156,20 @@ class UploadRoutes {
 
         print('✅ [PARCEL_PHOTO] Photo uploadée: $publicUrl');
 
-        return Response.ok(jsonEncode(
-            {'success': true, 'url': publicUrl, 'parcelId': parcelId}));
+        return Response.ok(jsonEncode({
+          'success': true,
+          'url': publicUrl,
+          'parcelId': parcelId
+        }));
       } catch (e) {
         print('❌ [PARCEL_PHOTO] Erreur: $e');
-        return Response.internalServerError(
-            body: jsonEncode({
-          'success': false,
-          'message': e.toString(),
-        }));
-      }
-    });
-
-// ✅ Route pour associer les photos temporaires à un colis après création
-    router.post('/attach-temp-photos', (Request request) async {
-      try {
-        final body = await request.readAsString();
-        final data = jsonDecode(body);
-
-        final tempIds = data['tempIds'] as List<dynamic>? ?? [];
-        final parcelId = data['parcelId'];
-
-        if (tempIds.isEmpty) {
-          return Response.ok(jsonEncode({'success': true}));
-        }
-
-        final db = await DatabaseService.getInstance();
-        final List<String> photoUrls = [];
-
-        for (final tempId in tempIds) {
-          // Chercher le fichier temporaire
-          final tempDir = Directory('uploads/temp');
-          final files = await tempDir.list().toList();
-
-          for (final file in files) {
-            if (file.path.contains(tempId.toString())) {
-              final extension = file.path.split('.').last;
-              final newFileName = '${_uuid.v4()}.$extension';
-              final newDir = Directory('uploads/parcels/$parcelId');
-
-              if (!await newDir.exists()) {
-                await newDir.create(recursive: true);
-              }
-
-              final newPath = '${newDir.path}/$newFileName';
-              await File(file.path).rename(newPath);
-
-              final publicUrl = '/uploads/parcels/$parcelId/$newFileName';
-              photoUrls.add(publicUrl);
-              break;
-            }
-          }
-        }
-
-        // Mettre à jour la base de données
-        for (final url in photoUrls) {
-          await db.connection.execute(
-            'UPDATE parcels SET photo_urls = array_append(photo_urls, \$1) WHERE id = \$2',
-            parameters: [url, parcelId],
-          );
-        }
-
-        return Response.ok(
-            jsonEncode({'success': true, 'attachedPhotos': photoUrls}));
-      } catch (e) {
-        print('❌ [ATTACH_PHOTOS] Erreur: $e');
         return Response.internalServerError(
             body: jsonEncode({'success': false, 'message': e.toString()}));
       }
     });
 
-    // ✅ Upload vidéo de colis
+    // ==================== VIDÉO DE COLIS ====================
+    
     router.post('/parcel-video', (Request request) async {
       try {
         final body = await request.readAsString();
@@ -321,8 +181,13 @@ class UploadRoutes {
 
         if (base64File == null || base64File.isEmpty) {
           return Response.badRequest(
-              body: jsonEncode(
-                  {'success': false, 'message': 'Fichier manquant'}));
+              body: jsonEncode({'success': false, 'message': 'Fichier manquant'}));
+        }
+
+        // Vérifier que le parcelId est un UUID valide
+        if (!_isValidUuid(parcelId)) {
+          return Response.badRequest(
+              body: jsonEncode({'success': false, 'message': 'ID de colis invalide'}));
         }
 
         String cleanBase64 = base64File;
@@ -331,52 +196,34 @@ class UploadRoutes {
         }
 
         final bytes = base64Decode(cleanBase64);
-
-        String? publicUrl;
-
-        if (useCloudinary) {
-          publicUrl = await _cloudinary.uploadFile(
-            fileBytes: bytes,
-            fileName: filename,
-            folder: 'parcels/$parcelId/videos',
-          );
-        } else {
-          final uploadDir = Directory('uploads/parcels/videos');
-          if (!await uploadDir.exists()) {
-            await uploadDir.create(recursive: true);
-          }
-
-          final extension = filename.split('.').last;
-          final uniqueName = '${_uuid.v4()}.$extension';
-          final filePath = '${uploadDir.path}/$uniqueName';
-
-          final file = File(filePath);
-          await file.writeAsBytes(bytes);
-
-          publicUrl = '/uploads/parcels/videos/$uniqueName';
-        }
+        
+        final String? publicUrl = await _uploadToCloudinaryOrLocal(
+          bytes: bytes,
+          filename: filename,
+          folder: 'parcels/$parcelId/videos',
+        );
 
         if (publicUrl == null) {
           return Response.internalServerError(
-              body: jsonEncode(
-                  {'success': false, 'message': 'Erreur lors de l\'upload'}));
+              body: jsonEncode({'success': false, 'message': 'Erreur lors de l\'upload'}));
         }
 
         print('✅ [PARCEL_VIDEO] Vidéo uploadée: $publicUrl');
 
-        return Response.ok(jsonEncode(
-            {'success': true, 'url': publicUrl, 'parcelId': parcelId}));
+        return Response.ok(jsonEncode({
+          'success': true,
+          'url': publicUrl,
+          'parcelId': parcelId
+        }));
       } catch (e) {
         print('❌ [PARCEL_VIDEO] Erreur: $e');
         return Response.internalServerError(
-            body: jsonEncode({
-          'success': false,
-          'message': e.toString(),
-        }));
+            body: jsonEncode({'success': false, 'message': e.toString()}));
       }
     });
 
-    // ✅ Upload base64 générique
+    // ==================== UPLOAD GÉNÉRIQUE BASE64 ====================
+    
     router.post('/base64', (Request request) async {
       try {
         final body = await request.readAsString();
@@ -388,8 +235,7 @@ class UploadRoutes {
 
         if (base64File == null || base64File.isEmpty) {
           return Response.badRequest(
-              body: jsonEncode(
-                  {'success': false, 'message': 'Fichier manquant'}));
+              body: jsonEncode({'success': false, 'message': 'Fichier manquant'}));
         }
 
         String cleanBase64 = base64File;
@@ -398,42 +244,25 @@ class UploadRoutes {
         }
 
         final bytes = base64Decode(cleanBase64);
-
-        String? publicUrl;
-
-        if (useCloudinary) {
-          final folder = type == 'profile' ? 'profiles' : 'uploads';
-          publicUrl = await _cloudinary.uploadFile(
-            fileBytes: bytes,
-            fileName: filename,
-            folder: folder,
-          );
-        } else {
-          final uploadDir = Directory('uploads/$type');
-          if (!await uploadDir.exists()) {
-            await uploadDir.create(recursive: true);
-          }
-
-          final extension = filename.split('.').last;
-          final uniqueName = '${_uuid.v4()}.$extension';
-          final filePath = '${uploadDir.path}/$uniqueName';
-
-          final file = File(filePath);
-          await file.writeAsBytes(bytes);
-
-          publicUrl = '/uploads/$type/$uniqueName';
-        }
+        
+        final String? publicUrl = await _uploadToCloudinaryOrLocal(
+          bytes: bytes,
+          filename: filename,
+          folder: type == 'profile' ? 'profiles' : 'uploads',
+        );
 
         if (publicUrl == null) {
           return Response.internalServerError(
-              body: jsonEncode(
-                  {'success': false, 'message': 'Erreur lors de l\'upload'}));
+              body: jsonEncode({'success': false, 'message': 'Erreur lors de l\'upload'}));
         }
 
         print('✅ [BASE64] Fichier uploadé: $publicUrl');
 
-        return Response.ok(jsonEncode(
-            {'success': true, 'url': publicUrl, 'fileId': _uuid.v4()}));
+        return Response.ok(jsonEncode({
+          'success': true,
+          'url': publicUrl,
+          'fileId': _uuid.v4()
+        }));
       } catch (e) {
         print('❌ [BASE64] Erreur: $e');
         return Response.internalServerError(
@@ -442,5 +271,62 @@ class UploadRoutes {
     });
 
     return router;
+  }
+
+  // ==================== MÉTHODES UTILITAIRES ====================
+
+  /// Upload vers Cloudinary ou stockage local selon la configuration
+  Future<String?> _uploadToCloudinaryOrLocal({
+    required List<int> bytes,
+    required String filename,
+    required String folder,
+  }) async {
+    if (useCloudinary && _cloudinary != null) {
+      try {
+        final url = await _cloudinary!.uploadFile(
+          fileBytes: bytes,
+          fileName: filename,
+          folder: folder,
+        );
+        if (url != null) {
+          print('✅ [CLOUDINARY] Upload réussi: $url');
+          return url;
+        }
+        print('⚠️ [CLOUDINARY] Échec, fallback vers stockage local');
+      } catch (e) {
+        print('❌ [CLOUDINARY] Erreur: $e, fallback vers stockage local');
+      }
+    }
+    
+    // Stockage local
+    return await _saveToLocal(bytes, filename, folder);
+  }
+
+  /// Sauvegarde locale du fichier
+  Future<String> _saveToLocal(List<int> bytes, String filename, String folder) async {
+    final uploadDir = Directory('uploads/$folder');
+    if (!await uploadDir.exists()) {
+      await uploadDir.create(recursive: true);
+    }
+
+    final extension = filename.split('.').last;
+    final uniqueName = '${_uuid.v4()}.$extension';
+    final filePath = '${uploadDir.path}/$uniqueName';
+
+    final file = File(filePath);
+    await file.writeAsBytes(bytes);
+
+    final publicUrl = '/uploads/$folder/$uniqueName';
+    print('✅ [LOCAL] Fichier sauvegardé: $publicUrl');
+    
+    return publicUrl;
+  }
+
+  /// Vérifie si une chaîne est un UUID valide
+  bool _isValidUuid(String uuid) {
+    final regex = RegExp(
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+        caseSensitive: false);
+    return regex.hasMatch(uuid);
   }
 }
