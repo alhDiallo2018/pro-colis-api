@@ -1,6 +1,7 @@
 // lib/routes/client_routes.dart
 import 'dart:convert';
 
+import 'package:procolis_backend/services/email_service.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
 
@@ -9,8 +10,12 @@ import '../services/user_service.dart';
 import '../utils/jwt_helper.dart';
 
 class ClientRoutes {
-  final ParcelService _parcelService = ParcelService();
+  late ParcelService _parcelService;
   final UserService _userService = UserService();
+
+  ClientRoutes({required EmailService emailService}) {
+    _parcelService = ParcelService(emailService: emailService);
+  }
   
   Router get router {
     final router = Router();

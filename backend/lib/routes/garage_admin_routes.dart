@@ -2,6 +2,7 @@
 import 'dart:convert';
 
 import 'package:procolis_backend/services/database_service.dart';
+import 'package:procolis_backend/services/email_service.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
 
@@ -11,8 +12,12 @@ import '../utils/jwt_helper.dart';
 
 
 class GarageAdminRoutes {
-  final ParcelService _parcelService = ParcelService();
+  late ParcelService _parcelService;
   final GarageService _garageService = GarageService();
+
+  GarageAdminRoutes({required EmailService emailService}) {
+    _parcelService = ParcelService(emailService: emailService);
+  }
   
   Router get router {
     final router = Router();

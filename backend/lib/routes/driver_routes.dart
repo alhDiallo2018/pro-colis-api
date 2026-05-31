@@ -2,6 +2,7 @@
 import 'dart:convert';
 
 import 'package:procolis_backend/services/database_service.dart';
+import 'package:procolis_backend/services/email_service.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
 
@@ -10,8 +11,12 @@ import '../services/parcel_service.dart';
 import '../utils/jwt_helper.dart';
 
 class DriverRoutes {
-  final ParcelService _parcelService = ParcelService();
+  late final ParcelService _parcelService;
   final DriverService _driverService = DriverService();
+
+  DriverRoutes({required EmailService emailService}) {
+    _parcelService = ParcelService(emailService: emailService);
+  }
 
   Router get router {
     final router = Router();
@@ -38,7 +43,7 @@ class DriverRoutes {
       return null;
     }
 
-    // ==================== ROUTES PROFIL (sans paramètres dynamiques) ====================
+    // ==================== ROUTES PROFIL ====================
 
     // Récupérer le profil du chauffeur
     router.get('/profile', (Request request) async {
@@ -109,7 +114,6 @@ class DriverRoutes {
 
         final db = await DatabaseService.getInstance();
 
-        // Construction dynamique de la requête UPDATE
         final updates = <String>[];
         final params = <dynamic>[userId];
         int paramIndex = 2;
@@ -182,7 +186,6 @@ class DriverRoutes {
 
         print('✅ Profil chauffeur mis à jour avec succès');
 
-        // Récupérer l'utilisateur mis à jour
         final updatedUserResult = await db.connection.execute('''
           SELECT id, email, phone, full_name, role, status, address, city, region, 
                  vehicle_plate, vehicle_model, vehicle_color, vehicle_year,
@@ -286,9 +289,8 @@ class DriverRoutes {
       }
     });
 
-    // ==================== ROUTES COLIS (ordre important) ====================
+    // ==================== ROUTES COLIS ====================
 
-    // 1. Routes avec chemins fixes d'abord
     // Créer un colis
     router.post('/parcels/create', (Request request) async {
       final authCheck = await _authMiddleware(request);
@@ -321,7 +323,6 @@ class DriverRoutes {
       }
     });
 
-    // 2. Routes avec paramètres dynamiques ensuite
     // Récupérer un colis spécifique
     router.get('/parcels/<parcelId>', (Request request, String parcelId) async {
       final authCheck = await _authMiddleware(request);
@@ -344,7 +345,6 @@ class DriverRoutes {
               jsonEncode({'success': false, 'message': 'Colis non trouvé'}));
         }
 
-        // Vérifier que le colis est assigné à ce chauffeur
         if (parcel['driverId'] != userId) {
           return Response.forbidden(jsonEncode({
             'success': false,
@@ -368,9 +368,12 @@ class DriverRoutes {
 
       final userId = JwtHelper.extractUserId(request)!;
       try {
-        await _parcelService.confirmPickup(parcelId, userId);
-        return Response.ok(
-            jsonEncode({'success': true, 'message': 'Ramassage confirmé'}));
+        final result = await _parcelService.confirmPickup(parcelId, userId);
+        return Response.ok(jsonEncode({
+          'success': true,
+          'message': 'Ramassage confirmé',
+          'parcel': result
+        }));
       } catch (e) {
         return Response.internalServerError(
             body: jsonEncode({'success': false, 'message': e.toString()}));
@@ -387,16 +390,18 @@ class DriverRoutes {
       try {
         final body = await request.readAsString();
         final data = jsonDecode(body);
-        await _parcelService.confirmDelivery(parcelId, userId, data);
-        return Response.ok(
-            jsonEncode({'success': true, 'message': 'Livraison confirmée'}));
+        final result = await _parcelService.confirmDelivery(parcelId, userId, data);
+        return Response.ok(jsonEncode({
+          'success': true,
+          'message': 'Livraison confirmée',
+          'parcel': result
+        }));
       } catch (e) {
         return Response.internalServerError(
             body: jsonEncode({'success': false, 'message': e.toString()}));
       }
     });
 
-    // Mettre à jour le statut d'un colis
     // Mettre à jour le statut d'un colis
     router.put('/parcels/<parcelId>/status',
         (Request request, String parcelId) async {
@@ -418,7 +423,6 @@ class DriverRoutes {
         print('🔑 userId extrait: $userId');
         print('📝 Chauffeur $userId change statut $parcelId -> $newStatus');
 
-        // ✅ CORRECTION : Appeler la méthode du service qui crée l'événement
         final updatedParcel = await _parcelService.updateParcelStatus(
           parcelId,
           newStatus,

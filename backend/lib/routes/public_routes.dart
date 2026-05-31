@@ -2,6 +2,7 @@
 import 'dart:convert';
 
 import 'package:procolis_backend/services/database_service.dart';
+import 'package:procolis_backend/services/email_service.dart';
 import 'package:procolis_backend/services/parcel_service.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf_router/shelf_router.dart';
@@ -11,7 +12,11 @@ import '../services/driver_service.dart';
 
 class PublicRoutes {
   final DriverService _driverService = DriverService();
-  final ParcelService _parcelService = ParcelService();
+  late ParcelService _parcelService;
+
+  PublicRoutes({required EmailService emailService}) {
+    _parcelService = ParcelService(emailService: emailService);
+  }
 
  
   

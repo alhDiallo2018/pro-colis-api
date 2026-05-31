@@ -11,11 +11,11 @@ class AppRoutes {
     
     // Montage des routes par rôle
     router.mount('/auth', AuthRoutes(emailService: emailService).router);
-    router.mount('/public', PublicRoutes().router);
-    router.mount('/client', ClientRoutes().router);
-    router.mount('/driver', DriverRoutes().router);
-    router.mount('/garage-admin', GarageAdminRoutes().router);
-    router.mount('/super-admin', SuperAdminRoutes().router);
+    router.mount('/public', PublicRoutes(emailService: emailService).router);
+    router.mount('/client', ClientRoutes(emailService: emailService).router);
+    router.mount('/driver', DriverRoutes(emailService: emailService).router);
+    router.mount('/garage-admin', GarageAdminRoutes(emailService: emailService).router);
+    router.mount('/super-admin', SuperAdminRoutes(emailService: emailService).router);
     router.mount('/upload', UploadRoutes().router);
     
     // Route racine
