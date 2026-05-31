@@ -1,5 +1,6 @@
 export 'admin_service.dart';
 export 'auth_service.dart';
+export 'cloudinary_service.dart';
 export 'database_service.dart';
 export 'driver_service.dart';
 export 'email_service.dart';

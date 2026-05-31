@@ -1,8 +1,9 @@
 -- migration_complete.sql
 -- Migration complète pour PROCOLIS Database avec tous les modèles
+-- Version corrigée pour Render PostgreSQL
 
 -- ========================================
--- 1. SUPPRESSION DES TABLES EXISTANTES (optionnel - décommentez si besoin)
+-- 1. SUPPRESSION DES TABLES EXISTANTES (optionnel)
 -- ========================================
 -- DROP TABLE IF EXISTS parcel_events CASCADE;
 -- DROP TABLE IF EXISTS payments CASCADE;
@@ -16,7 +17,7 @@
 -- 2. CRÉATION DES TABLES
 -- ========================================
 
--- Table users (correspond au modèle User)
+-- Table users
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email VARCHAR(255) UNIQUE NOT NULL,
@@ -33,14 +34,26 @@ CREATE TABLE IF NOT EXISTS users (
     address TEXT,
     city VARCHAR(100),
     region VARCHAR(100),
-    driver_status VARCHAR(50),
-    profile_photo_url TEXT,
+    country VARCHAR(100) DEFAULT 'Sénégal',
+    driver_status VARCHAR(50) DEFAULT 'offline',
+    profile_photo TEXT,
     status VARCHAR(50) DEFAULT 'active',
     is_email_verified BOOLEAN DEFAULT FALSE,
     is_phone_verified BOOLEAN DEFAULT FALSE,
+    gender VARCHAR(20),
+    birth_date DATE,
+    national_id VARCHAR(100),
+    emergency_contact VARCHAR(255),
+    emergency_phone VARCHAR(50),
+    fcm_token TEXT,
+    is_approved BOOLEAN DEFAULT FALSE,
+    approved_by UUID,
+    approved_at TIMESTAMP,
+    created_by UUID,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_login TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    last_active TIMESTAMP
 );
 
 -- Table garages
@@ -60,13 +73,14 @@ CREATE TABLE IF NOT EXISTS garages (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Table parcels (correspond au modèle Parcel complet)
+-- Table parcels
 CREATE TABLE IF NOT EXISTS parcels (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tracking_number VARCHAR(50) UNIQUE NOT NULL,
-    sender_id UUID NOT NULL,
+    sender_id UUID,
     sender_name VARCHAR(255) NOT NULL,
     sender_phone VARCHAR(50) NOT NULL,
+    sender_email VARCHAR(255),
     receiver_name VARCHAR(255) NOT NULL,
     receiver_phone VARCHAR(50) NOT NULL,
     receiver_email VARCHAR(255),
@@ -78,8 +92,8 @@ CREATE TABLE IF NOT EXISTS parcels (
     height DECIMAL(10, 2),
     type VARCHAR(50) DEFAULT 'package',
     status VARCHAR(50) DEFAULT 'pending',
-    departure_garage_id UUID NOT NULL,
-    departure_garage_name VARCHAR(255) NOT NULL,
+    departure_garage_id UUID,
+    departure_garage_name VARCHAR(255),
     arrival_garage_id UUID,
     arrival_garage_name VARCHAR(255),
     driver_id UUID,
@@ -90,6 +104,7 @@ CREATE TABLE IF NOT EXISTS parcels (
     total_amount DECIMAL(10, 2),
     payment_method VARCHAR(50),
     payment_status VARCHAR(50) DEFAULT 'pending',
+    payment_phone_number VARCHAR(50),
     photo_urls TEXT[] DEFAULT '{}',
     video_urls TEXT[] DEFAULT '{}',
     signature_url TEXT,
@@ -106,16 +121,10 @@ CREATE TABLE IF NOT EXISTS parcels (
     created_by UUID,
     cancelled_by UUID,
     cancellation_reason TEXT,
-    cancelled_at TIMESTAMP,
-    FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE RESTRICT,
-    FOREIGN KEY (driver_id) REFERENCES users(id) ON DELETE SET NULL,
-    FOREIGN KEY (departure_garage_id) REFERENCES garages(id) ON DELETE RESTRICT,
-    FOREIGN KEY (arrival_garage_id) REFERENCES garages(id) ON DELETE SET NULL,
-    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL,
-    FOREIGN KEY (cancelled_by) REFERENCES users(id) ON DELETE SET NULL
+    cancelled_at TIMESTAMP
 );
 
--- Table parcel_events (correspond au modèle ParcelEvent)
+-- Table parcel_events
 CREATE TABLE IF NOT EXISTS parcel_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     parcel_id UUID NOT NULL,
@@ -129,12 +138,10 @@ CREATE TABLE IF NOT EXISTS parcel_events (
     user_role VARCHAR(50),
     photo_url TEXT,
     metadata JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (parcel_id) REFERENCES parcels(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Table payments (correspond au modèle Payment)
+-- Table payments
 CREATE TABLE IF NOT EXISTS payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL,
@@ -148,9 +155,7 @@ CREATE TABLE IF NOT EXISTS payments (
     reference VARCHAR(255),
     metadata JSONB,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT,
-    FOREIGN KEY (parcel_id) REFERENCES parcels(id) ON DELETE SET NULL
+    completed_at TIMESTAMP
 );
 
 -- Table otps
@@ -161,8 +166,7 @@ CREATE TABLE IF NOT EXISTS otps (
     type VARCHAR(50) DEFAULT 'verification',
     expires_at TIMESTAMP NOT NULL,
     attempts INT DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Table tokens
@@ -172,8 +176,7 @@ CREATE TABLE IF NOT EXISTS tokens (
     token TEXT UNIQUE NOT NULL,
     refresh_token TEXT,
     expires_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ========================================
@@ -267,20 +270,23 @@ CREATE TRIGGER update_parcels_updated_at
 -- 5. DONNÉES INITIALES
 -- ========================================
 
--- Insertion des garages
+-- Insertion des garages avec des UUIDs fixes pour faciliter la migration
 INSERT INTO garages (id, name, city, region, address, phone)
 VALUES 
-    (gen_random_uuid(), 'Garage Dakar Centre', 'Dakar', 'Dakar', '123 Avenue Cheikh Anta Diop', '+221 33 123 45 67'),
-    (gen_random_uuid(), 'Garage Thiès', 'Thiès', 'Thiès', 'Route Nationale 1', '+221 33 987 65 43'),
-    (gen_random_uuid(), 'Garage Saint-Louis', 'Saint-Louis', 'Saint-Louis', 'Boulevard de la Libération', '+221 33 456 78 90'),
-    (gen_random_uuid(), 'Garage Ziguinchor', 'Ziguinchor', 'Ziguinchor', 'Avenue Léopold Sédar Senghor', '+221 33 654 32 10'),
-    (gen_random_uuid(), 'Garage Kaolack', 'Kaolack', 'Kaolack', 'Boulevard du Général de Gaulle', '+221 33 789 01 23')
+    ('11111111-1111-1111-1111-111111111111', 'Garage Dakar Centre', 'Dakar', 'Dakar', '123 Avenue Cheikh Anta Diop', '+221 33 123 45 67'),
+    ('22222222-2222-2222-2222-222222222222', 'Garage Thiès', 'Thiès', 'Thiès', 'Route Nationale 1', '+221 33 987 65 43'),
+    ('33333333-3333-3333-3333-333333333333', 'Garage Saint-Louis', 'Saint-Louis', 'Saint-Louis', 'Boulevard de la Libération', '+221 33 456 78 90'),
+    ('44444444-4444-4444-4444-444444444444', 'Garage Ziguinchor', 'Ziguinchor', 'Ziguinchor', 'Avenue Léopold Sédar Senghor', '+221 33 654 32 10'),
+    ('55555555-5555-5555-5555-555555555555', 'Garage Kaolack', 'Kaolack', 'Kaolack', 'Boulevard du Général de Gaulle', '+221 33 789 01 23')
 ON CONFLICT (id) DO NOTHING;
 
--- Insertion de l'admin
-INSERT INTO users (id, email, phone, full_name, role, status, pin, is_email_verified, is_phone_verified)
+-- Insertion du super admin
+INSERT INTO users (
+    id, email, phone, full_name, role, status, pin, 
+    is_email_verified, is_phone_verified, created_at
+)
 VALUES (
-    gen_random_uuid(), 
+    '00000000-0000-0000-0000-000000000001',
     'admin@procolis.com', 
     '+221 77 123 45 67', 
     'Administrateur', 
@@ -288,24 +294,64 @@ VALUES (
     'active', 
     '123456',
     TRUE,
-    TRUE
+    TRUE,
+    NOW()
+)
+ON CONFLICT (email) DO NOTHING;
+
+-- Insertion d'un admin garage
+INSERT INTO users (
+    id, email, phone, full_name, role, status, pin, 
+    garage_id, is_email_verified, is_phone_verified, created_at
+)
+VALUES (
+    '00000000-0000-0000-0000-000000000002',
+    'garage@procolis.com', 
+    '+221 78 123 45 67', 
+    'Admin Garage', 
+    'admin', 
+    'active', 
+    '123456',
+    '11111111-1111-1111-1111-111111111111',
+    TRUE,
+    TRUE,
+    NOW()
 )
 ON CONFLICT (email) DO NOTHING;
 
 -- Insertion d'un chauffeur test
-INSERT INTO users (id, email, phone, full_name, role, driver_status, status, garage_id)
-SELECT 
-    gen_random_uuid(), 
+INSERT INTO users (
+    id, email, phone, full_name, role, driver_status, status, 
+    garage_id, pin, created_at
+)
+VALUES (
+    '00000000-0000-0000-0000-000000000003',
     'driver@procolis.com', 
-    '+221 78 123 45 67', 
+    '+221 79 123 45 67', 
     'Chauffeur Test', 
     'driver', 
     'available', 
     'active',
-    id
-FROM garages 
-WHERE name = 'Garage Dakar Centre'
-LIMIT 1
+    '11111111-1111-1111-1111-111111111111',
+    '123456',
+    NOW()
+)
+ON CONFLICT (email) DO NOTHING;
+
+-- Insertion d'un client test
+INSERT INTO users (
+    id, email, phone, full_name, role, status, pin, created_at
+)
+VALUES (
+    '00000000-0000-0000-0000-000000000004',
+    'client@procolis.com', 
+    '+221 70 123 45 67', 
+    'Client Test', 
+    'client', 
+    'active', 
+    '123456',
+    NOW()
+)
 ON CONFLICT (email) DO NOTHING;
 
 -- ========================================
@@ -333,8 +379,8 @@ SELECT 'otps', COUNT(*) FROM otps
 UNION ALL
 SELECT 'tokens', COUNT(*) FROM tokens;
 
--- Afficher les index
-SELECT tablename, indexname 
-FROM pg_indexes 
-WHERE schemaname = 'public' 
-ORDER BY tablename, indexname;
+-- Afficher les utilisateurs créés
+SELECT id, email, full_name, role, status FROM users;
+
+-- Afficher les garages créés
+SELECT id, name, city, region FROM garages;
