@@ -201,223 +201,243 @@ Merci d'avoir choisi PRO COLIS !
   // ==================== CRÉATION ====================
 
   Future<Map<String, dynamic>> createParcel(
-      String userId, Map<String, dynamic> data) async {
-    final db = await DatabaseService.getInstance();
-    final parcelId = _uuid.v4();
-    final trackingNumber = _generateTrackingNumber();
+    String userId, Map<String, dynamic> data) async {
+  final db = await DatabaseService.getInstance();
+  final parcelId = _uuid.v4();
+  final trackingNumber = _generateTrackingNumber();
 
-    print('📝 Insertion colis:');
-    print('  - trackingNumber: $trackingNumber');
-    print('  - price: ${data['price']}');
-    print('  - totalAmount: ${data['totalAmount']}');
+  print('📝 Insertion colis:');
+  print('  - trackingNumber: $trackingNumber');
+  print('  - price: ${data['price']}');
+  print('  - totalAmount: ${data['totalAmount']}');
 
-    // Récupérer les infos de l'utilisateur
-    final userResult = await db.connection.execute(
-      'SELECT full_name, phone, email, role FROM users WHERE id = \$1',
-      parameters: [userId],
+  // Récupérer les infos de l'utilisateur
+  final userResult = await db.connection.execute(
+    'SELECT full_name, phone, email, role FROM users WHERE id = \$1',
+    parameters: [userId],
+  );
+
+  final currentUserName = userResult.first[0].toString();
+  final currentUserPhone = userResult.first[1].toString();
+  // ignore: unused_local_variable
+  final currentUserEmail = userResult.first[2].toString();
+  final userRole = userResult.first[3].toString();
+  final isDriver = userRole == 'driver';
+  final initialStatus = isDriver ? 'confirmed' : 'pending';
+
+  // Auto-assignation du chauffeur
+  final driverId = isDriver ? userId : data['driverId']?.toString();
+  final driverName = isDriver ? currentUserName : data['driverName']?.toString();
+  final driverPhone = isDriver ? currentUserPhone : data['driverPhone']?.toString();
+
+  // Données
+  final senderName = data['senderName']?.toString();
+  final senderPhone = data['senderPhone']?.toString();
+  final senderEmail = data['senderEmail']?.toString();
+  final String? senderId = data['senderId'] != null && data['senderId'].toString().isNotEmpty
+      ? data['senderId'].toString()
+      : null;
+
+  final receiverName = data['receiverName']?.toString();
+  final receiverPhone = data['receiverPhone']?.toString();
+  final receiverEmail = data['receiverEmail']?.toString();
+  final receiverAddress = data['receiverAddress']?.toString();
+
+  final arrivalGarageId = data['arrivalGarageId']?.toString();
+  final arrivalGarageName = data['arrivalGarageName']?.toString();
+  final notes = data['notes']?.toString();
+  final pickupDate = data['pickupDate']?.toString();
+  final estimatedDeliveryDate = data['estimatedDeliveryDate']?.toString();
+
+  // 🔥 CORRECTION: Convertir les List en JSON string pour stockage TEXT
+  final List<String> photoUrls = data['photoUrls'] != null
+      ? List<String>.from(data['photoUrls'])
+      : [];
+  final List<String> videoUrls = data['videoUrls'] != null
+      ? List<String>.from(data['videoUrls'])
+      : [];
+
+  // Convertir en JSON string (car la colonne est TEXT, pas TEXT[])
+  final String photoUrlsJson = jsonEncode(photoUrls);
+  final String videoUrlsJson = jsonEncode(videoUrls);
+
+  print('📸 Photos reçues: $photoUrls');
+  print('🎬 Vidéos reçues: $videoUrls');
+  print('📸 Photos JSON: $photoUrlsJson');
+  print('🎬 Vidéos JSON: $videoUrlsJson');
+
+  // Options
+  final isInsured = data['isInsured'] == true;
+  final isUrgent = data['isUrgent'] == true;
+  final price = data['price'] != null ? (data['price'] as num).toDouble() : 0;
+  final deliveryFees = data['deliveryFees'] != null ? (data['deliveryFees'] as num).toDouble() : 0;
+  final totalAmount = data['totalAmount'] != null
+      ? (data['totalAmount'] as num).toDouble()
+      : price + deliveryFees;
+
+  final paymentMethod = data['paymentMethod']?.toString();
+  final paymentPhoneNumber = data['paymentPhoneNumber']?.toString();
+  final paymentStatus = 'pending';
+
+  // Vérifier les colonnes disponibles
+  final availableColumns = await _checkColumns();
+
+  // Construction de la requête
+  final columns = <String>[];
+  final values = <dynamic>[];
+
+  // 🔥 CORRECTION: Utiliser les versions JSON pour photo_urls et video_urls
+  final baseColumns = {
+    'id': parcelId,
+    'tracking_number': trackingNumber,
+    'sender_id': senderId,
+    'sender_name': senderName,
+    'sender_phone': senderPhone,
+    'sender_email': senderEmail,
+    'receiver_name': receiverName,
+    'receiver_phone': receiverPhone,
+    'receiver_email': receiverEmail,
+    'receiver_address': receiverAddress,
+    'description': data['description']?.toString() ?? '',
+    'weight': (data['weight'] as num).toDouble(),
+    'type': data['type']?.toString() ?? 'package',
+    'status': initialStatus,
+    'departure_garage_id': data['departureGarageId']?.toString(),
+    'departure_garage_name': data['departureGarageName']?.toString(),
+    'arrival_garage_id': arrivalGarageId,
+    'arrival_garage_name': arrivalGarageName,
+    'driver_id': driverId,
+    'driver_name': driverName,
+    'driver_phone': driverPhone,
+    'price': price,
+    'is_urgent': isUrgent,
+    'is_insured': isInsured,
+    'payment_method': paymentMethod,
+    'payment_status': paymentStatus,
+    'photo_urls': photoUrlsJson,  // ← JSON string
+    'created_by': userId,
+    'created_at': DateTime.now(),
+    'updated_at': DateTime.now(),
+  };
+
+  for (final entry in baseColumns.entries) {
+    columns.add(entry.key);
+    values.add(entry.value);
+  }
+
+  // 🔥 CORRECTION: Ajouter video_urls avec JSON string
+  if (availableColumns['video_urls'] == true) {
+    columns.add('video_urls');
+    values.add(videoUrlsJson);  // ← JSON string au lieu de List
+    print('📹 Ajout de video_urls avec ${videoUrls.length} vidéo(s)');
+  } else {
+    print('⚠️ La colonne video_urls n\'existe pas');
+  }
+
+  // Colonnes optionnelles
+  if (availableColumns['notes'] == true && notes != null && notes.isNotEmpty) {
+    columns.add('notes');
+    values.add(notes);
+  }
+  if (availableColumns['pickup_date'] == true && pickupDate != null) {
+    columns.add('pickup_date');
+    values.add(DateTime.tryParse(pickupDate));
+  }
+  if (availableColumns['estimated_delivery_date'] == true && estimatedDeliveryDate != null) {
+    columns.add('estimated_delivery_date');
+    values.add(DateTime.tryParse(estimatedDeliveryDate));
+  }
+  if (availableColumns['payment_phone_number'] == true && paymentPhoneNumber != null && paymentPhoneNumber.isNotEmpty) {
+    columns.add('payment_phone_number');
+    values.add(paymentPhoneNumber);
+  }
+  if (availableColumns['total_amount'] == true && totalAmount != null) {
+    columns.add('total_amount');
+    values.add(totalAmount);
+  }
+  if (availableColumns['delivery_fees'] == true && deliveryFees != null) {
+    columns.add('delivery_fees');
+    values.add(deliveryFees);
+  }
+
+  final placeholders = List.generate(values.length, (i) => '\$${i + 1}').join(', ');
+  final sql = 'INSERT INTO parcels (${columns.join(', ')}) VALUES ($placeholders)';
+
+  print('📝 SQL: $sql');
+  print('📝 Nombre de valeurs: ${values.length}');
+
+  try {
+    await db.connection.execute(sql, parameters: values);
+    print('✅ Insertion réussie');
+
+    // Événement de création
+    await createParcelEvent(
+      parcelId,
+      initialStatus,
+      'Colis créé par $currentUserName',
+      userId: userId,
+      userName: currentUserName,
+      metadata: {
+        'type': 'creation',
+        'weight': data['weight'],
+        'trackingNumber': trackingNumber,
+        'clientName': senderName,
+        'totalAmount': totalAmount,
+        'photoCount': photoUrls.length,
+        'videoCount': videoUrls.length,
+      },
     );
 
-    final currentUserName = userResult.first[0].toString();
-    final currentUserPhone = userResult.first[1].toString();
-    // ignore: unused_local_variable
-    final currentUserEmail = userResult.first[2].toString();
-    final userRole = userResult.first[3].toString();
-    final isDriver = userRole == 'driver';
-    final initialStatus = isDriver ? 'confirmed' : 'pending';
-
-    // Auto-assignation du chauffeur
-    final driverId = isDriver ? userId : data['driverId']?.toString();
-    final driverName = isDriver ? currentUserName : data['driverName']?.toString();
-    final driverPhone = isDriver ? currentUserPhone : data['driverPhone']?.toString();
-
-    // Données
-    final senderName = data['senderName']?.toString();
-    final senderPhone = data['senderPhone']?.toString();
-    final senderEmail = data['senderEmail']?.toString();
-    final String? senderId = data['senderId'] != null && data['senderId'].toString().isNotEmpty
-        ? data['senderId'].toString()
-        : null;
-
-    final receiverName = data['receiverName']?.toString();
-    final receiverPhone = data['receiverPhone']?.toString();
-    final receiverEmail = data['receiverEmail']?.toString();
-    final receiverAddress = data['receiverAddress']?.toString();
-
-    final arrivalGarageId = data['arrivalGarageId']?.toString();
-    final arrivalGarageName = data['arrivalGarageName']?.toString();
-    final notes = data['notes']?.toString();
-    final pickupDate = data['pickupDate']?.toString();
-    final estimatedDeliveryDate = data['estimatedDeliveryDate']?.toString();
-
-    // Médias
-    final List<String> photoUrls = data['photoUrls'] != null
-        ? List<String>.from(data['photoUrls'])
-        : [];
-    final List<String> videoUrls = data['videoUrls'] != null
-        ? List<String>.from(data['videoUrls'])
-        : [];
-
-    // Options
-    final isInsured = data['isInsured'] == true;
-    final isUrgent = data['isUrgent'] == true;
-    final price = data['price'] != null ? (data['price'] as num).toDouble() : 0;
-    final deliveryFees = data['deliveryFees'] != null ? (data['deliveryFees'] as num).toDouble() : 0;
-    final totalAmount = data['totalAmount'] != null
-        ? (data['totalAmount'] as num).toDouble()
-        : price + deliveryFees;
-
-    final paymentMethod = data['paymentMethod']?.toString();
-    final paymentPhoneNumber = data['paymentPhoneNumber']?.toString();
-    final paymentStatus = 'pending';
-
-    // Vérifier les colonnes disponibles
-    final availableColumns = await _checkColumns();
-
-    // Construction de la requête
-    final columns = <String>[];
-    final values = <dynamic>[];
-
-    // Colonnes de base
-    final baseColumns = {
-      'id': parcelId,
-      'tracking_number': trackingNumber,
-      'sender_id': senderId,
-      'sender_name': senderName,
-      'sender_phone': senderPhone,
-      'sender_email': senderEmail,
-      'receiver_name': receiverName,
-      'receiver_phone': receiverPhone,
-      'receiver_email': receiverEmail,
-      'receiver_address': receiverAddress,
-      'description': data['description']?.toString() ?? '',
-      'weight': (data['weight'] as num).toDouble(),
-      'type': data['type']?.toString() ?? 'package',
-      'status': initialStatus,
-      'departure_garage_id': data['departureGarageId']?.toString(),
-      'departure_garage_name': data['departureGarageName']?.toString(),
-      'arrival_garage_id': arrivalGarageId,
-      'arrival_garage_name': arrivalGarageName,
-      'driver_id': driverId,
-      'driver_name': driverName,
-      'driver_phone': driverPhone,
-      'price': price,
-      'is_urgent': isUrgent,
-      'is_insured': isInsured,
-      'payment_method': paymentMethod,
-      'payment_status': paymentStatus,
-      'photo_urls': photoUrls,
-      'created_by': userId,
-      'created_at': DateTime.now(),
-      'updated_at': DateTime.now(),
-    };
-
-    for (final entry in baseColumns.entries) {
-      columns.add(entry.key);
-      values.add(entry.value);
+    // Envoyer email de confirmation
+    if (senderEmail != null && senderEmail.isNotEmpty) {
+      unawaited(
+        _sendParcelNotification(
+          toEmail: senderEmail,
+          toPhone: senderPhone ?? '',
+          trackingNumber: trackingNumber,
+          status: initialStatus,
+          statusLabel: 'Colis créé',
+          receiverName: receiverName ?? '',
+          senderName: senderName,
+        ).then((_) => print('✅ Email de confirmation envoyé à $senderEmail'))
+          .catchError((e) => print('❌ Erreur envoi email: $e'))
+      );
     }
 
-    // Colonnes optionnelles
-    if (availableColumns['video_urls'] == true) {
-      columns.add('video_urls');
-      values.add(videoUrls);
-    }
-    if (availableColumns['notes'] == true && notes != null) {
-      columns.add('notes');
-      values.add(notes);
-    }
-    if (availableColumns['pickup_date'] == true && pickupDate != null) {
-      columns.add('pickup_date');
-      values.add(DateTime.tryParse(pickupDate));
-    }
-    if (availableColumns['estimated_delivery_date'] == true && estimatedDeliveryDate != null) {
-      columns.add('estimated_delivery_date');
-      values.add(DateTime.tryParse(estimatedDeliveryDate));
-    }
-    if (availableColumns['payment_phone_number'] == true && paymentPhoneNumber != null) {
-      columns.add('payment_phone_number');
-      values.add(paymentPhoneNumber);
-    }
-    if (availableColumns['total_amount'] == true && totalAmount != null) {
-      columns.add('total_amount');
-      values.add(totalAmount);
-    }
-    if (availableColumns['delivery_fees'] == true && deliveryFees != null) {
-      columns.add('delivery_fees');
-      values.add(deliveryFees);
-    }
-
-    final placeholders = List.generate(values.length, (i) => '\$${i + 1}').join(', ');
-    final sql = 'INSERT INTO parcels (${columns.join(', ')}) VALUES ($placeholders)';
-
-    print('📝 SQL: $sql');
-
-    try {
-      await db.connection.execute(sql, parameters: values);
-
-      // Événement de création
+    // Événement de confirmation pour les chauffeurs
+    if (isDriver) {
       await createParcelEvent(
         parcelId,
-        initialStatus,
-        'Colis créé par $currentUserName',
+        'confirmed',
+        'Colis confirmé et prêt pour le transport',
         userId: userId,
         userName: currentUserName,
         metadata: {
-          'type': 'creation',
-          'weight': data['weight'],
-          'trackingNumber': trackingNumber,
-          'clientName': senderName,
-          'totalAmount': totalAmount,
+          'type': 'confirmation',
+          'driverId': driverId,
+          'driverName': driverName,
         },
       );
-
-      // Envoyer email de confirmation
-      if (senderEmail != null && senderEmail.isNotEmpty) {
-        unawaited(
-          _sendParcelNotification(
-            toEmail: senderEmail,
-            toPhone: senderPhone ?? '',
-            trackingNumber: trackingNumber,
-            status: initialStatus,
-            statusLabel: 'Colis créé',
-            receiverName: receiverName ?? '',
-            senderName: senderName,
-          ).then((_) => print('✅ Email de confirmation envoyé à $senderEmail'))
-            .catchError((e) => print('❌ Erreur envoi email: $e'))
-        );
-      }
-
-      // Événement de confirmation pour les chauffeurs
-      if (isDriver) {
-        await createParcelEvent(
-          parcelId,
-          'confirmed',
-          'Colis confirmé et prêt pour le transport',
-          userId: userId,
-          userName: currentUserName,
-          metadata: {
-            'type': 'confirmation',
-            'driverId': driverId,
-            'driverName': driverName,
-          },
-        );
-      }
-
-      return {
-        'success': true,
-        'id': parcelId,
-        'trackingNumber': trackingNumber,
-        'status': initialStatus,
-        'createdAt': DateTime.now().toIso8601String(),
-        'driverId': driverId,
-        'driverName': driverName,
-        'senderName': senderName,
-        'totalAmount': totalAmount,
-      };
-    } catch (e) {
-      print('❌ Erreur insertion colis: $e');
-      return {'success': false, 'error': e.toString()};
     }
+
+    return {
+      'success': true,
+      'id': parcelId,
+      'trackingNumber': trackingNumber,
+      'status': initialStatus,
+      'createdAt': DateTime.now().toIso8601String(),
+      'driverId': driverId,
+      'driverName': driverName,
+      'senderName': senderName,
+      'totalAmount': totalAmount,
+      'photoUrls': photoUrls,
+      'videoUrls': videoUrls,
+    };
+  } catch (e) {
+    print('❌ Erreur insertion colis: $e');
+    return {'success': false, 'error': e.toString()};
   }
+}
 
   // ==================== LECTURE ====================
 
