@@ -219,8 +219,6 @@ Merci d'avoir choisi PRO COLIS !
 
   final currentUserName = userResult.first[0].toString();
   final currentUserPhone = userResult.first[1].toString();
-  // ignore: unused_local_variable
-  final currentUserEmail = userResult.first[2].toString();
   final userRole = userResult.first[3].toString();
   final isDriver = userRole == 'driver';
   final initialStatus = isDriver ? 'confirmed' : 'pending';
@@ -249,7 +247,7 @@ Merci d'avoir choisi PRO COLIS !
   final pickupDate = data['pickupDate']?.toString();
   final estimatedDeliveryDate = data['estimatedDeliveryDate']?.toString();
 
-  // 🔥 CORRECTION: Convertir les List en JSON string pour stockage TEXT
+  // Médias - Convertir en format PostgreSQL ARRAY
   final List<String> photoUrls = data['photoUrls'] != null
       ? List<String>.from(data['photoUrls'])
       : [];
@@ -257,14 +255,21 @@ Merci d'avoir choisi PRO COLIS !
       ? List<String>.from(data['videoUrls'])
       : [];
 
-  // Convertir en JSON string (car la colonne est TEXT, pas TEXT[])
-  final String photoUrlsJson = jsonEncode(photoUrls);
-  final String videoUrlsJson = jsonEncode(videoUrls);
+  // Fonction pour convertir List en PostgreSQL ARRAY
+  String listToPgArray(List<String> list) {
+    if (list.isEmpty) return '{}';
+    // Échapper les guillemets dans les URLs
+    final escaped = list.map((url) => url.replaceAll('"', '\\"')).toList();
+    return '{${escaped.join(',')}}';
+  }
+
+  final String photoUrlsPg = listToPgArray(photoUrls);
+  final String videoUrlsPg = listToPgArray(videoUrls);
 
   print('📸 Photos reçues: $photoUrls');
   print('🎬 Vidéos reçues: $videoUrls');
-  print('📸 Photos JSON: $photoUrlsJson');
-  print('🎬 Vidéos JSON: $videoUrlsJson');
+  print('📸 Photos PG: $photoUrlsPg');
+  print('🎬 Vidéos PG: $videoUrlsPg');
 
   // Options
   final isInsured = data['isInsured'] == true;
@@ -279,14 +284,11 @@ Merci d'avoir choisi PRO COLIS !
   final paymentPhoneNumber = data['paymentPhoneNumber']?.toString();
   final paymentStatus = 'pending';
 
-  // Vérifier les colonnes disponibles
-  final availableColumns = await _checkColumns();
-
   // Construction de la requête
   final columns = <String>[];
   final values = <dynamic>[];
 
-  // 🔥 CORRECTION: Utiliser les versions JSON pour photo_urls et video_urls
+  // Colonnes de base
   final baseColumns = {
     'id': parcelId,
     'tracking_number': trackingNumber,
@@ -314,7 +316,7 @@ Merci d'avoir choisi PRO COLIS !
     'is_insured': isInsured,
     'payment_method': paymentMethod,
     'payment_status': paymentStatus,
-    'photo_urls': photoUrlsJson,  // ← JSON string
+    'photo_urls': photoUrlsPg,
     'created_by': userId,
     'created_at': DateTime.now(),
     'updated_at': DateTime.now(),
@@ -325,37 +327,33 @@ Merci d'avoir choisi PRO COLIS !
     values.add(entry.value);
   }
 
-  // 🔥 CORRECTION: Ajouter video_urls avec JSON string
-  if (availableColumns['video_urls'] == true) {
-    columns.add('video_urls');
-    values.add(videoUrlsJson);  // ← JSON string au lieu de List
-    print('📹 Ajout de video_urls avec ${videoUrls.length} vidéo(s)');
-  } else {
-    print('⚠️ La colonne video_urls n\'existe pas');
-  }
+  // Ajouter video_urls
+  columns.add('video_urls');
+  values.add(videoUrlsPg);
+  print('📹 Ajout de video_urls: $videoUrlsPg');
 
   // Colonnes optionnelles
-  if (availableColumns['notes'] == true && notes != null && notes.isNotEmpty) {
+  if (notes != null && notes.isNotEmpty) {
     columns.add('notes');
     values.add(notes);
   }
-  if (availableColumns['pickup_date'] == true && pickupDate != null) {
+  if (pickupDate != null) {
     columns.add('pickup_date');
     values.add(DateTime.tryParse(pickupDate));
   }
-  if (availableColumns['estimated_delivery_date'] == true && estimatedDeliveryDate != null) {
+  if (estimatedDeliveryDate != null) {
     columns.add('estimated_delivery_date');
     values.add(DateTime.tryParse(estimatedDeliveryDate));
   }
-  if (availableColumns['payment_phone_number'] == true && paymentPhoneNumber != null && paymentPhoneNumber.isNotEmpty) {
+  if (paymentPhoneNumber != null && paymentPhoneNumber.isNotEmpty) {
     columns.add('payment_phone_number');
     values.add(paymentPhoneNumber);
   }
-  if (availableColumns['total_amount'] == true && totalAmount != null) {
+  if (totalAmount != null) {
     columns.add('total_amount');
     values.add(totalAmount);
   }
-  if (availableColumns['delivery_fees'] == true && deliveryFees != null) {
+  if (deliveryFees != null) {
     columns.add('delivery_fees');
     values.add(deliveryFees);
   }
@@ -388,22 +386,6 @@ Merci d'avoir choisi PRO COLIS !
       },
     );
 
-    // Envoyer email de confirmation
-    if (senderEmail != null && senderEmail.isNotEmpty) {
-      unawaited(
-        _sendParcelNotification(
-          toEmail: senderEmail,
-          toPhone: senderPhone ?? '',
-          trackingNumber: trackingNumber,
-          status: initialStatus,
-          statusLabel: 'Colis créé',
-          receiverName: receiverName ?? '',
-          senderName: senderName,
-        ).then((_) => print('✅ Email de confirmation envoyé à $senderEmail'))
-          .catchError((e) => print('❌ Erreur envoi email: $e'))
-      );
-    }
-
     // Événement de confirmation pour les chauffeurs
     if (isDriver) {
       await createParcelEvent(
@@ -430,8 +412,6 @@ Merci d'avoir choisi PRO COLIS !
       'driverName': driverName,
       'senderName': senderName,
       'totalAmount': totalAmount,
-      'photoUrls': photoUrls,
-      'videoUrls': videoUrls,
     };
   } catch (e) {
     print('❌ Erreur insertion colis: $e');
