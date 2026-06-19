@@ -542,17 +542,39 @@ Merci d'avoir choisi PRO COLIS !
 
   // Récupérer les colis en libre service
   Future<List<Map<String, dynamic>>> getFreeParcels() async {
-    final db = await DatabaseService.getInstance();
+  final db = await DatabaseService.getInstance();
 
-    try {
-      final parcelsResult = await db.connection.execute('''
+  try {
+    final parcelsResult = await db.connection.execute('''
       SELECT 
-        id, tracking_number, sender_name, sender_phone,
-        receiver_name, receiver_phone,
-        description, weight, type, status,
-        price, proposed_price, total_amount,
-        departure_garage_name, arrival_garage_name,
-        created_at, notes
+        id, 
+        tracking_number, 
+        sender_name, 
+        sender_phone,
+        sender_email,
+        receiver_name, 
+        receiver_phone,
+        receiver_email,
+        receiver_address,
+        description, 
+        weight, 
+        type, 
+        status,
+        price, 
+        proposed_price, 
+        total_amount,
+        departure_garage_name, 
+        arrival_garage_name,
+        created_at, 
+        notes,
+        is_urgent,
+        is_insured,
+        payment_method,
+        payment_phone_number,
+        is_free_for_bidding,
+        driver_id,
+        driver_name,
+        driver_phone
       FROM parcels
       WHERE is_free_for_bidding = true 
       AND status = 'free'
@@ -560,69 +582,121 @@ Merci d'avoir choisi PRO COLIS !
       ORDER BY created_at DESC
     ''');
 
-      final parcels = <Map<String, dynamic>>[];
+    final parcels = <Map<String, dynamic>>[];
 
-      for (final row in parcelsResult) {
-        final parcelId = row[0].toString();
+    for (final row in parcelsResult) {
+      final parcelId = row[0].toString();
 
-        final bidsResult = await db.connection.execute('''
+      // Récupérer les offres
+      final bidsResult = await db.connection.execute('''
         SELECT 
           id, driver_id, driver_name, driver_phone, 
-          price, message, status, created_at, responded_at, response_message
+          price, message, status, created_at, 
+          responded_at, response_message, audio_url
         FROM bids 
         WHERE parcel_id = \$1
         ORDER BY price DESC, created_at ASC
       ''', parameters: [parcelId]);
 
-        final bids = bidsResult
-            .map((bidRow) => {
-                  'id': bidRow[0].toString(),
-                  'driverId': bidRow[1].toString(),
-                  'driverName': bidRow[2].toString(),
-                  'driverPhone': bidRow[3].toString(),
-                  'price': double.tryParse(bidRow[4].toString()) ?? 0,
-                  'message': bidRow[5]?.toString(),
-                  'status': bidRow[6]?.toString() ?? 'pending',
-                  'createdAt': (bidRow[7] as DateTime).toIso8601String(),
-                  'respondedAt': bidRow[8] != null
-                      ? (bidRow[8] as DateTime).toIso8601String()
-                      : null,
-                  'responseMessage': bidRow[9]?.toString(),
-                })
-            .toList();
+      final bids = bidsResult
+          .map((bidRow) => {
+                'id': bidRow[0].toString(),
+                'driverId': bidRow[1].toString(),
+                'driverName': bidRow[2].toString(),
+                'driverPhone': bidRow[3].toString(),
+                'price': double.tryParse(bidRow[4].toString()) ?? 0,
+                'message': bidRow[5]?.toString(),
+                'status': bidRow[6]?.toString() ?? 'pending',
+                'createdAt': (bidRow[7] as DateTime).toIso8601String(),
+                'respondedAt': bidRow[8] != null
+                    ? (bidRow[8] as DateTime).toIso8601String()
+                    : null,
+                'responseMessage': bidRow[9]?.toString(),
+                'audioUrl': bidRow[10]?.toString(),
+              })
+          .toList();
 
-        print('📦 Parcel $parcelId: ${bids.length} bids found');
+      // Récupérer les photos
+      final photosResult = await db.connection.execute('''
+        SELECT photo_url 
+        FROM parcel_photos 
+        WHERE parcel_id = \$1
+        ORDER BY created_at ASC
+      ''', parameters: [parcelId]);
 
-        parcels.add({
-          'id': parcelId,
-          'trackingNumber': row[1].toString(),
-          'senderName': row[2].toString(),
-          'senderPhone': row[3].toString(),
-          'receiverName': row[4].toString(),
-          'receiverPhone': row[5].toString(),
-          'description': row[6].toString(),
-          'weight': double.tryParse(row[7].toString()) ?? 0,
-          'type': row[8].toString(),
-          'status': row[9].toString(),
-          'price': double.tryParse(row[10].toString()) ?? 0,
-          'proposedPrice':
-              row[11] != null ? double.tryParse(row[11].toString()) : null,
-          'totalAmount': double.tryParse(row[12].toString()) ?? 0,
-          'departureGarageName': row[13].toString(),
-          'arrivalGarageName': row[14]?.toString(),
-          'createdAt': (row[15] as DateTime).toIso8601String(),
-          'notes': row[16]?.toString(),
-          'bids': bids,
-        });
-      }
+      final photoUrls = photosResult
+          .map((photoRow) => photoRow[0].toString())
+          .toList();
 
-      print('✅ ${parcels.length} free parcels loaded with bids');
-      return parcels;
-    } catch (e) {
-      print('❌ Erreur getFreeParcels: $e');
-      return [];
+      // Récupérer les vidéos
+      final videosResult = await db.connection.execute('''
+        SELECT video_url 
+        FROM parcel_videos 
+        WHERE parcel_id = \$1
+        ORDER BY created_at ASC
+      ''', parameters: [parcelId]);
+
+      final videoUrls = videosResult
+          .map((videoRow) => videoRow[0].toString())
+          .toList();
+
+      // Récupérer les audios
+      final audiosResult = await db.connection.execute('''
+        SELECT audio_url 
+        FROM parcel_audios 
+        WHERE parcel_id = \$1
+        ORDER BY created_at ASC
+      ''', parameters: [parcelId]);
+
+      final audioUrls = audiosResult
+          .map((audioRow) => audioRow[0].toString())
+          .toList();
+
+      print('📦 Parcel $parcelId: ${bids.length} bids, ${photoUrls.length} photos, ${videoUrls.length} videos, ${audioUrls.length} audios');
+
+      parcels.add({
+        'id': parcelId,
+        'trackingNumber': row[1].toString(),
+        'senderName': row[2].toString(),
+        'senderPhone': row[3].toString(),
+        'senderEmail': row[4]?.toString(),
+        'receiverName': row[5].toString(),
+        'receiverPhone': row[6].toString(),
+        'receiverEmail': row[7]?.toString(),
+        'receiverAddress': row[8]?.toString(),
+        'description': row[9].toString(),
+        'weight': double.tryParse(row[10].toString()) ?? 0,
+        'type': row[11].toString(),
+        'status': row[12].toString(),
+        'price': double.tryParse(row[13].toString()) ?? 0,
+        'proposedPrice': row[14] != null ? double.tryParse(row[14].toString()) : null,
+        'totalAmount': double.tryParse(row[15].toString()) ?? 0,
+        'departureGarageName': row[16].toString(),
+        'arrivalGarageName': row[17]?.toString(),
+        'createdAt': (row[18] as DateTime).toIso8601String(),
+        'notes': row[19]?.toString(),
+        'isUrgent': row[20] != null && row[20] == true,
+        'isInsured': row[21] != null && row[21] == true,
+        'paymentMethod': row[22]?.toString(),
+        'paymentPhoneNumber': row[23]?.toString(),
+        'isFreeForBidding': row[24] != null && row[24] == true,
+        'driverId': row[25]?.toString(),
+        'driverName': row[26]?.toString(),
+        'driverPhone': row[27]?.toString(),
+        'photoUrls': photoUrls,
+        'videoUrls': videoUrls,
+        'audioUrls': audioUrls,
+        'bids': bids,
+      });
     }
+
+    print('✅ ${parcels.length} free parcels loaded with all data');
+    return parcels;
+  } catch (e) {
+    print('❌ Erreur getFreeParcels: $e');
+    return [];
   }
+}
 
   Future<Map<String, dynamic>?> getParcelById(String parcelId) async {
     final db = await DatabaseService.getInstance();
