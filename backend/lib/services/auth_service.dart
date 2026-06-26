@@ -1,5 +1,5 @@
 // backend/lib/services/auth_service.dart
-// ignore_for_file: unused_local_variable
+// ignore_for_file: unused_local_variable, unused_element
 
 import 'dart:async';
 
@@ -33,7 +33,32 @@ class AuthService {
     _notificationService = NotificationService();
   }
 
-  // Méthode utilitaire pour convertir un garage ID en UUID valide
+  // ==================== MÉTHODES DE CONVERSION DE TYPES ====================
+
+  /// Convertit une valeur en String ou null
+  String? _getStringValue(Map<String, dynamic> data, String key) {
+    final value = data[key];
+    if (value == null) return null;
+    if (value is String && value.isEmpty) return null;
+    if (value is String) return value;
+    return value.toString();
+  }
+
+  /// Convertit une valeur en int ou null
+  int? _getIntValue(Map<String, dynamic> data, String key) {
+    final value = data[key];
+    if (value == null) return null;
+    if (value is int) return value;
+    if (value is String) {
+      if (value.isEmpty) return null;
+      return int.tryParse(value);
+    }
+    if (value is double) return value.toInt();
+    if (value is bool) return value ? 1 : 0;
+    return null;
+  }
+
+  /// Convertit un garage ID en UUID valide
   String? _convertGarageIdToUuid(dynamic garageId) {
     if (garageId == null) return null;
 
@@ -57,6 +82,101 @@ class AuthService {
     // ignore: deprecated_member_use
     return _uuid.v5(Uuid.NAMESPACE_DNS, garageIdStr);
   }
+
+  // ==================== FONCTIONS DE CONVERSION POUR LES LIGNES DB ====================
+
+  static String _safeToString(dynamic value) {
+    if (value == null) return '';
+    return value.toString();
+  }
+
+  static String? _safeToStringNullable(dynamic value) {
+    if (value == null) return null;
+    final str = value.toString();
+    return str.isEmpty ? null : str;
+  }
+
+  static bool _safeToBool(dynamic value) {
+    if (value == null) return false;
+    if (value is bool) return value;
+    if (value is String) {
+      return value.toLowerCase() == 'true' || value == '1';
+    }
+    if (value is int) return value == 1;
+    return false;
+  }
+
+  static int? _safeToInt(dynamic value) {
+    if (value == null) return null;
+    if (value is int) return value;
+    if (value is double) return value.toInt();
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+
+  static double? _safeToDouble(dynamic value) {
+    if (value == null) return null;
+    if (value is double) return value;
+    if (value is int) return value.toDouble();
+    if (value is String) return double.tryParse(value);
+    return null;
+  }
+
+  static DateTime? _safeToDateTime(dynamic value) {
+    if (value == null) return null;
+    if (value is DateTime) return value;
+    if (value is String) {
+      try {
+        return DateTime.parse(value);
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  static DateTime _safeToDateTimeRequired(dynamic value) {
+    if (value == null) return DateTime.now();
+    if (value is DateTime) return value;
+    if (value is String) {
+      try {
+        return DateTime.parse(value);
+      } catch (_) {
+        return DateTime.now();
+      }
+    }
+    return DateTime.now();
+  }
+
+  static UserRole _toUserRole(String value) {
+    switch (value) {
+      case 'super_admin':
+        return UserRole.superAdmin;
+      case 'admin':
+        return UserRole.admin;
+      case 'driver':
+        return UserRole.driver;
+      case 'client':
+        return UserRole.client;
+      default:
+        return UserRole.client;
+    }
+  }
+
+  static UserStatus _toUserStatus(String value) {
+    switch (value) {
+      case 'active':
+        return UserStatus.active;
+      case 'suspended':
+        return UserStatus.suspended;
+      case 'deleted':
+        return UserStatus.deleted;
+      default:
+        return UserStatus.active;
+    }
+  }
+
+  // ==================== INSCRIPTION ====================
 
   Future<Map<String, dynamic>> register(Map<String, dynamic> data) async {
     final db = await DatabaseService.getInstance();
@@ -96,7 +216,7 @@ class AuthService {
       // Générer un OTP qui servira de PIN par défaut
       final defaultOtp = (100000 + _uuid.v4().hashCode % 900000).toString();
 
-      // Nettoyer les valeurs null
+      // Nettoyer et typer correctement les valeurs
       final address = _getStringValue(data, 'address');
       final city = _getStringValue(data, 'city');
       final region = _getStringValue(data, 'region');
@@ -111,6 +231,7 @@ class AuthService {
       print('   vehicleModel: $vehicleModel');
       print('   vehicleColor: $vehicleColor');
       print('   vehicleYear: $vehicleYear');
+      print('   role: $role');
       print('   OTP/PIN par défaut: $defaultOtp');
 
       // Créer l'utilisateur avec l'OTP comme PIN par défaut
@@ -119,9 +240,9 @@ class AuthService {
           id, email, phone, full_name, role, pin, 
           address, city, region, 
           vehicle_plate, vehicle_model, vehicle_color, vehicle_year,
-          garage_id, driver_status, created_at, updated_at
+          garage_id, created_at, updated_at
         )
-        VALUES (\$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8, \$9, \$10, \$11, \$12, \$13, \$14, \$15, NOW(), NOW())
+        VALUES (\$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8, \$9, \$10, \$11, \$12, \$13, \$14, NOW(), NOW())
       ''', parameters: [
         userId,
         data['email'],
@@ -137,13 +258,12 @@ class AuthService {
         vehicleColor,
         vehicleYear,
         garageUuid,
-        _getStringValue(data, 'driverStatus') ?? 'offline'
       ]);
 
       print('✅ [REGISTER] Utilisateur créé avec succès: $userId');
 
       // Stocker l'OTP pour vérification
-      final expiresAt = DateTime.now().add(Duration(minutes: 10));
+      final expiresAt = DateTime.now().add(const Duration(minutes: 10));
       _otpStorage[userId] = {
         'code': defaultOtp,
         'expiresAt': expiresAt.toIso8601String(),
@@ -164,7 +284,7 @@ class AuthService {
         print('❌ [REGISTER] Erreur envoi email: $error');
       }));
 
-      // ✅ NOTIFICATION: Inscription réussie
+      // NOTIFICATION: Inscription réussie
       await _notificationService.createNotification(
         userId: userId,
         type: 'system',
@@ -204,7 +324,41 @@ class AuthService {
         };
       }
 
-      final user = User.fromDatabaseRow(userResult.first);
+      final row = userResult.first;
+      
+      // Construction manuelle de l'utilisateur
+      final user = User(
+        id: _safeToString(row[0]),
+        email: _safeToString(row[1]),
+        phone: _safeToString(row[2]),
+        fullName: _safeToString(row[3]),
+        passwordHash: _safeToStringNullable(row[4]),
+        role: _toUserRole(_safeToString(row[5])),
+        status: _toUserStatus(_safeToString(row[6])),
+        address: _safeToStringNullable(row[7]),
+        city: _safeToStringNullable(row[8]),
+        region: _safeToStringNullable(row[9]),
+        vehiclePlate: _safeToStringNullable(row[10]),
+        vehicleModel: _safeToStringNullable(row[11]),
+        vehicleColor: _safeToStringNullable(row[12]),
+        vehicleYear: _safeToInt(row[13]),
+        pin: _safeToStringNullable(row[14]),
+        garageId: _safeToStringNullable(row[15]),
+        garageName: _safeToStringNullable(row[16]),
+        profilePhotoUrl: _safeToStringNullable(row[17]),
+        isEmailVerified: _safeToBool(row[18]),
+        isPhoneVerified: _safeToBool(row[19]),
+        isProfileComplete: _safeToBool(row[20]),
+        rating: _safeToDouble(row[21]),
+        totalDeliveries: _safeToInt(row[22]),
+        completedDeliveries: _safeToInt(row[23]),
+        cancelledDeliveries: _safeToInt(row[24]),
+        gender: _safeToStringNullable(row[25]),
+        createdAt: _safeToDateTimeRequired(row[26]),
+        updatedAt: _safeToDateTime(row[27]),
+        lastLogin: _safeToDateTime(row[28]),
+        lastActiveAt: _safeToDateTime(row[29]),
+      );
 
       return {
         'success': true,
@@ -215,19 +369,21 @@ class AuthService {
       };
     } catch (e) {
       print('❌ [REGISTER] Erreur: $e');
+      print('📚 Stack trace: ${StackTrace.current}');
       return {'success': false, 'message': e.toString()};
     }
   }
 
+  // ==================== ENVOI OTP ====================
+
   Future<Map<String, dynamic>> sendOtp(String identifier) async {
     final db = await DatabaseService.getInstance();
     final otp = (100000 + _uuid.v4().hashCode % 900000).toString();
-    final expiresAt = DateTime.now().add(Duration(minutes: 5));
+    final expiresAt = DateTime.now().add(const Duration(minutes: 5));
 
     try {
       print('📧 [OTP] Envoi OTP pour: $identifier');
 
-      // Vérifier si l'utilisateur existe
       final user = await db.connection.execute(
         'SELECT id, email, phone, full_name FROM users WHERE email = \$1 OR phone = \$1',
         parameters: [identifier],
@@ -238,13 +394,11 @@ class AuthService {
         return {'success': false, 'message': 'Utilisateur non trouvé'};
       }
 
-      final userId = user.first[0] as String;
-      final email = user.first[1] as String;
-      final fullName = user.first[3] as String? ?? 'Client';
+      final userId = _safeToString(user.first[0]);
+      final email = _safeToString(user.first[1]);
 
       print('📧 [OTP] Utilisateur trouvé: $email, OTP: $otp');
 
-      // Stocker l'OTP AVANT d'envoyer l'email
       _otpStorage[userId] = {
         'code': otp,
         'expiresAt': expiresAt.toIso8601String(),
@@ -252,7 +406,6 @@ class AuthService {
         'attempts': 0
       };
 
-      // Envoyer l'email de manière asynchrone
       unawaited(_emailService.sendOtpCode(email, otp).then((success) {
         if (success) {
           print('✅ [OTP] Email envoyé avec succès à $email (OTP: $otp)');
@@ -262,8 +415,6 @@ class AuthService {
       }).catchError((error) {
         print('❌ [OTP] Erreur lors de l\'envoi email: $error');
       }));
-
-      print('✅ [OTP] Réponse immédiate pour $email (envoi email en arrière-plan)');
 
       return {
         'success': true,
@@ -275,6 +426,8 @@ class AuthService {
       return {'success': false, 'message': e.toString()};
     }
   }
+
+  // ==================== VÉRIFICATION OTP ====================
 
   Future<Map<String, dynamic>> verifyOtp(
       String userId, String code, String type) async {
@@ -290,7 +443,6 @@ class AuthService {
       };
     }
 
-    // Vérifier les tentatives
     final attempts = stored['attempts'] as int? ?? 0;
     if (attempts >= 3) {
       _otpStorage.remove(userId);
@@ -320,13 +472,11 @@ class AuthService {
       };
     }
 
-    // Générer le token
     final token = JwtHelper.generateToken(userId);
     _otpStorage.remove(userId);
 
     print('✅ [VERIFY] OTP validé avec succès pour userId: $userId');
 
-    // Récupérer toutes les infos utilisateur
     final db = await DatabaseService.getInstance();
     final userResult = await db.connection.execute(
       'SELECT * FROM users WHERE id = \$1',
@@ -338,15 +488,46 @@ class AuthService {
       return {'success': false, 'message': 'Utilisateur non trouvé'};
     }
 
-    final user = User.fromDatabaseRow(userResult.first);
+    final row = userResult.first;
+    
+    final user = User(
+      id: _safeToString(row[0]),
+      email: _safeToString(row[1]),
+      phone: _safeToString(row[2]),
+      fullName: _safeToString(row[3]),
+      passwordHash: _safeToStringNullable(row[4]),
+      role: _toUserRole(_safeToString(row[5])),
+      status: _toUserStatus(_safeToString(row[6])),
+      address: _safeToStringNullable(row[7]),
+      city: _safeToStringNullable(row[8]),
+      region: _safeToStringNullable(row[9]),
+      vehiclePlate: _safeToStringNullable(row[10]),
+      vehicleModel: _safeToStringNullable(row[11]),
+      vehicleColor: _safeToStringNullable(row[12]),
+      vehicleYear: _safeToInt(row[13]),
+      pin: _safeToStringNullable(row[14]),
+      garageId: _safeToStringNullable(row[15]),
+      garageName: _safeToStringNullable(row[16]),
+      profilePhotoUrl: _safeToStringNullable(row[17]),
+      isEmailVerified: _safeToBool(row[18]),
+      isPhoneVerified: _safeToBool(row[19]),
+      isProfileComplete: _safeToBool(row[20]),
+      rating: _safeToDouble(row[21]),
+      totalDeliveries: _safeToInt(row[22]),
+      completedDeliveries: _safeToInt(row[23]),
+      cancelledDeliveries: _safeToInt(row[24]),
+      gender: _safeToStringNullable(row[25]),
+      createdAt: _safeToDateTimeRequired(row[26]),
+      updatedAt: _safeToDateTime(row[27]),
+      lastLogin: _safeToDateTime(row[28]),
+      lastActiveAt: _safeToDateTime(row[29]),
+    );
 
-    // Mettre à jour last_login
     await db.connection.execute(
       'UPDATE users SET last_login = NOW() WHERE id = \$1',
       parameters: [userId],
     );
 
-    // ✅ NOTIFICATION: Connexion réussie
     await _notificationService.createNotification(
       userId: userId,
       type: 'system',
@@ -355,7 +536,7 @@ class AuthService {
       priority: 'normal',
       data: {
         'type': 'login_success',
-        'role': user.role,
+        'role': user.role.name,
       },
     );
 
@@ -363,6 +544,8 @@ class AuthService {
 
     return {'success': true, 'accessToken': token, 'user': user.toJson()};
   }
+
+  // ==================== CONNEXION AVEC PIN ====================
 
   Future<Map<String, dynamic>> loginWithPin(String pin, String identifier) async {
     final db = await DatabaseService.getInstance();
@@ -382,7 +565,41 @@ class AuthService {
         return {'success': false, 'message': 'Identifiant ou PIN incorrect'};
       }
 
-      final user = User.fromDatabaseRow(result.first);
+      final row = result.first;
+      
+      final user = User(
+        id: _safeToString(row[0]),
+        email: _safeToString(row[1]),
+        phone: _safeToString(row[2]),
+        fullName: _safeToString(row[3]),
+        passwordHash: _safeToStringNullable(row[4]),
+        role: _toUserRole(_safeToString(row[5])),
+        status: _toUserStatus(_safeToString(row[6])),
+        address: _safeToStringNullable(row[7]),
+        city: _safeToStringNullable(row[8]),
+        region: _safeToStringNullable(row[9]),
+        vehiclePlate: _safeToStringNullable(row[10]),
+        vehicleModel: _safeToStringNullable(row[11]),
+        vehicleColor: _safeToStringNullable(row[12]),
+        vehicleYear: _safeToInt(row[13]),
+        pin: _safeToStringNullable(row[14]),
+        garageId: _safeToStringNullable(row[15]),
+        garageName: _safeToStringNullable(row[16]),
+        profilePhotoUrl: _safeToStringNullable(row[17]),
+        isEmailVerified: _safeToBool(row[18]),
+        isPhoneVerified: _safeToBool(row[19]),
+        isProfileComplete: _safeToBool(row[20]),
+        rating: _safeToDouble(row[21]),
+        totalDeliveries: _safeToInt(row[22]),
+        completedDeliveries: _safeToInt(row[23]),
+        cancelledDeliveries: _safeToInt(row[24]),
+        gender: _safeToStringNullable(row[25]),
+        createdAt: _safeToDateTimeRequired(row[26]),
+        updatedAt: _safeToDateTime(row[27]),
+        lastLogin: _safeToDateTime(row[28]),
+        lastActiveAt: _safeToDateTime(row[29]),
+      );
+
       final token = JwtHelper.generateToken(user.id);
 
       await db.connection.execute(
@@ -390,7 +607,6 @@ class AuthService {
         parameters: [user.id],
       );
 
-      // ✅ NOTIFICATION: Connexion réussie (pour les chauffeurs)
       if (user.isDriver) {
         await _notificationService.createNotification(
           userId: user.id,
@@ -418,6 +634,8 @@ class AuthService {
     }
   }
 
+  // ==================== RÉCUPÉRATION UTILISATEUR ====================
+
   Future<Map<String, dynamic>> getUserById(String userId) async {
     final db = await DatabaseService.getInstance();
 
@@ -431,7 +649,40 @@ class AuthService {
         return {'success': false, 'message': 'Utilisateur non trouvé'};
       }
 
-      final user = User.fromDatabaseRow(result.first);
+      final row = result.first;
+      
+      final user = User(
+        id: _safeToString(row[0]),
+        email: _safeToString(row[1]),
+        phone: _safeToString(row[2]),
+        fullName: _safeToString(row[3]),
+        passwordHash: _safeToStringNullable(row[4]),
+        role: _toUserRole(_safeToString(row[5])),
+        status: _toUserStatus(_safeToString(row[6])),
+        address: _safeToStringNullable(row[7]),
+        city: _safeToStringNullable(row[8]),
+        region: _safeToStringNullable(row[9]),
+        vehiclePlate: _safeToStringNullable(row[10]),
+        vehicleModel: _safeToStringNullable(row[11]),
+        vehicleColor: _safeToStringNullable(row[12]),
+        vehicleYear: _safeToInt(row[13]),
+        pin: _safeToStringNullable(row[14]),
+        garageId: _safeToStringNullable(row[15]),
+        garageName: _safeToStringNullable(row[16]),
+        profilePhotoUrl: _safeToStringNullable(row[17]),
+        isEmailVerified: _safeToBool(row[18]),
+        isPhoneVerified: _safeToBool(row[19]),
+        isProfileComplete: _safeToBool(row[20]),
+        rating: _safeToDouble(row[21]),
+        totalDeliveries: _safeToInt(row[22]),
+        completedDeliveries: _safeToInt(row[23]),
+        cancelledDeliveries: _safeToInt(row[24]),
+        gender: _safeToStringNullable(row[25]),
+        createdAt: _safeToDateTimeRequired(row[26]),
+        updatedAt: _safeToDateTime(row[27]),
+        lastLogin: _safeToDateTime(row[28]),
+        lastActiveAt: _safeToDateTime(row[29]),
+      );
 
       return {'success': true, 'user': user.toJson()};
     } catch (e) {
@@ -439,12 +690,13 @@ class AuthService {
     }
   }
 
+  // ==================== CHANGEMENT DE PIN ====================
+
   Future<Map<String, dynamic>> changePin(
       String userId, String oldPin, String newPin) async {
     final db = await DatabaseService.getInstance();
 
     try {
-      // Vérifier l'ancien PIN
       final result = await db.connection.execute(
         'SELECT id FROM users WHERE id = \$1 AND pin = \$2',
         parameters: [userId, oldPin],
@@ -454,13 +706,11 @@ class AuthService {
         return {'success': false, 'message': 'PIN actuel incorrect'};
       }
 
-      // Mettre à jour le nouveau PIN
       await db.connection.execute(
         'UPDATE users SET pin = \$1, updated_at = NOW() WHERE id = \$2',
         parameters: [newPin, userId],
       );
 
-      // ✅ NOTIFICATION: PIN modifié
       await _notificationService.createNotification(
         userId: userId,
         type: 'system',
@@ -478,11 +728,12 @@ class AuthService {
     }
   }
 
+  // ==================== RÉINITIALISATION PIN ====================
+
   Future<Map<String, dynamic>> resetPin(String email, String newPin) async {
     final db = await DatabaseService.getInstance();
 
     try {
-      // Vérifier si l'utilisateur existe
       final result = await db.connection.execute(
         'SELECT id FROM users WHERE email = \$1',
         parameters: [email],
@@ -492,15 +743,13 @@ class AuthService {
         return {'success': false, 'message': 'Email non trouvé'};
       }
 
-      final userId = result.first[0] as String;
+      final userId = _safeToString(result.first[0]);
 
-      // Réinitialiser le PIN
       await db.connection.execute(
         'UPDATE users SET pin = \$1, updated_at = NOW() WHERE email = \$2',
         parameters: [newPin, email],
       );
 
-      // ✅ NOTIFICATION: PIN réinitialisé
       await _notificationService.createNotification(
         userId: userId,
         type: 'system',
@@ -519,7 +768,8 @@ class AuthService {
     }
   }
 
-  // ✅ NOUVELLE MÉTHODE: Notification de mot de passe oublié
+  // ==================== MOT DE PASSE OUBLIÉ ====================
+
   Future<Map<String, dynamic>> forgotPassword(String email) async {
     final db = await DatabaseService.getInstance();
 
@@ -533,10 +783,9 @@ class AuthService {
         return {'success': false, 'message': 'Email non trouvé ou compte inactif'};
       }
 
-      final userId = result.first[0] as String;
-      final fullName = result.first[1] as String? ?? 'Utilisateur';
+      final userId = _safeToString(result.first[0]);
+      final fullName = _safeToString(result.first[1]);
 
-      // ✅ NOTIFICATION: Demande de réinitialisation
       await _notificationService.createNotification(
         userId: userId,
         type: 'system',
@@ -556,22 +805,5 @@ class AuthService {
     } catch (e) {
       return {'success': false, 'message': e.toString()};
     }
-  }
-
-  String? _getStringValue(Map<String, dynamic> data, String key) {
-    final value = data[key];
-    if (value == null) return null;
-    if (value is String && value.isEmpty) return null;
-    return value.toString();
-  }
-
-  int? _getIntValue(Map<String, dynamic> data, String key) {
-    final value = data[key];
-    if (value == null) return null;
-    if (value is int) return value;
-    if (value is String && value.isNotEmpty) {
-      return int.tryParse(value);
-    }
-    return null;
   }
 }
