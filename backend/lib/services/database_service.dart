@@ -20,43 +20,40 @@ class DatabaseService {
   }
 
   Future<void> _init() async {
-  try {
-    final config = await DatabaseConfig.getInstance();
+    try {
+      final config = await DatabaseConfig.getInstance();
 
-    final endpoint = Endpoint(
-      host: config.host,
-      port: config.port,
-      database: config.database,
-      username: config.username,
-      password: config.password,
-    );
+      final endpoint = Endpoint(
+        host: config.host,
+        port: config.port,
+        database: config.database,
+        username: config.username,
+        password: config.password,
+      );
 
-    final settings = ConnectionSettings(
-      sslMode:
-          config.useSsl
-              ? SslMode.require
-              : SslMode.disable,
-    );
+      final settings = ConnectionSettings(
+        sslMode: config.useSsl ? SslMode.require : SslMode.disable,
+      );
 
-    print('🔄 Connexion PostgreSQL...');
+      print('🔄 Connexion PostgreSQL...');
 
-    _connection = await Connection.open(
-      endpoint,
-      settings: settings,
-    );
+      _connection = await Connection.open(
+        endpoint,
+        settings: settings,
+      );
 
-    _isConnected = true;
+      _isConnected = true;
 
-    print('✅ PostgreSQL connecté');
+      print('✅ PostgreSQL connecté');
 
-    await _createTables();
-    await _seedInitialData();
-
-  } catch (e) {
-    print('❌ Erreur DB: $e');
-    _isConnected = false;
+      await _createTables();
+      await _seedInitialData();
+    } catch (e, stackTrace) {
+      print('❌ Erreur DB: $e');
+      print(stackTrace);
+      _isConnected = false;
+    }
   }
-}
 
   Future<void> _createTables() async {
     try {
@@ -86,7 +83,7 @@ class DatabaseService {
           last_login TIMESTAMP
         )
       ''');
-      
+
       await _connection.execute('''
         CREATE TABLE IF NOT EXISTS garages (
           id UUID PRIMARY KEY,
@@ -104,7 +101,7 @@ class DatabaseService {
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       ''');
-      
+
       await _connection.execute('''
         CREATE TABLE IF NOT EXISTS parcels (
           id UUID PRIMARY KEY,
@@ -137,7 +134,7 @@ class DatabaseService {
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       ''');
-      
+
       await _connection.execute('''
         CREATE TABLE IF NOT EXISTS parcel_events (
           id UUID PRIMARY KEY,
@@ -151,7 +148,7 @@ class DatabaseService {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       ''');
-      
+
       await _connection.execute('''
         CREATE TABLE IF NOT EXISTS otps (
           id UUID PRIMARY KEY,
@@ -163,7 +160,7 @@ class DatabaseService {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       ''');
-      
+
       await _connection.execute('''
         CREATE TABLE IF NOT EXISTS tokens (
           id UUID PRIMARY KEY,
@@ -174,7 +171,7 @@ class DatabaseService {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       ''');
-      
+
       print('✅ Tables créées/vérifiées');
     } catch (e) {
       print('❌ Erreur création tables: $e');
@@ -185,10 +182,10 @@ class DatabaseService {
     try {
       final result = await _connection.execute('SELECT COUNT(*) FROM garages');
       final count = result.first[0] as int? ?? 0;
-      
+
       if (count == 0) {
         print('🌱 Insertion des données initiales...');
-        
+
         await _connection.execute('''
           INSERT INTO garages (id, name, city, region, address, phone)
           VALUES 
@@ -198,7 +195,7 @@ class DatabaseService {
             (gen_random_uuid(), 'Garage Ziguinchor', 'Ziguinchor', 'Ziguinchor', 'Avenue Léopold Sédar Senghor', '+221 33 654 32 10'),
             (gen_random_uuid(), 'Garage Kaolack', 'Kaolack', 'Kaolack', 'Boulevard du Général de Gaulle', '+221 33 789 01 23')
         ''');
-        
+
         await _connection.execute('''
           INSERT INTO users (id, email, phone, full_name, role, status, pin, is_email_verified, is_phone_verified)
           VALUES (
@@ -213,7 +210,7 @@ class DatabaseService {
             TRUE
           )
         ''');
-        
+
         print('✅ Données initiales insérées');
       }
     } catch (e) {
@@ -223,13 +220,14 @@ class DatabaseService {
 
   Connection get connection {
     if (!_isConnected) {
-      throw StateError('Database connection is not initialized. Call getInstance() first and await it.');
+      throw StateError(
+          'Database connection is not initialized. Call getInstance() first and await it.');
     }
     return _connection;
   }
-  
+
   bool get isConnected => _isConnected;
-  
+
   Future<void> close() async {
     if (_isConnected) {
       await _connection.close();
