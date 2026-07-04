@@ -153,6 +153,7 @@ mobileRouter.post('/advertisements/:advertisementId/offers', authenticate, requi
 mobileRouter.get('/advertisements/:advertisementId/offers', authenticate, mobileController.advertisementOffers);
 mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/accept', authenticate, mobileController.acceptAdvertisementOffer);
 mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/reject', authenticate, mobileController.rejectAdvertisementOffer);
+mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/negotiate', authenticate, mobileController.negotiateAdvertisementOffer);
 
 mobileRouter.get('/webhooks', authenticate, requireRoles('super_admin'), mobileController.listWebhooks);
 mobileRouter.post('/webhooks', authenticate, requireRoles('super_admin'), mobileController.createWebhook);

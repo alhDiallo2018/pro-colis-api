@@ -386,6 +386,21 @@ export const getParcelDetail = handle('parcel.detail', async (req, res) => {
 export const cancelParcel = handle('parcel.cancel', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'cancelled', { reason: req.body.reason || 'Annulation' });
+
+  // Si un chauffeur etait assigne, on lui credite son point d'engagement.
+  if (parcel.driverId) {
+    await prisma.$transaction(async (tx) => {
+      await tx.score.upsert({
+        where: { userId: parcel.driverId },
+        update: { points: { increment: 1 }, lastUpdated: new Date() },
+        create: { userId: parcel.driverId, points: 1 }
+      });
+      await tx.scoreTransaction.create({
+        data: { userId: parcel.driverId, amount: 1, type: 'commitment_refund', parcelId: parcel.id, description: 'Remboursement engagement (colis annule)' }
+      });
+    });
+  }
+
   return ok(res, { message: 'Colis annule', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
@@ -621,6 +636,17 @@ export const acceptBid = handle('bid.accept', async (req, res) => {
       data: { parcelId: parcel.id, status: 'confirmed', description: 'Offre chauffeur acceptee', userId: req.user.id, userName: req.user.fullName, userRole: req.user.role }
     });
     await audit(tx, req, { action: 'bid.accept', entityType: 'bid', entityId: bid.id, afterData: { status: 'accepted' } });
+
+    // Debit 1 point from the assigned driver as a commitment fee.
+    await tx.score.upsert({
+      where: { userId: bid.driverId },
+      update: { points: { decrement: 1 }, totalSpent: { increment: 1 }, lastUpdated: new Date() },
+      create: { userId: bid.driverId, points: 0, totalSpent: 1 }
+    });
+    await tx.scoreTransaction.create({
+      data: { userId: bid.driverId, amount: -1, type: 'commitment_fee', parcelId: parcel.id, description: 'Engagement chauffeur sur le colis' }
+    });
+
     await notify(tx, {
       userId: bid.driverId,
       parcelId: parcel.id,
@@ -910,20 +936,25 @@ export const sendMessage = handle('messages.send', async (req, res) => {
 
 export const messageThread = handle('messages.thread', async (req, res) => {
   const peerId = req.query.peerId;
-  const parcelId = req.query.parcelId || undefined;
+  const parcelId = req.query.parcelId || null;
   if (!peerId) throw new ValidationError([{ path: 'peerId', message: 'peerId requis' }]);
+  const where = {
+    OR: [
+      { senderId: req.user.id, receiverId: peerId },
+      { senderId: peerId, receiverId: req.user.id }
+    ]
+  };
+  if (parcelId === null) {
+    where.parcelId = null;
+  } else {
+    where.parcelId = parcelId;
+  }
   const messages = await prisma.message.findMany({
-    where: {
-      parcelId,
-      OR: [
-        { senderId: req.user.id, receiverId: peerId },
-        { senderId: peerId, receiverId: req.user.id }
-      ]
-    },
+    where,
     orderBy: { createdAt: 'asc' }
   });
   await prisma.message.updateMany({
-    where: { receiverId: req.user.id, senderId: peerId, parcelId, isRead: false },
+    where: { receiverId: req.user.id, senderId: peerId, parcelId: parcelId === null ? null : parcelId, isRead: false },
     data: { isRead: true, readAt: new Date() }
   });
   return ok(res, { message: 'Conversation', data: { messages: messages.map(serializeMessage) } });
@@ -932,7 +963,7 @@ export const messageThread = handle('messages.thread', async (req, res) => {
 export const conversations = handle('messages.conversations', async (req, res) => {
   const messages = await prisma.message.findMany({
     where: { OR: [{ senderId: req.user.id }, { receiverId: req.user.id }] },
-    include: { sender: true, receiver: true, parcel: true },
+    include: { sender: true, receiver: true, parcel: { include: { media: true, departureGarage: true, arrivalGarage: true } } },
     orderBy: { createdAt: 'desc' },
     take: 100
   });
@@ -1057,7 +1088,7 @@ export const listAdvertisements = handle('advertisements.list', async (req, res)
 });
 
 export const myAdvertisements = handle('advertisements.my', async (req, res) => {
-  const advertisements = await prisma.advertisement.findMany({ where: { driverId: req.user.id }, include: { driver: true, offers: true }, orderBy: { createdAt: 'desc' } });
+  const advertisements = await prisma.advertisement.findMany({ where: { driverId: req.user.id }, include: { driver: true, offers: { include: { client: true, parcel: { include: { media: true } } } } }, orderBy: { createdAt: 'desc' } });
   return ok(res, { message: 'Mes annonces', data: { advertisements: advertisements.map(serializeAdvertisement) } });
 });
 
@@ -1108,9 +1139,25 @@ export const closeAdvertisement = handle('advertisements.close', async (req, res
 });
 
 export const createAdvertisementOffer = handle('advertisements.offerCreate', async (req, res) => {
-  const offer = await prisma.advertisementOffer.create({
-    data: { advertisementId: req.params.advertisementId, clientId: req.user.id, parcelId: req.body.parcelId, price: decimal(req.body.price, '0'), message: req.body.message },
-    include: { client: true }
+  const ad = await prisma.advertisement.findUnique({ where: { id: req.params.advertisementId } });
+  if (!ad) throw new NotFoundError('Annonce introuvable');
+
+  const offer = await prisma.$transaction(async (tx) => {
+    const created = await tx.advertisementOffer.create({
+      data: { advertisementId: ad.id, clientId: req.user.id, parcelId: req.body.parcelId, price: decimal(req.body.price, '0'), message: req.body.message },
+      include: { client: true, parcel: { include: { media: true } } }
+    });
+    await notify(tx, {
+      userId: ad.driverId,
+      senderId: req.user.id,
+      senderName: req.user.fullName,
+      type: 'ad_offer',
+      title: 'Nouvelle offre client',
+      body: `${req.user.fullName} propose ${created.price} FCFA pour votre annonce.`,
+      data: { advertisementId: ad.id, offerId: created.id, price: Number(created.price) },
+      priority: 'high'
+    });
+    return created;
   });
   return ok(res, { status: 201, message: 'Offre envoyee', data: { offer: serializeAdvertisementOffer(offer) } });
 });
@@ -1119,26 +1166,60 @@ export const advertisementOffers = handle('advertisements.offers', async (req, r
   const advertisement = await prisma.advertisement.findUnique({ where: { id: req.params.advertisementId } });
   if (!advertisement) throw new NotFoundError('Annonce introuvable');
   if (req.user.role !== 'super_admin' && advertisement.driverId !== req.user.id) throw new ForbiddenError('Annonce non autorisee');
-  const offers = await prisma.advertisementOffer.findMany({ where: { advertisementId: advertisement.id }, include: { client: true }, orderBy: { createdAt: 'desc' } });
+  const offers = await prisma.advertisementOffer.findMany({ where: { advertisementId: advertisement.id }, include: { client: true, parcel: true }, orderBy: { createdAt: 'desc' } });
   return ok(res, { message: 'Offres annonce', data: { offers: offers.map(serializeAdvertisementOffer) } });
 });
 
 export const acceptAdvertisementOffer = handle('advertisements.offerAccept', async (req, res) => {
-  const offer = await prisma.advertisementOffer.update({
-    where: { id: req.params.offerId },
-    data: { status: 'accepted', responseMessage: req.body.responseMessage, respondedAt: new Date() },
-    include: { client: true }
+  const offer = await prisma.$transaction(async (tx) => {
+    const updated = await tx.advertisementOffer.update({
+      where: { id: req.params.offerId },
+      data: { status: 'accepted', responseMessage: req.body.responseMessage, respondedAt: new Date() },
+      include: { client: true, advertisement: true }
+    });
+    await notify(tx, {
+      userId: updated.clientId,
+      senderId: req.user.id,
+      senderName: req.user.fullName,
+      type: 'ad_offer_accepted',
+      title: 'Offre acceptee',
+      body: `Votre offre pour l'annonce a ete acceptee.`,
+      data: { advertisementId: updated.advertisementId, offerId: updated.id },
+      priority: 'high'
+    });
+    return updated;
   });
   return ok(res, { message: 'Offre traitee', data: { offer: serializeAdvertisementOffer(offer) } });
 });
 
 export const rejectAdvertisementOffer = handle('advertisements.offerReject', async (req, res) => {
-  const offer = await prisma.advertisementOffer.update({
-    where: { id: req.params.offerId },
-    data: { status: 'rejected', responseMessage: req.body.responseMessage, respondedAt: new Date() },
-    include: { client: true }
+  const offer = await prisma.$transaction(async (tx) => {
+    const updated = await tx.advertisementOffer.update({
+      where: { id: req.params.offerId },
+      data: { status: 'rejected', responseMessage: req.body.responseMessage, respondedAt: new Date() },
+      include: { client: true }
+    });
+    await notify(tx, {
+      userId: updated.clientId,
+      senderId: req.user.id,
+      senderName: req.user.fullName,
+      type: 'ad_offer_rejected',
+      title: 'Offre refusee',
+      body: `Votre offre pour l'annonce a ete refusee.`,
+      data: { advertisementId: updated.advertisementId, offerId: updated.id }
+    });
+    return updated;
   });
   return ok(res, { message: 'Offre traitee', data: { offer: serializeAdvertisementOffer(offer) } });
+});
+
+export const negotiateAdvertisementOffer = handle('advertisements.offerNegotiate', async (req, res) => {
+  const offer = await prisma.advertisementOffer.update({
+    where: { id: req.params.offerId },
+    data: { price: decimal(req.body.price, '0'), responseMessage: req.body.message },
+    include: { client: true, parcel: { include: { media: true } } }
+  });
+  return ok(res, { message: 'Prix negocie', data: { offer: serializeAdvertisementOffer(offer) } });
 });
 
 export const advertisementStats = handle('advertisements.stats', async (req, res) => {
