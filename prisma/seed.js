@@ -24,7 +24,9 @@ const ids = {
   supportMessage: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd1',
   messageCustomer: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1',
   messageDriver: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2',
-  driverLocation: 'ffffffff-ffff-4fff-8fff-fffffffffff1'
+  driverLocation: 'ffffffff-ffff-4fff-8fff-fffffffffff1',
+  superAdmin: '33333333-3333-4333-8333-333333333334',
+  adminGarage: '33333333-3333-4333-8333-333333333335'
 };
 
 const seedProfiles = [
@@ -52,6 +54,31 @@ const seedProfiles = [
     pin: '123456',
     password: 'Password123!',
     driverStatus: 'available'
+  },
+  {
+    id: ids.superAdmin,
+    email: 'admin@procolis.test',
+    phone: '+221770000303',
+    fullName: 'Super Admin',
+    role: 'super_admin',
+    address: 'Centre-ville',
+    city: 'Dakar',
+    region: 'Dakar',
+    pin: '123456',
+    password: 'Password123!'
+  },
+  {
+    id: ids.adminGarage,
+    email: 'garage@procolis.test',
+    phone: '+221770000404',
+    fullName: 'Admin Garage Dakar',
+    role: 'admin',
+    address: 'Route de Rufisque',
+    city: 'Dakar',
+    region: 'Dakar',
+    garageId: ids.garageDakar,
+    pin: '123456',
+    password: 'Password123!'
   }
 ];
 
@@ -144,7 +171,7 @@ async function seedUsers(garage) {
           address: profile.address,
           city: profile.city,
           region: profile.region,
-          garageId: profile.role === 'driver' ? garage.id : null,
+          garageId: profile.garageId ?? (profile.role === 'driver' || profile.role === 'admin' ? garage.id : null),
           driverStatus: profile.driverStatus || null,
           isEmailVerified: true,
           isPhoneVerified: true,
@@ -162,7 +189,7 @@ async function seedUsers(garage) {
           address: profile.address,
           city: profile.city,
           region: profile.region,
-          garageId: profile.role === 'driver' ? garage.id : null,
+          garageId: profile.garageId ?? (profile.role === 'driver' || profile.role === 'admin' ? garage.id : null),
           driverStatus: profile.driverStatus || null,
           isEmailVerified: true,
           isPhoneVerified: true,

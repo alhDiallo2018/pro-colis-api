@@ -108,6 +108,29 @@ enum BackupStatus {
   failed
 }
 
+enum WalletStatus {
+  active
+  suspended
+}
+
+enum WalletTransactionType {
+  deposit
+  commission
+  bonus
+  adjustment
+  refund
+  correction
+  penalty
+  withdrawal
+}
+
+enum CommissionProfileType {
+  local
+  regional
+  express
+  international
+}
+
 model User {
   id                   String                 @id @default(uuid()) @db.Uuid
   email                String?                @unique
@@ -169,6 +192,8 @@ model User {
   systemConfigs        SystemConfig[]
   webhooks             Webhook[]
   backups              Backup[]
+  wallet               Wallet?
+  walletTransactions   WalletTransaction[]
 
   @@map("users")
 }
@@ -275,6 +300,7 @@ model Parcel {
   media                 ParcelMedia[]
   payments              Payment[]
   scoreTransactions     ScoreTransaction[]
+  walletTransactions    WalletTransaction[]
   notifications         Notification[]
   advertisementOffers   AdvertisementOffer[]
   driverLocations       DriverLocation[]
@@ -405,6 +431,58 @@ model ScoreTransaction {
 
   @@index([userId, createdAt])
   @@map("score_transactions")
+}
+
+model Wallet {
+  userId        String       @id @map("user_id") @db.Uuid
+  balance       Decimal      @default(0) @db.Decimal(12, 2)
+  totalDeposited Decimal     @default(0) @map("total_deposited") @db.Decimal(12, 2)
+  totalSpent    Decimal      @default(0) @map("total_spent") @db.Decimal(12, 2)
+  totalRefunded Decimal      @default(0) @map("total_refunded") @db.Decimal(12, 2)
+  status        WalletStatus @default(active)
+  lastDepositAt DateTime?    @map("last_deposit_at") @db.Timestamptz
+  lastActivityAt DateTime?   @map("last_activity_at") @db.Timestamptz
+  createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions  WalletTransaction[]
+
+  @@map("wallets")
+}
+
+model WalletTransaction {
+  id           String                @id @default(uuid()) @db.Uuid
+  walletUserId String                @map("wallet_user_id") @db.Uuid
+  type         WalletTransactionType
+  amount       Decimal               @db.Decimal(12, 2)
+  balanceBefore Decimal              @map("balance_before") @db.Decimal(12, 2)
+  balanceAfter  Decimal              @map("balance_after") @db.Decimal(12, 2)
+  parcelId     String?               @map("parcel_id") @db.Uuid
+  description  String?
+  origin       String?
+  status       String                @default("completed")
+  performedBy  String?               @map("performed_by") @db.Uuid
+  createdAt    DateTime              @default(now()) @map("created_at") @db.Timestamptz
+  wallet       Wallet                @relation(fields: [walletUserId], references: [userId], onDelete: Cascade)
+  parcel       Parcel?               @relation(fields: [parcelId], references: [id], onDelete: SetNull)
+  admin        User?                 @relation(fields: [performedBy], references: [id], onDelete: SetNull)
+
+  @@index([walletUserId, createdAt])
+  @@map("wallet_transactions")
+}
+
+model CommissionConfig {
+  id             String              @id @default(uuid()) @db.Uuid
+  profile        CommissionProfileType @default(local)
+  percentage     Decimal             @default(5) @db.Decimal(5, 2)
+  minAmount      Decimal             @default(100) @map("min_amount") @db.Decimal(12, 2)
+  maxAmount      Decimal             @default(500) @map("max_amount") @db.Decimal(12, 2)
+  isActive       Boolean             @default(true) @map("is_active")
+  effectiveFrom  DateTime            @map("effective_from") @db.Timestamptz
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime            @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("commission_configs")
 }
 
 model Notification {

@@ -2,6 +2,9 @@ import { Router } from 'express';
 import { authenticate, optionalAuthenticate } from '../../middlewares/auth.middleware.js';
 import { requireRoles } from '../../middlewares/rbac.middleware.js';
 import * as mobileController from './mobile.controller.js';
+import * as adminFinanceController from '../admin-finance.controller.js';
+import * as adminReputationController from '../admin-reputation.controller.js';
+import * as paydunyaController from '../paydunya.controller.js';
 
 export const mobileRouter = Router();
 
@@ -103,12 +106,16 @@ mobileRouter.post('/parcels/estimate', optionalAuthenticate, mobileController.es
 
 mobileRouter.post('/payments/initiate', authenticate, mobileController.initiatePayment);
 mobileRouter.post('/payments/:paymentId/confirm', authenticate, mobileController.confirmPayment);
+mobileRouter.post('/super-admin/parcels/:parcelId/confirm-cash', authenticate, requireRoles('super_admin'), mobileController.confirmCashPayment);
 mobileRouter.get('/payments/history', authenticate, mobileController.paymentHistory);
 
 mobileRouter.get('/score', authenticate, mobileController.getScore);
 mobileRouter.get('/score/balance', authenticate, mobileController.getScoreBalance);
+mobileRouter.get('/driver/wallet', authenticate, mobileController.getDriverWallet);
+mobileRouter.post('/driver/wallet/withdraw', authenticate, mobileController.withdrawWallet);
 mobileRouter.get('/score/history', authenticate, mobileController.getScoreHistory);
 mobileRouter.post('/score/purchase', authenticate, mobileController.purchaseScore);
+mobileRouter.post('/score/purchase/wallet', authenticate, mobileController.purchaseScoreWithWallet);
 mobileRouter.post('/score/debit', authenticate, mobileController.debitScore);
 mobileRouter.post('/score/credit', authenticate, mobileController.creditScore);
 mobileRouter.post('/score/refund', authenticate, mobileController.refundScore);
@@ -133,6 +140,14 @@ mobileRouter.post('/support/messages', authenticate, mobileController.createSupp
 mobileRouter.get('/support/messages', authenticate, mobileController.listSupportMessages);
 mobileRouter.post('/ratings', authenticate, mobileController.createRating);
 mobileRouter.get('/ratings/driver/:driverId', optionalAuthenticate, mobileController.driverRatings);
+
+// PayDunya
+mobileRouter.post('/payments/paydunya/create', authenticate, paydunyaController.createPaydunyaPayment);
+mobileRouter.get('/payments/paydunya/confirm/:token', authenticate, paydunyaController.confirmPaydunyaPayment);
+mobileRouter.post('/payments/paydunya/ipn', paydunyaController.paydunyaIpn);
+mobileRouter.get('/payments/paydunya/return', paydunyaController.paydunyaReturn);
+mobileRouter.get('/payments/paydunya/cancel', paydunyaController.paydunyaCancel);
+
 mobileRouter.get('/coupons/available', authenticate, mobileController.availableCoupons);
 mobileRouter.get('/search/parcels', authenticate, mobileController.searchParcels);
 
@@ -158,4 +173,38 @@ mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/negotiate', 
 mobileRouter.get('/webhooks', authenticate, requireRoles('super_admin'), mobileController.listWebhooks);
 mobileRouter.post('/webhooks', authenticate, requireRoles('super_admin'), mobileController.createWebhook);
 mobileRouter.delete('/webhooks/:webhookId', authenticate, requireRoles('super_admin'), mobileController.deleteWebhook);
+
+// ------------------------------------------------------------------
+// Super Admin – Finance
+// ------------------------------------------------------------------
+mobileRouter.get('/super-admin/finance/dashboard', authenticate, requireRoles('super_admin'), adminFinanceController.financeDashboard);
+// Wallets
+mobileRouter.get('/super-admin/wallets', authenticate, requireRoles('super_admin'), adminFinanceController.listWallets);
+mobileRouter.get('/super-admin/wallets/:userId', authenticate, requireRoles('super_admin'), adminFinanceController.getWallet);
+mobileRouter.post('/super-admin/wallets/:userId/recharge', authenticate, requireRoles('super_admin'), adminFinanceController.rechargeWallet);
+mobileRouter.post('/super-admin/wallets/:userId/debit', authenticate, requireRoles('super_admin'), adminFinanceController.debitWallet);
+mobileRouter.get('/super-admin/wallets/:userId/transactions', authenticate, requireRoles('super_admin'), adminFinanceController.walletTransactions);
+// Commissions
+mobileRouter.get('/super-admin/commissions/config', authenticate, requireRoles('super_admin'), adminFinanceController.getCommissionConfig);
+mobileRouter.put('/super-admin/commissions/config', authenticate, requireRoles('super_admin'), adminFinanceController.updateCommissionConfig);
+mobileRouter.post('/super-admin/commissions/simulate', authenticate, requireRoles('super_admin'), adminFinanceController.simulateCommission);
+// Payments
+mobileRouter.get('/super-admin/payments', authenticate, requireRoles('super_admin'), adminFinanceController.listPayments);
+mobileRouter.get('/super-admin/payments/:paymentId', authenticate, requireRoles('super_admin'), adminFinanceController.getPayment);
+// Payouts (preparation)
+mobileRouter.get('/super-admin/payouts', authenticate, requireRoles('super_admin'), adminFinanceController.listPayouts);
+
+// ------------------------------------------------------------------
+// Super Admin – Reputation
+// ------------------------------------------------------------------
+mobileRouter.get('/super-admin/reputation/dashboard', authenticate, requireRoles('super_admin'), adminReputationController.reputationDashboard);
+// Scores
+mobileRouter.get('/super-admin/scores', authenticate, requireRoles('super_admin'), adminReputationController.listScores);
+mobileRouter.get('/super-admin/scores/ranking', authenticate, requireRoles('super_admin'), adminReputationController.driverRanking);
+mobileRouter.get('/super-admin/scores/:userId', authenticate, requireRoles('super_admin'), adminReputationController.getScore);
+mobileRouter.get('/super-admin/scores/:userId/history', authenticate, requireRoles('super_admin'), adminReputationController.scoreHistory);
+mobileRouter.post('/super-admin/scores/:userId/add', authenticate, requireRoles('super_admin'), adminReputationController.addPoints);
+mobileRouter.post('/super-admin/scores/:userId/remove', authenticate, requireRoles('super_admin'), adminReputationController.removePoints);
+// Driver detail (combined reputation + finance)
+mobileRouter.get('/super-admin/drivers/:userId', authenticate, requireRoles('super_admin'), adminReputationController.driverDetail);
 
