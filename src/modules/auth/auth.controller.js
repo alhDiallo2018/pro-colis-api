@@ -1,6 +1,7 @@
 import { ok, fail } from '../../utils/api-response.js';
 import { serializeUser } from '../../utils/user-serializer.js';
 import * as authService from './auth.service.js';
+import { sendOtpSms, sendOtpEmail, isBrevoConfigured } from '../../utils/brevo.js';
 
 export async function register(req, res) {
   try {
@@ -92,4 +93,61 @@ export function me(req, res) {
       user: serializeUser(req.user)
     }
   });
+}
+
+export async function sendOtp(req, res) {
+  try {
+    const { phone, email, purpose } = req.validated.body;
+    const { code } = await authService.sendOtp({ phone, email, purpose });
+
+    if (isBrevoConfigured()) {
+      if (phone) {
+        sendOtpSms({ phone, code, purpose }).catch(() => {});
+      }
+      if (email) {
+        sendOtpEmail({ email, code, purpose }).catch(() => {});
+      }
+    }
+
+    return ok(res, {
+      message: isBrevoConfigured()
+        ? 'Code envoye'
+        : `Code genere (Brevo non configure) : ${code}`,
+      data: isBrevoConfigured() ? { sent: true } : { code }
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'auth.sendOtp', requestId: req.requestId },
+      'Failed to send OTP'
+    );
+    return fail(res, {
+      status: error.statusCode || 500,
+      message: error.publicMessage || 'Impossible d\'envoyer le code',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.details || []
+    });
+  }
+}
+
+export async function verifyOtp(req, res) {
+  try {
+    const { phone, email, code, purpose } = req.validated.body;
+    const result = await authService.verifyOtp({ phone, email, code, purpose });
+
+    return ok(res, {
+      message: 'Code verifie',
+      data: result
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'auth.verifyOtp', requestId: req.requestId },
+      'Failed to verify OTP'
+    );
+    return fail(res, {
+      status: error.statusCode || 500,
+      message: error.publicMessage || 'Code invalide',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.details || []
+    });
+  }
 }

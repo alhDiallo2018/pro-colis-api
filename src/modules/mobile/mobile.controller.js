@@ -17,6 +17,7 @@ import {
   serializeUser
 } from '../../utils/mobile-serializers.js';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
+import { sendNotificationEmail, sendNotificationSms, sendOtpSms, isBrevoConfigured } from '../../utils/brevo.js';
 
 const parcelInclude = {
   departureGarage: true,
@@ -51,12 +52,24 @@ async function getConfigValue(key, fallback) {
 async function notifyAdmins(tx, type, title, body, data = {}) {
   const admins = await tx.user.findMany({
     where: { role: 'super_admin', status: 'active' },
-    select: { id: true }
+    select: { id: true, email: true, phone: true }
   });
   const notifs = admins.map((a) =>
     tx.notification.create({ data: { userId: a.id, type, title, body, data } })
   );
   await Promise.all(notifs);
+
+  if (isBrevoConfigured()) {
+    for (const admin of admins) {
+      if (admin.email) {
+        sendNotificationEmail({ email: admin.email, subject: title, message: body }).catch(() => {});
+      }
+      if (admin.phone) {
+        const smsContent = body.length > 300 ? `[Admin] ${title}: ${body.substring(0, 300)}...` : `[Admin] ${title}: ${body}`;
+        sendNotificationSms({ phone: admin.phone, message: smsContent, tag: type }).catch(() => {});
+      }
+    }
+  }
 }
 
 function handle(action, fn) {
@@ -129,9 +142,27 @@ async function audit(tx, req, { action, entityType, entityId, beforeData, afterD
 
 async function notify(tx, { userId, parcelId, bidId, senderId, senderName = 'PRO COLIS', type, title, body, data = {}, priority = 'normal' }) {
   if (!userId) return null;
-  return tx.notification.create({
+
+  const user = await tx.user.findUnique({
+    where: { id: userId },
+    select: { email: true, phone: true }
+  });
+
+  const notification = await tx.notification.create({
     data: { userId, parcelId, bidId, senderId, senderName, type, title, body, data, priority }
   });
+
+  if (isBrevoConfigured() && user) {
+    if (user.email) {
+      sendNotificationEmail({ email: user.email, subject: title, message: body }).catch(() => {});
+    }
+    if (user.phone) {
+      const smsContent = body.length > 300 ? `${title}: ${body.substring(0, 300)}...` : `${title}: ${body}`;
+      sendNotificationSms({ phone: user.phone, message: smsContent, tag: type }).catch(() => {});
+    }
+  }
+
+  return notification;
 }
 
 function statusDescription(status) {
@@ -453,8 +484,9 @@ export const bulkAssignDriver = handle('parcel.bulkAssign', async (req, res) => 
 });
 
 // --- Delivery OTP (proof of receipt) ---
-// The code is stored on the generic OtpCode table keyed by parcel id. In dev there
-// is no SMS gateway, so the sender/recipient reads it from their parcel page and
+// The code is stored on the generic OtpCode table keyed by parcel id.
+// When Brevo is configured, the code is sent via SMS to the recipient's phone.
+// Otherwise, the sender/recipient reads it from their parcel page and
 // hands it to the driver, who must enter it to confirm delivery.
 function generateDeliveryCode() {
   return String(Math.floor(1000 + Math.random() * 9000));
@@ -463,17 +495,20 @@ function generateDeliveryCode() {
 async function getOrCreateDeliveryCode(parcelId, phone) {
   const type = `delivery:${parcelId}`;
   const existing = await prisma.otpCode.findFirst({ where: { type, isUsed: false } });
-  if (existing) return existing.codeHash;
+  if (existing) return { code: existing.codeHash, phone };
   const code = generateDeliveryCode();
   await prisma.otpCode.create({
     data: { type, phone, codeHash: code, isUsed: false, expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) }
   });
-  return code;
+  return { code, phone };
 }
 
 export const clientDeliveryCode = handle('parcel.deliveryCode', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
-  const code = await getOrCreateDeliveryCode(parcel.id, parcel.receiverPhone);
+  const { code, phone } = await getOrCreateDeliveryCode(parcel.id, parcel.receiverPhone);
+  if (isBrevoConfigured() && phone) {
+    sendOtpSms({ phone, code, purpose: 'livraison' }).catch(() => {});
+  }
   return ok(res, { message: 'Code de livraison', data: { code } });
 });
 
@@ -507,8 +542,10 @@ export const driverArrived = handle('driver.arrived', async (req, res) => {
 export const driverOutForDelivery = handle('driver.outForDelivery', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'out_for_delivery', req.body);
-  // Ensure a delivery code exists so the recipient can be verified on arrival.
-  await getOrCreateDeliveryCode(parcel.id, parcel.receiverPhone);
+  const { code, phone } = await getOrCreateDeliveryCode(parcel.id, parcel.receiverPhone);
+  if (isBrevoConfigured() && phone) {
+    sendOtpSms({ phone, code, purpose: 'livraison' }).catch(() => {});
+  }
   return ok(res, { message: 'Colis en livraison finale', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 

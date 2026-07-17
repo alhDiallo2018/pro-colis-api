@@ -2,6 +2,7 @@ import { prisma } from '../config/prisma.js'
 import { env } from '../config/env.js'
 import { ok, fail } from '../utils/api-response.js'
 import { ValidationError, normalizeError } from '../utils/errors.js'
+import { sendNotificationEmail, sendNotificationSms, isBrevoConfigured } from '../utils/brevo.js'
 import {
   createInvoice as paydunyaCreateInvoice,
   confirmInvoice as paydunyaConfirmInvoice,
@@ -135,7 +136,23 @@ async function createPaymentRecord(userId, parcelId, amount, token) {
 async function sendNotification(userId, type, title, body, data = {}) {
   await prisma.notification.create({
     data: { userId, type, title, body, data }
-  })
+  });
+
+  if (isBrevoConfigured()) {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { email: true, phone: true }
+    });
+    if (user) {
+      if (user.email) {
+        sendNotificationEmail({ email: user.email, subject: title, message: body }).catch(() => {});
+      }
+      if (user.phone) {
+        const smsContent = body.length > 300 ? `${title}: ${body.substring(0, 300)}...` : `${title}: ${body}`;
+        sendNotificationSms({ phone: user.phone, message: smsContent, tag: type }).catch(() => {});
+      }
+    }
+  }
 }
 
 async function creditDriverForParcel(parcel, token) {

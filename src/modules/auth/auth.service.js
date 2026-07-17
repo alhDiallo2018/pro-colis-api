@@ -1,6 +1,7 @@
 import bcrypt from 'bcryptjs';
 import { prisma } from '../../config/prisma.js';
-import { ConflictError, UnauthorizedError } from '../../utils/errors.js';
+import { env } from '../../config/env.js';
+import { ConflictError, UnauthorizedError, ValidationError } from '../../utils/errors.js';
 import {
   compareSecret,
   hashSecret,
@@ -143,4 +144,61 @@ export async function refreshAccessToken(refreshToken) {
     user: serializeUser(user),
     accessToken: signAccessToken(user)
   };
+}
+
+function generateOtpCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+export async function sendOtp({ phone, email, purpose }) {
+  const identifier = phone || email;
+  const type = `${purpose}:${identifier}`;
+
+  const recent = await prisma.otpCode.findFirst({
+    where: { type, isUsed: false, createdAt: { gt: new Date(Date.now() - 60 * 1000) } }
+  });
+  if (recent) {
+    throw new ValidationError([{ path: 'body', message: 'Un code a deja ete envoye il y a moins d\'une minute. Veuillez patienter.' }]);
+  }
+
+  const code = generateOtpCode();
+  const expiresAt = new Date(Date.now() + env.OTP_EXPIRES_MINUTES * 60 * 1000);
+
+  await prisma.otpCode.create({
+    data: {
+      phone: phone || null,
+      email: email || null,
+      codeHash: code,
+      type,
+      isUsed: false,
+      expiresAt
+    }
+  });
+
+  return { code, phone, email, purpose, expiresAt };
+}
+
+export async function verifyOtp({ phone, email, code, purpose }) {
+  const identifier = phone || email;
+  const type = `${purpose}:${identifier}`;
+
+  const record = await prisma.otpCode.findFirst({
+    where: { type, codeHash: code, isUsed: false, expiresAt: { gt: new Date() } },
+    orderBy: { createdAt: 'desc' }
+  });
+
+  if (!record) {
+    await prisma.otpCode.updateMany({
+      where: { type, isUsed: false },
+      data: { attempts: { increment: 1 } }
+    });
+    throw new ValidationError([{ path: 'body.code', message: 'Code invalide ou expire' }]);
+  }
+
+  await prisma.otpCode.update({
+    where: { id: record.id },
+    data: { isUsed: true }
+  });
+
+  return { verified: true, phone: record.phone, email: record.email };
 }

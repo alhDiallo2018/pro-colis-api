@@ -40,3 +40,28 @@ export const refreshSchema = z.object({
   params: z.object({}).default({}),
   query: z.object({}).default({})
 });
+
+export const sendOtpSchema = z.object({
+  body: z.object({
+    phone: z.string().min(8).optional(),
+    email: z.string().email().optional(),
+    purpose: z.enum(['verification', 'reset-pin', 'delivery', 'payment']).default('verification')
+  }).refine((data) => data.phone || data.email, {
+    message: 'Le numero de telephone ou l\'email est requis'
+  }),
+  params: z.object({}).default({}),
+  query: z.object({}).default({})
+});
+
+export const verifyOtpSchema = z.object({
+  body: z.object({
+    phone: z.string().min(8).optional(),
+    email: z.string().email().optional(),
+    code: z.string().min(4).max(10),
+    purpose: z.enum(['verification', 'reset-pin', 'delivery', 'payment']).default('verification')
+  }).refine((data) => data.phone || data.email, {
+    message: 'Le numero de telephone ou l\'email est requis'
+  }),
+  params: z.object({}).default({}),
+  query: z.object({}).default({})
+});
