@@ -5,7 +5,6 @@ import { sendOtpSms, sendOtpEmail, isBrevoConfigured } from '../../utils/brevo.j
 
 export async function register(req, res) {
   try {
-    // Critical flow: writes user, score and audit data, so errors are logged with request context.
     const result = await authService.registerUser(req.validated.body);
     return ok(res, {
       status: 201,
@@ -34,7 +33,6 @@ export async function register(req, res) {
 
 export async function loginWithPin(req, res) {
   try {
-    // PIN authentication is sensitive: never log the submitted PIN or token values.
     const result = await authService.loginWithPin(req.validated.body);
     return ok(res, {
       message: 'Connexion effectuee',
@@ -146,6 +144,147 @@ export async function verifyOtp(req, res) {
     return fail(res, {
       status: error.statusCode || 500,
       message: error.publicMessage || 'Code invalide',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.details || []
+    });
+  }
+}
+
+export async function forgotPassword(req, res) {
+  try {
+    const { identifier } = req.validated.body;
+    const { code, phone, email } = await authService.forgotPassword({ identifier });
+
+    if (isBrevoConfigured()) {
+      if (phone) {
+        sendOtpSms({ phone, code, purpose: 'reset-password' }).catch(() => {});
+      }
+      if (email) {
+        sendOtpEmail({ email, code, purpose: 'reset-password' }).catch(() => {});
+      }
+    }
+
+    return ok(res, {
+      message: isBrevoConfigured()
+        ? 'Code de reinitialisation envoye'
+        : `Code genere (Brevo non configure) : ${code}`,
+      data: isBrevoConfigured() ? { sent: true } : { code }
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'auth.forgotPassword', requestId: req.requestId, identifier: req.validated?.body?.identifier },
+      'Failed to process forgot password'
+    );
+    return fail(res, {
+      status: error.statusCode || 500,
+      message: error.publicMessage || 'Impossible de traiter la demande',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.details || []
+    });
+  }
+}
+
+export async function resetPassword(req, res) {
+  try {
+    const { identifier, otpCode, newPassword } = req.validated.body;
+    const result = await authService.resetPassword({ identifier, otpCode, newPassword });
+
+    return ok(res, {
+      message: 'Mot de passe reinitialise',
+      data: result
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'auth.resetPassword', requestId: req.requestId, identifier: req.validated?.body?.identifier },
+      'Failed to reset password'
+    );
+    return fail(res, {
+      status: error.statusCode || 500,
+      message: error.publicMessage || 'Impossible de reinitialiser le mot de passe',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.details || []
+    });
+  }
+}
+
+export async function changePassword(req, res) {
+  try {
+    const { currentPassword, newPassword } = req.validated.body;
+    const result = await authService.changePassword({
+      userId: req.user.id,
+      currentPassword,
+      newPassword
+    });
+
+    return ok(res, {
+      message: 'Mot de passe modifie',
+      data: result
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'auth.changePassword', requestId: req.requestId, userId: req.user?.id },
+      'Failed to change password'
+    );
+    return fail(res, {
+      status: error.statusCode || 500,
+      message: error.publicMessage || 'Impossible de changer le mot de passe',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.details || []
+    });
+  }
+}
+
+export async function verifyEmail(req, res) {
+  try {
+    const { email, otpCode } = req.validated.body;
+    const result = await authService.verifyEmail({ email, otpCode });
+
+    return ok(res, {
+      message: 'Email verifie',
+      data: result
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'auth.verifyEmail', requestId: req.requestId, email: req.validated?.body?.email },
+      'Failed to verify email'
+    );
+    return fail(res, {
+      status: error.statusCode || 500,
+      message: error.publicMessage || 'Impossible de verifier l\'email',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.details || []
+    });
+  }
+}
+
+export async function resendVerification(req, res) {
+  try {
+    const { identifier } = req.validated.body;
+    const { code, phone, email } = await authService.resendVerification({ identifier });
+
+    if (isBrevoConfigured()) {
+      if (phone) {
+        sendOtpSms({ phone, code, purpose: 'verification' }).catch(() => {});
+      }
+      if (email) {
+        sendOtpEmail({ email, code, purpose: 'verification' }).catch(() => {});
+      }
+    }
+
+    return ok(res, {
+      message: isBrevoConfigured()
+        ? 'Code de verification renvoye'
+        : `Code genere (Brevo non configure) : ${code}`,
+      data: isBrevoConfigured() ? { sent: true } : { code }
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'auth.resendVerification', requestId: req.requestId, identifier: req.validated?.body?.identifier },
+      'Failed to resend verification'
+    );
+    return fail(res, {
+      status: error.statusCode || 500,
+      message: error.publicMessage || 'Impossible de renvoyer la verification',
       code: error.code || 'INTERNAL_ERROR',
       details: error.details || []
     });

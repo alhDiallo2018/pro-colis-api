@@ -4,6 +4,7 @@ import { ok, fail } from '../utils/api-response.js';
 import { getPagination, paginationMeta } from '../utils/pagination.js';
 import { serializeUser } from '../utils/mobile-serializers.js';
 import { NotFoundError, ValidationError, normalizeError } from '../utils/errors.js';
+import { getConfigValue } from '../utils/commission.js';
 
 function decimal(value, fallback = null) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -19,10 +20,27 @@ function cleanUndefined(obj) {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
 }
 
-function getLevel(points) {
-  if (points >= 1000) return 'ELITE';
-  if (points >= 500) return 'PREMIUM';
-  if (points >= 100) return 'STANDARD';
+async function getLevelThresholds() {
+  const [standard, premium, elite] = await Promise.all([
+    getConfigValue(prisma, 'score.standardThreshold', 100),
+    getConfigValue(prisma, 'score.premiumThreshold', 500),
+    getConfigValue(prisma, 'score.eliteThreshold', 1000)
+  ]);
+  return { standard: Number(standard), premium: Number(premium), elite: Number(elite) };
+}
+
+async function getLevel(points) {
+  const { standard, premium, elite } = await getLevelThresholds();
+  if (points >= elite) return 'ELITE';
+  if (points >= premium) return 'PREMIUM';
+  if (points >= standard) return 'STANDARD';
+  return 'NEW';
+}
+
+function getLevelSync(points, thresholds) {
+  if (points >= thresholds.elite) return 'ELITE';
+  if (points >= thresholds.premium) return 'PREMIUM';
+  if (points >= thresholds.standard) return 'STANDARD';
   return 'NEW';
 }
 
@@ -65,6 +83,7 @@ export const reputationDashboard = handle('reputation.dashboard', async (_req, r
     })
   ]);
 
+  const thresholds = await getLevelThresholds();
   let eliteCount = 0;
   let premiumCount = 0;
   let standardCount = 0;
@@ -72,9 +91,9 @@ export const reputationDashboard = handle('reputation.dashboard', async (_req, r
 
   for (const s of scores) {
     const p = s.points;
-    if (p >= 1000) eliteCount++;
-    else if (p >= 500) premiumCount++;
-    else if (p >= 100) standardCount++;
+    if (p >= thresholds.elite) eliteCount++;
+    else if (p >= thresholds.premium) premiumCount++;
+    else if (p >= thresholds.standard) standardCount++;
     else newCount++;
   }
 
@@ -88,6 +107,7 @@ export const reputationDashboard = handle('reputation.dashboard', async (_req, r
 
 export const listScores = handle('reputation.listScores', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
+  const thresholds = await getLevelThresholds();
 
   const userWhere = cleanUndefined({
     role: 'driver',
@@ -107,10 +127,10 @@ export const listScores = handle('reputation.listScores', async (req, res) => {
   if (req.query.level) {
     const lvl = req.query.level.toUpperCase();
     let pointsFilter;
-    if (lvl === 'ELITE') pointsFilter = { points: { gte: 1000 } };
-    else if (lvl === 'PREMIUM') pointsFilter = { points: { gte: 500, lt: 1000 } };
-    else if (lvl === 'STANDARD') pointsFilter = { points: { gte: 100, lt: 500 } };
-    else if (lvl === 'NEW') pointsFilter = { points: { lt: 100 } };
+    if (lvl === 'ELITE') pointsFilter = { points: { gte: thresholds.elite } };
+    else if (lvl === 'PREMIUM') pointsFilter = { points: { gte: thresholds.premium, lt: thresholds.elite } };
+    else if (lvl === 'STANDARD') pointsFilter = { points: { gte: thresholds.standard, lt: thresholds.premium } };
+    else if (lvl === 'NEW') pointsFilter = { points: { lt: thresholds.standard } };
 
     if (pointsFilter) {
       const matchingScores = await prisma.score.findMany({
@@ -148,7 +168,7 @@ export const listScores = handle('reputation.listScores', async (req, res) => {
     points: u.score?.points || 0,
     totalEarned: u.score?.totalEarned || 0,
     totalSpent: u.score?.totalSpent || 0,
-    level: getLevel(u.score?.points || 0),
+    level: getLevelSync(u.score?.points || 0, thresholds),
     rating: Number(u.rating || 0),
     totalDeliveries: u.totalDeliveries,
     lastUpdated: u.score?.lastUpdated || u.updatedAt
@@ -185,7 +205,7 @@ export const getScore = handle('reputation.getScore', async (req, res) => {
             points: score.points,
             totalEarned: score.totalEarned,
             totalSpent: score.totalSpent,
-            level: getLevel(score.points),
+            level: await getLevel(score.points),
             lastUpdated: score.lastUpdated
           }
         : { points: 0, totalEarned: 0, totalSpent: 0, level: 'NEW', lastUpdated: null },
@@ -303,7 +323,7 @@ export const addPoints = handle('reputation.addPoints', async (req, res) => {
     data: {
       userId,
       points: result.score.points,
-      level: getLevel(result.score.points),
+      level: await getLevel(result.score.points),
       transaction: {
         id: result.transaction.id,
         amount: result.transaction.amount,
@@ -385,7 +405,7 @@ export const removePoints = handle('reputation.removePoints', async (req, res) =
     data: {
       userId,
       points: result.score.points,
-      level: getLevel(result.score.points),
+      level: await getLevel(result.score.points),
       transaction: {
         id: result.transaction.id,
         amount: result.transaction.amount,
@@ -403,6 +423,8 @@ export const driverRanking = handle('reputation.driverRanking', async (_req, res
     include: { garage: true, score: true }
   });
 
+  const thresholds = await getLevelThresholds();
+
   let walletMap = new Map();
   try {
     const wallets = await prisma.wallet.findMany({ where: { userId: { in: activeDrivers.map(d => d.id) } } });
@@ -418,7 +440,7 @@ export const driverRanking = handle('reputation.driverRanking', async (_req, res
       garageName: d.garage?.name || null,
       region: d.region,
       points: d.score?.points || 0,
-      level: getLevel(d.score?.points || 0),
+      level: getLevelSync(d.score?.points || 0, thresholds),
       rating: Number(d.rating || 0),
       totalDeliveries: d.totalDeliveries,
       completedDeliveries: d.completedDeliveries,
@@ -444,6 +466,8 @@ export const driverDetail = handle('reputation.driverDetail', async (req, res) =
 
   if (!user) throw new NotFoundError('Utilisateur introuvable');
 
+  const thresholds = await getLevelThresholds();
+
   let wallet = null;
   try {
     wallet = await prisma.wallet.findUnique({ where: { userId } });
@@ -458,7 +482,7 @@ export const driverDetail = handle('reputation.driverDetail', async (req, res) =
             points: user.score.points,
             totalEarned: user.score.totalEarned,
             totalSpent: user.score.totalSpent,
-            level: getLevel(user.score.points),
+            level: getLevelSync(user.score.points, thresholds),
             lastUpdated: user.score.lastUpdated
           }
         : null,

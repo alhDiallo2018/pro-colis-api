@@ -98,3 +98,49 @@ export async function markAllAsRead(req, res) {
     return fail(res, { status: 500, message: 'Impossible de mettre a jour les notifications' });
   }
 }
+
+export async function deleteNotification(req, res) {
+  try {
+    await prisma.notification.deleteMany({
+      where: { id: req.params.notificationId, userId: req.user.id }
+    });
+
+    return ok(res, {
+      message: 'Notification supprimee',
+      data: { deleted: true }
+    });
+  } catch (error) {
+    req.log.error(
+      {
+        error,
+        action: 'notification.delete',
+        notificationId: req.params.notificationId,
+        userId: req.user?.id,
+        requestId: req.requestId
+      },
+      'Failed to delete notification'
+    );
+
+    return fail(res, { status: 500, message: 'Impossible de supprimer la notification' });
+  }
+}
+
+export async function deleteAllNotifications(req, res) {
+  try {
+    const result = await prisma.notification.deleteMany({
+      where: { userId: req.user.id }
+    });
+
+    return ok(res, {
+      message: 'Notifications supprimees',
+      data: { deleted: result.count }
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'notification.deleteAll', userId: req.user?.id, requestId: req.requestId },
+      'Failed to delete all notifications'
+    );
+
+    return fail(res, { status: 500, message: 'Impossible de supprimer les notifications' });
+  }
+}

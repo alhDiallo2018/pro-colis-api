@@ -18,6 +18,7 @@ import {
 } from '../../utils/mobile-serializers.js';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
 import { sendNotificationEmail, sendNotificationSms, sendOtpSms, isBrevoConfigured } from '../../utils/brevo.js';
+import { calculateCommission, deductCashCommission, getCfaPerPoint, getDeliveryPoints, getCommitmentFee } from '../../utils/commission.js';
 
 const parcelInclude = {
   departureGarage: true,
@@ -263,6 +264,54 @@ export const updateProfile = handle('profile.update', async (req, res) => {
   return ok(res, { message: 'Profil mis a jour', data: { user: serializeUser(user) } });
 });
 
+export const deleteAccount = handle('users.deleteAccount', async (req, res) => {
+  const timestamp = new Date();
+
+  await prisma.$transaction([
+    prisma.user.update({
+      where: { id: req.user.id },
+      data: {
+        status: 'deleted',
+        deletedAt: timestamp
+      }
+    }),
+    prisma.refreshToken.updateMany({
+      where: { userId: req.user.id, revokedAt: null },
+      data: { revokedAt: timestamp }
+    }),
+    prisma.auditLog.create({
+      data: {
+        actorId: req.user.id,
+        actorRole: req.user.role,
+        action: 'user.deleteAccount',
+        entityType: 'user',
+        entityId: req.user.id,
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent'),
+        requestId: req.requestId
+      }
+    })
+  ]);
+
+  return ok(res, { message: 'Compte supprime' });
+});
+
+export const updateProfilePhoto = handle('users.updateProfilePhoto', async (req, res) => {
+  const { profilePhoto } = req.body;
+
+  if (!profilePhoto) {
+    throw new ValidationError([{ path: 'body.profilePhoto', message: 'La photo de profil est requise' }]);
+  }
+
+  const user = await prisma.user.update({
+    where: { id: req.user.id },
+    data: { profilePhoto },
+    include: { garage: true }
+  });
+
+  return ok(res, { message: 'Photo de profil mise a jour', data: { user: serializeUser(user) } });
+});
+
 export const updatePin = handle('users.updatePin', async (req, res) => {
   const { currentPin, newPin } = req.body;
   if (!/^\d{6}$/.test(newPin || '')) {
@@ -440,14 +489,17 @@ export const cancelParcel = handle('parcel.cancel', async (req, res) => {
   // Si un chauffeur etait assigne, on lui credite son point d'engagement.
   if (parcel.driverId) {
     await prisma.$transaction(async (tx) => {
-      await tx.score.upsert({
-        where: { userId: parcel.driverId },
-        update: { points: { increment: 1 }, lastUpdated: new Date() },
-        create: { userId: parcel.driverId, points: 1 }
-      });
-      await tx.scoreTransaction.create({
-        data: { userId: parcel.driverId, amount: 1, type: 'commitment_refund', parcelId: parcel.id, description: 'Remboursement engagement (colis annule)' }
-      });
+      const commitmentFee = await getCommitmentFee(tx);
+      if (commitmentFee > 0) {
+        await tx.score.upsert({
+          where: { userId: parcel.driverId },
+          update: { points: { increment: commitmentFee }, lastUpdated: new Date() },
+          create: { userId: parcel.driverId, points: commitmentFee }
+        });
+        await tx.scoreTransaction.create({
+          data: { userId: parcel.driverId, amount: commitmentFee, type: 'commitment_refund', source: 'system', parcelId: parcel.id, description: 'Remboursement engagement (colis annule)' }
+        });
+      }
     });
   }
 
@@ -567,29 +619,19 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
     description: recipientNote ? `Livraison confirmee (code OTP) — ${recipientNote}` : 'Livraison confirmee par code OTP'
   });
 
-  // Récompense chauffeur
-  // Points : attribués pour toute livraison réussie (récompense fidélité)
-  // Portefeuille : crédité UNIQUEMENT si le colis a été payé
-  const deliveryPoints = await getConfigValue('score.deliveryCompleted', 120);
   const parcelPrice = Number(parcel.price || parcel.totalAmount || 0);
   const isPaid = parcel.paymentStatus === 'completed';
 
-  // Calcul commission (uniquement si payé)
   let commission = 0;
   let driverEarning = 0;
   if (isPaid && parcelPrice > 0) {
-    const commissionConfigs = await prisma.commissionConfig.findMany({ where: { isActive: true } });
-    const commissionCfg = commissionConfigs.find((c) => c.profile === 'local') || commissionConfigs[0];
-    if (commissionCfg) {
-      const pct = Number(commissionCfg.percentage);
-      const min = Number(commissionCfg.minAmount);
-      const max = Number(commissionCfg.maxAmount);
-      commission = Math.max(min, Math.min(Math.round((pct * parcelPrice) / 100), max));
-    }
+    commission = await calculateCommission(parcelPrice);
     driverEarning = Math.max(0, parcelPrice - commission);
   }
 
   await prisma.$transaction(async (tx) => {
+    const deliveryPoints = await getDeliveryPoints(tx);
+
     // Points (toujours attribués)
     await tx.score.upsert({
       where: { userId: req.user.id },
@@ -597,7 +639,7 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
       create: { userId: req.user.id, points: deliveryPoints, totalEarned: deliveryPoints }
     });
     await tx.scoreTransaction.create({
-      data: { userId: req.user.id, amount: deliveryPoints, type: 'delivery_completed', parcelId: parcel.id, description: 'Points chauffeur pour livraison terminee' }
+      data: { userId: req.user.id, amount: deliveryPoints, type: 'delivery_completed', source: 'system', parcelId: parcel.id, description: 'Points chauffeur pour livraison terminee' }
     });
 
     // Portefeuille (uniquement si payé)
@@ -782,15 +824,17 @@ export const acceptBid = handle('bid.accept', async (req, res) => {
     });
     await audit(tx, req, { action: 'bid.accept', entityType: 'bid', entityId: bid.id, afterData: { status: 'accepted' } });
 
-    // Debit 1 point from the assigned driver as a commitment fee.
-    await tx.score.upsert({
-      where: { userId: bid.driverId },
-      update: { points: { decrement: 1 }, totalSpent: { increment: 1 }, lastUpdated: new Date() },
-      create: { userId: bid.driverId, points: 0, totalSpent: 1 }
-    });
-    await tx.scoreTransaction.create({
-      data: { userId: bid.driverId, amount: -1, type: 'commitment_fee', parcelId: parcel.id, description: 'Engagement chauffeur sur le colis' }
-    });
+    const commitmentFee = await getCommitmentFee(tx);
+    if (commitmentFee > 0) {
+      await tx.score.upsert({
+        where: { userId: bid.driverId },
+        update: { points: { decrement: commitmentFee }, totalSpent: { increment: commitmentFee }, lastUpdated: new Date() },
+        create: { userId: bid.driverId, points: 0, totalSpent: commitmentFee }
+      });
+      await tx.scoreTransaction.create({
+        data: { userId: bid.driverId, amount: -commitmentFee, type: 'commitment_fee', source: 'system', parcelId: parcel.id, description: 'Engagement chauffeur sur le colis' }
+      });
+    }
 
     await notify(tx, {
       userId: bid.driverId,
@@ -939,103 +983,92 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
       data: {
         userId: parcel.senderId || req.user.id,
         type: 'payment_cash',
-        title: 'Paiement en espèces confirmé',
-        body: `Le paiement de ${parcelPrice} FCFA pour le colis ${parcel.trackingNumber} a été confirmé en espèces.`,
+        title: 'Paiement en especes confirme',
+        body: `Le paiement de ${parcelPrice} FCFA pour le colis ${parcel.trackingNumber} a ete confirme en especes.`,
         data: { parcelId, amount: parcelPrice }
       }
     }),
-    // Notification admins
     prisma.notification.create({
       data: {
         userId: req.user.id,
         type: 'admin_payment_confirmed',
-        title: `Espèces confirmé : ${parcel.trackingNumber}`,
-        body: `${parcelPrice} FCFA confirmés${isDelivered ? ` — chauffeur ${parcel.driverId} sera crédité` : ''}.`,
+        title: `Especes confirme : ${parcel.trackingNumber}`,
+        body: `${parcelPrice} FCFA confirmes${isDelivered ? ` — chauffeur ${parcel.driverId} sera credite` : ''}.`,
         data: { parcelId, amount: parcelPrice, delivered: isDelivered }
       }
     })
   ]);
 
-  // Si le colis est déjà livré, créditer le chauffeur maintenant
   if (isDelivered && parcel.driverId && parcelPrice > 0) {
-    const commissionConfigs = await prisma.commissionConfig.findMany({ where: { isActive: true } });
-    const commissionCfg = commissionConfigs.find((c) => c.profile === 'local') || commissionConfigs[0];
-    let commission = 0;
-    if (commissionCfg) {
-      const pct = Number(commissionCfg.percentage);
-      const min = Number(commissionCfg.minAmount);
-      const max = Number(commissionCfg.maxAmount);
-      commission = Math.max(min, Math.min(Math.round((pct * parcelPrice) / 100), max));
-    }
-    const driverNet = Math.max(0, parcelPrice - commission);
+    const commission = await calculateCommission(parcelPrice);
 
-    if (driverNet >= 0 && parcelPrice > 0) {
-      await prisma.$transaction(async (tx) => {
-        // Créditer le prix complet au chauffeur
-        const wallet = await tx.wallet.upsert({
-          where: { userId: parcel.driverId },
-          update: { balance: { increment: parcelPrice }, totalDeposited: { increment: parcelPrice }, lastActivityAt: new Date(), lastDepositAt: new Date() },
-          create: { userId: parcel.driverId, balance: parcelPrice, totalDeposited: parcelPrice, lastDepositAt: new Date(), lastActivityAt: new Date() }
-        });
-        await tx.walletTransaction.create({
-          data: {
-            walletUserId: parcel.driverId,
-            type: 'deposit',
-            amount: parcelPrice,
-            balanceBefore: Number(wallet.balance) - parcelPrice,
-            balanceAfter: Number(wallet.balance),
-            parcelId,
-            description: `Gain brut colis ${parcel.trackingNumber} (paiement espèces)`,
-            origin: 'delivery',
-            status: 'completed'
-          }
-        });
-
-        // Prélever la commission (visible dans l'historique wallet)
-        if (commission > 0) {
-          const walletAfterCredit = await tx.wallet.findUnique({ where: { userId: parcel.driverId } });
-          await tx.wallet.update({
-            where: { userId: parcel.driverId },
-            data: { balance: { decrement: commission }, totalSpent: { increment: commission }, lastActivityAt: new Date() }
-          });
-          await tx.walletTransaction.create({
-            data: {
-              walletUserId: parcel.driverId,
-              type: 'commission',
-              amount: commission,
-              balanceBefore: Number(walletAfterCredit.balance),
-              balanceAfter: Number(walletAfterCredit.balance) - commission,
-              parcelId,
-              description: `Commission plateforme colis ${parcel.trackingNumber} (${commission} FCFA)`,
-              origin: 'cash_delivery',
-              status: 'completed'
-            }
-          });
-        }
-
-        await tx.notification.create({
-          data: {
-            userId: parcel.driverId,
-            type: 'delivery_paid',
-            title: 'Paiement reçu (espèces)',
-            body: `+${driverNet} FCFA nets pour le colis ${parcel.trackingNumber}.${commission > 0 ? ` Commission: ${commission} FCFA.` : ''}`,
-            data: { parcelId, earning: driverNet, commission, gross: parcelPrice }
-          }
-        });
-        await tx.notification.create({
-          data: {
-            userId: req.user.id,
-            type: 'admin_driver_credited',
-            title: `Espèces - ${parcel.trackingNumber}`,
-            body: `Chauffeur: +${driverNet} FCFA nets. Commission collectée: ${commission} FCFA.`,
-            data: { parcelId, driverId: parcel.driverId, earning: driverNet, commission }
-          }
-        });
+    await prisma.$transaction(async (tx) => {
+      const wallet = await tx.wallet.upsert({
+        where: { userId: parcel.driverId },
+        update: { balance: { increment: parcelPrice }, totalDeposited: { increment: parcelPrice }, lastActivityAt: new Date(), lastDepositAt: new Date() },
+        create: { userId: parcel.driverId, balance: parcelPrice, totalDeposited: parcelPrice, lastDepositAt: new Date(), lastActivityAt: new Date() }
       });
-    }
+      await tx.walletTransaction.create({
+        data: {
+          walletUserId: parcel.driverId,
+          type: 'deposit',
+          amount: parcelPrice,
+          balanceBefore: Number(wallet.balance) - parcelPrice,
+          balanceAfter: Number(wallet.balance),
+          parcelId,
+          description: `Gain brut colis ${parcel.trackingNumber} (paiement especes)`,
+          origin: 'delivery',
+          status: 'completed'
+        }
+      });
+
+      let deductionResult = { walletDeducted: 0, pointsDeducted: 0 };
+      if (commission > 0) {
+        try {
+          deductionResult = await deductCashCommission({
+            parcelId,
+            driverId: parcel.driverId,
+            commission,
+            tx,
+            req
+          });
+        } catch (err) {
+          if (err.code === 'INSUFFICIENT_FUNDS') {
+            throw new ValidationError(
+              [{ path: 'commission', message: 'Ressources insuffisantes. Wallet + Points ne couvrent pas la commission.' }],
+              'Solde insuffisant pour la commission'
+            );
+          }
+          throw err;
+        }
+      }
+
+      const driverNet = parcelPrice - commission;
+      const notifBody = `+${driverNet} FCFA nets pour le colis ${parcel.trackingNumber}.`
+        + `${commission > 0 ? ` Commission: ${commission} FCFA (Wallet: ${deductionResult.walletDeducted} FCFA, Points: ${deductionResult.pointsDeducted} pts).` : ''}`;
+
+      await tx.notification.create({
+        data: {
+          userId: parcel.driverId,
+          type: 'delivery_paid',
+          title: 'Paiement recu (especes)',
+          body: notifBody,
+          data: { parcelId, earning: driverNet, commission, gross: parcelPrice, ...deductionResult }
+        }
+      });
+      await tx.notification.create({
+        data: {
+          userId: req.user.id,
+          type: 'admin_driver_credited',
+          title: `Especes - ${parcel.trackingNumber}`,
+          body: `Chauffeur: +${driverNet} FCFA nets. Commission: ${commission} FCFA (Wallet: ${deductionResult.walletDeducted}, Points: ${deductionResult.pointsDeducted}).`,
+          data: { parcelId, driverId: parcel.driverId, earning: driverNet, commission, ...deductionResult }
+        }
+      });
+    });
   }
 
-  return ok(res, { message: 'Paiement espèces confirmé', data: { driverCredited: isDelivered && !!parcel.driverId } });
+  return ok(res, { message: 'Paiement especes confirme', data: { driverCredited: isDelivered && !!parcel.driverId } });
 });
 
 export const getScore = handle('score.get', async (req, res) => {
@@ -1054,59 +1087,172 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
     update: {},
     create: { userId: req.user.id }
   });
-  return ok(res, { message: 'Portefeuille', data: { wallet } });
+  return ok(res, {
+    message: 'Portefeuille',
+    data: {
+      wallet: {
+        balance: number(wallet.balance),
+        pendingBalance: number(wallet.pendingBalance),
+        totalDeposited: number(wallet.totalDeposited),
+        totalSpent: number(wallet.totalSpent),
+        totalWithdrawn: number(wallet.totalWithdrawn),
+        totalCommissionsPaid: number(wallet.totalCommissionsPaid),
+        status: wallet.status,
+        lastDepositAt: wallet.lastDepositAt,
+        lastActivityAt: wallet.lastActivityAt
+      }
+    }
+  });
 });
 
 export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
   const amount = Number(req.body.amount || 0);
-  if (!amount || amount < 100) {
-    throw new ValidationError([{ path: 'body.amount', message: 'Montant minimum 100 FCFA' }]);
+  if (!amount || amount < 500) {
+    throw new ValidationError([{ path: 'body.amount', message: 'Montant minimum 500 FCFA' }]);
   }
 
+  const method = req.body.method || 'wave';
+  const phone = req.body.phone || req.user.phone;
+
   const wallet = await prisma.wallet.findUnique({ where: { userId: req.user.id } });
-  const balance = Number(wallet?.balance || 0);
-  if (balance < amount) {
-    throw new ValidationError([{ path: 'body.amount', message: `Solde insuffisant. Disponible: ${balance} FCFA` }]);
+  const availableBalance = Number(wallet?.balance || 0);
+  if (availableBalance < amount) {
+    throw new ValidationError([{ path: 'body.amount', message: `Solde insuffisant. Disponible: ${availableBalance} FCFA` }]);
   }
+
+  const reference = `WTH-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 
   const result = await prisma.$transaction(async (tx) => {
     await tx.wallet.update({
       where: { userId: req.user.id },
-      data: { balance: { decrement: amount }, totalSpent: { increment: amount }, lastActivityAt: new Date() }
+      data: {
+        balance: { decrement: amount },
+        pendingBalance: { increment: amount },
+        lastActivityAt: new Date()
+      }
     });
-    const transaction = await tx.walletTransaction.create({
+
+    const withdrawal = await tx.withdrawal.create({
       data: {
         walletUserId: req.user.id,
-        type: 'withdrawal',
         amount,
-        balanceBefore: balance,
-        balanceAfter: balance - amount,
-        description: `Retrait ${amount} FCFA — ${req.body.method || 'mobile money'}${req.body.phone ? ` (${req.body.phone})` : ''}`,
-        origin: 'withdrawal',
-        status: 'completed'
+        method,
+        phone,
+        status: 'pending',
+        reference
       }
     });
 
     await tx.notification.create({
       data: {
         userId: req.user.id,
-        type: 'withdrawal_completed',
-        title: 'Retrait effectué',
-        body: `${amount} FCFA retirés de votre portefeuille.`,
-        data: { amount }
+        type: 'withdrawal_requested',
+        title: 'Demande de retrait',
+        body: `Votre demande de retrait de ${amount} FCFA a ete enregistree. Reference: ${reference}`,
+        data: { amount, reference, method, withdrawalId: withdrawal.id }
       }
     });
 
-    await notifyAdmins(tx, 'admin_withdrawal',
-      `Retrait chauffeur - ${amount} FCFA`,
-      `${req.user.fullName} a retiré ${amount} FCFA. ${req.body.method || ''} ${req.body.phone || ''}`,
-      { userId: req.user.id, amount, method: req.body.method, phone: req.body.phone }
+    await notifyAdmins(tx, 'admin_withdrawal_request',
+      `Nouveau retrait - ${amount} FCFA`,
+      `${req.user.fullName} demande un retrait de ${amount} FCFA via ${method}${phone ? ` (${phone})` : ''}. Reference: ${reference}`,
+      { userId: req.user.id, amount, method, phone, reference, withdrawalId: withdrawal.id }
     );
 
-    return transaction;
+    return withdrawal;
   });
 
-  return ok(res, { message: 'Retrait effectué', data: { transaction: result } });
+  return ok(res, {
+    status: 201,
+    message: 'Demande de retrait enregistree',
+    data: {
+      withdrawal: {
+        id: result.id,
+        amount: number(result.amount),
+        method: result.method,
+        phone: result.phone,
+        status: result.status,
+        reference: result.reference,
+        requestedAt: result.requestedAt
+      }
+    }
+  });
+});
+
+export const getDriverWithdrawals = handle('driver.withdrawals.list', async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const where = { walletUserId: req.user.id };
+
+  const [total, withdrawals] = await Promise.all([
+    prisma.withdrawal.count({ where }),
+    prisma.withdrawal.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    })
+  ]);
+
+  return ok(res, {
+    message: 'Historique des retraits',
+    data: {
+      withdrawals: withdrawals.map((w) => ({
+        id: w.id,
+        amount: number(w.amount),
+        method: w.method,
+        phone: w.phone,
+        status: w.status,
+        reference: w.reference,
+        failureReason: w.failureReason,
+        requestedAt: w.requestedAt,
+        processedAt: w.processedAt,
+        completedAt: w.completedAt,
+        createdAt: w.createdAt
+      }))
+    },
+    meta: paginationMeta({ page, limit, total })
+  });
+});
+
+export const cancelWithdrawal = handle('driver.withdrawal.cancel', async (req, res) => {
+  const withdrawalId = req.params.withdrawalId || req.body.withdrawalId;
+
+  const withdrawal = await prisma.withdrawal.findFirst({
+    where: { id: withdrawalId, walletUserId: req.user.id }
+  });
+
+  if (!withdrawal) throw new NotFoundError('Retrait introuvable');
+  if (withdrawal.status !== 'pending') {
+    throw new ValidationError([{ path: 'status', message: 'Seuls les retraits en attente peuvent etre annules' }]);
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.withdrawal.update({
+      where: { id: withdrawalId },
+      data: { status: 'cancelled' }
+    });
+
+    await tx.wallet.update({
+      where: { userId: req.user.id },
+      data: {
+        balance: { increment: Number(withdrawal.amount) },
+        pendingBalance: { decrement: Number(withdrawal.amount) },
+        lastActivityAt: new Date()
+      }
+    });
+
+    await tx.notification.create({
+      data: {
+        userId: req.user.id,
+        type: 'withdrawal_cancelled',
+        title: 'Retrait annule',
+        body: `Votre demande de retrait de ${withdrawal.amount} FCFA a ete annulee. Le montant est de nouveau disponible.`,
+        data: { withdrawalId, amount: number(withdrawal.amount) }
+      }
+    });
+  });
+
+  return ok(res, { message: 'Retrait annule', data: { status: 'cancelled' } });
 });
 
 export const getScoreHistory = handle('score.history', async (req, res) => {
@@ -1120,19 +1266,22 @@ export const getScoreHistory = handle('score.history', async (req, res) => {
 });
 
 export const purchaseScore = handle('score.purchase', async (req, res) => {
-  const points = Number(req.body.points || req.body.amount || 0);
-  if (points <= 0) throw new ValidationError([{ path: 'body.points', message: 'Le nombre de points doit etre positif' }]);
+  const pointsRequested = Number(req.body.points || req.body.amount || 0);
+  if (pointsRequested <= 0) throw new ValidationError([{ path: 'body.points', message: 'Le nombre de points doit etre positif' }]);
   const result = await prisma.$transaction(async (tx) => {
+    const cfaPerPoint = await getCfaPerPoint(tx);
+    const cfaAmount = Math.round(pointsRequested * cfaPerPoint);
+
     await tx.score.upsert({
       where: { userId: req.user.id },
-      update: { points: { increment: points }, totalEarned: { increment: points }, lastUpdated: new Date() },
-      create: { userId: req.user.id, points, totalEarned: points }
+      update: { points: { increment: pointsRequested }, totalEarned: { increment: pointsRequested }, lastUpdated: new Date() },
+      create: { userId: req.user.id, points: pointsRequested, totalEarned: pointsRequested }
     });
     const payment = await tx.payment.create({
-      data: { userId: req.user.id, amount: decimal(points, '0'), method: req.body.method || req.body.paymentMethod || 'cash', status: 'completed', phoneNumber: req.body.phoneNumber, reference: `SCORE-${Date.now()}`, completedAt: new Date() }
+      data: { userId: req.user.id, amount: decimal(cfaAmount, '0'), method: req.body.method || req.body.paymentMethod || 'cash', status: 'completed', phoneNumber: req.body.phoneNumber, reference: `SCORE-${Date.now()}`, completedAt: new Date() }
     });
     const transaction = await tx.scoreTransaction.create({
-      data: { userId: req.user.id, amount: points, type: 'purchase', description: 'Achat de points', metadata: { paymentId: payment.id } }
+      data: { userId: req.user.id, amount: pointsRequested, type: 'purchase', source: req.body.source || 'driver_recharge', description: `Achat de ${pointsRequested} points (${cfaAmount} FCFA)`, metadata: { paymentId: payment.id, cfaPerPoint, cfaAmount } }
     });
     return { payment, transaction };
   });
@@ -1140,28 +1289,31 @@ export const purchaseScore = handle('score.purchase', async (req, res) => {
 });
 
 export const purchaseScoreWithWallet = handle('score.purchaseWallet', async (req, res) => {
-  const points = Number(req.body.points || req.body.amount || 0);
-  if (points <= 0) throw new ValidationError([{ path: 'body.points', message: 'Le nombre de points doit etre positif' }]);
+  const pointsRequested = Number(req.body.points || req.body.amount || 0);
+  if (pointsRequested <= 0) throw new ValidationError([{ path: 'body.points', message: 'Le nombre de points doit etre positif' }]);
 
   const result = await prisma.$transaction(async (tx) => {
+    const cfaPerPoint = await getCfaPerPoint(tx);
+    const cfaAmount = Math.round(pointsRequested * cfaPerPoint);
+
     const wallet = await tx.wallet.findUnique({ where: { userId: req.user.id } });
     const balance = Number(wallet?.balance || 0);
-    if (balance < points) {
-      throw new ValidationError([{ path: 'wallet', message: `Solde insuffisant. Disponible: ${balance} FCFA, requis: ${points} FCFA` }]);
+    if (balance < cfaAmount) {
+      throw new ValidationError([{ path: 'wallet', message: `Solde insuffisant. Disponible: ${balance} FCFA, requis: ${cfaAmount} FCFA (${pointsRequested} pts × ${cfaPerPoint} FCFA/pt)` }]);
     }
 
     await tx.wallet.update({
       where: { userId: req.user.id },
-      data: { balance: { decrement: points }, totalSpent: { increment: points }, lastActivityAt: new Date() }
+      data: { balance: { decrement: cfaAmount }, totalSpent: { increment: cfaAmount }, lastActivityAt: new Date() }
     });
     await tx.walletTransaction.create({
       data: {
         walletUserId: req.user.id,
         type: 'commission',
-        amount: points,
+        amount: cfaAmount,
         balanceBefore: balance,
-        balanceAfter: balance - points,
-        description: `Achat de ${points} points`,
+        balanceAfter: balance - cfaAmount,
+        description: `Achat de ${pointsRequested} points (${cfaPerPoint} FCFA/pt)`,
         origin: 'score_purchase',
         status: 'completed'
       }
@@ -1169,11 +1321,11 @@ export const purchaseScoreWithWallet = handle('score.purchaseWallet', async (req
 
     await tx.score.upsert({
       where: { userId: req.user.id },
-      update: { points: { increment: points }, totalEarned: { increment: points }, lastUpdated: new Date() },
-      create: { userId: req.user.id, points, totalEarned: points }
+      update: { points: { increment: pointsRequested }, totalEarned: { increment: pointsRequested }, lastUpdated: new Date() },
+      create: { userId: req.user.id, points: pointsRequested, totalEarned: pointsRequested }
     });
     const transaction = await tx.scoreTransaction.create({
-      data: { userId: req.user.id, amount: points, type: 'purchase', description: 'Achat de points via portefeuille' }
+      data: { userId: req.user.id, amount: pointsRequested, type: 'purchase', source: 'wallet', description: `Achat de ${pointsRequested} points via portefeuille (${cfaAmount} FCFA)`, metadata: { cfaPerPoint, cfaAmount } }
     });
 
     return { transaction };
@@ -1999,5 +2151,27 @@ export const createWebhook = handle('webhooks.create', async (req, res) => {
 export const deleteWebhook = handle('webhooks.delete', async (req, res) => {
   await prisma.webhook.delete({ where: { id: req.params.webhookId } });
   return ok(res, { message: 'Webhook supprime' });
+});
+
+export const systemHealth = handle('system.health', async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return ok(res, {
+      message: 'Systeme operationnel',
+      data: {
+        status: 'healthy',
+        database: 'connected',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch {
+    return fail(res, {
+      status: 503,
+      message: 'Systeme degrade',
+      code: 'SERVICE_UNAVAILABLE',
+      data: { status: 'degraded', database: 'disconnected' }
+    });
+  }
 });
 

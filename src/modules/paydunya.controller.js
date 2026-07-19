@@ -3,6 +3,7 @@ import { env } from '../config/env.js'
 import { ok, fail } from '../utils/api-response.js'
 import { ValidationError, normalizeError } from '../utils/errors.js'
 import { sendNotificationEmail, sendNotificationSms, isBrevoConfigured } from '../utils/brevo.js'
+import { calculateCommission } from '../utils/commission.js'
 import {
   createInvoice as paydunyaCreateInvoice,
   confirmInvoice as paydunyaConfirmInvoice,
@@ -72,14 +73,14 @@ async function creditScore(userId, points, token) {
       create: { userId, points, totalEarned: points }
     })
     await tx.scoreTransaction.create({
-      data: { userId, amount: points, type: 'purchase', description: `Achat points via PayDunya (${token})` }
+      data: { userId, amount: points, type: 'purchase', source: 'paydunya', description: `Achat points via PayDunya (${token})` }
     })
     await tx.notification.create({
       data: {
         userId,
         type: 'score_credited',
-        title: 'Points crédités',
-        body: `${points} points ont été ajoutés à votre compte via PayDunya.`,
+        title: 'Points credites',
+        body: `${points} points ont ete ajoutes a votre compte via PayDunya.`,
         data: { points, token, source: 'paydunya' }
       }
     })
@@ -109,8 +110,8 @@ async function creditWallet(userId, amount, token) {
       data: {
         userId,
         type: 'wallet_recharged',
-        title: 'Portefeuille rechargé',
-        body: `${amount} FCFA ont été ajoutés à votre portefeuille via PayDunya.`,
+        title: 'Portefeuille recharge',
+        body: `${amount} FCFA ont ete ajoutes a votre portefeuille via PayDunya.`,
         data: { amount, token, source: 'paydunya' }
       }
     })
@@ -159,15 +160,7 @@ async function creditDriverForParcel(parcel, token) {
   const parcelPrice = Number(parcel.price || parcel.totalAmount || 0)
   if (!parcelPrice || !parcel.driverId) return
 
-  const commissionConfigs = await prisma.commissionConfig.findMany({ where: { isActive: true } })
-  const commissionCfg = commissionConfigs.find((c) => c.profile === 'local') || commissionConfigs[0]
-  let commission = 0
-  if (commissionCfg) {
-    const pct = Number(commissionCfg.percentage)
-    const min = Number(commissionCfg.minAmount)
-    const max = Number(commissionCfg.maxAmount)
-    commission = Math.max(min, Math.min(Math.round((pct * parcelPrice) / 100), max))
-  }
+  const commission = await calculateCommission(parcelPrice)
   const driverEarning = Math.max(0, parcelPrice - commission)
 
   if (driverEarning <= 0) return
@@ -195,12 +188,11 @@ async function creditDriverForParcel(parcel, token) {
       data: {
         userId: parcel.driverId,
         type: 'delivery_paid',
-        title: 'Paiement reçu',
+        title: 'Paiement recu',
         body: `+${driverEarning} FCFA pour le colis ${parcel.trackingNumber}. Commission: ${commission} FCFA.`,
         data: { parcelId: parcel.id, earning: driverEarning, commission }
       }
     })
-    // Notifier les admins
     const admins = await tx.user.findMany({ where: { role: 'super_admin', status: 'active' }, select: { id: true } })
     await Promise.all(admins.map((a) =>
       tx.notification.create({
@@ -208,7 +200,7 @@ async function creditDriverForParcel(parcel, token) {
           userId: a.id,
           type: 'admin_driver_credited',
           title: `PayDunya - ${parcel.trackingNumber}`,
-          body: `Chauffeur crédité (${driverEarning} FCFA). Commission: ${commission} FCFA.`,
+          body: `Chauffeur credite (${driverEarning} FCFA). Commission: ${commission} FCFA.`,
           data: { parcelId: parcel.id, driverId: parcel.driverId, earning: driverEarning, commission }
         }
       })
@@ -216,14 +208,10 @@ async function creditDriverForParcel(parcel, token) {
   })
 }
 
-/**
- * POST /payments/paydunya/create
- * Crée une facture PayDunya. type = parcel | score | wallet
- */
 export const createPaydunyaPayment = handle('paydunya.create', async (req, res) => {
   const config = await getPaydunyaConfig()
   if (!config) {
-    throw new ValidationError([{ path: 'paydunya', message: 'PayDunya non configuré' }])
+    throw new ValidationError([{ path: 'paydunya', message: 'PayDunya non configure' }])
   }
 
   const { type, parcelId, points, amount: rawAmount } = req.body
@@ -244,7 +232,7 @@ export const createPaydunyaPayment = handle('paydunya.create', async (req, res) 
     const parcel = await prisma.parcel.findUnique({ where: { id: parcelId } })
     if (!parcel) throw new ValidationError([{ path: 'body.parcelId', message: 'Colis introuvable' }])
     if (parcel.paymentStatus === 'completed') {
-      throw new ValidationError([{ path: 'body.parcelId', message: 'Ce colis est déjà payé' }])
+      throw new ValidationError([{ path: 'body.parcelId', message: 'Ce colis est deja paye' }])
     }
     customData.parcelId = parcelId
     description = `Paiement colis ${parcel.trackingNumber}`
@@ -279,7 +267,7 @@ export const createPaydunyaPayment = handle('paydunya.create', async (req, res) 
 
   return ok(res, {
     status: 201,
-    message: 'Facture PayDunya créée',
+    message: 'Facture PayDunya creee',
     data: {
       token: result.token,
       paymentUrl: result.paymentUrl
@@ -287,13 +275,10 @@ export const createPaydunyaPayment = handle('paydunya.create', async (req, res) 
   })
 })
 
-/**
- * GET /payments/paydunya/confirm/:token
- */
 export const confirmPaydunyaPayment = handle('paydunya.confirm', async (req, res) => {
   const config = await getPaydunyaConfig()
   if (!config) {
-    throw new ValidationError([{ path: 'paydunya', message: 'PayDunya non configuré' }])
+    throw new ValidationError([{ path: 'paydunya', message: 'PayDunya non configure' }])
   }
 
   const { token } = req.params
@@ -308,12 +293,9 @@ export const confirmPaydunyaPayment = handle('paydunya.confirm', async (req, res
   })
 })
 
-/**
- * POST /payments/paydunya/ipn — Callback IPN (public)
- */
 export const paydunyaIpn = handle('paydunya.ipn', async (req, res) => {
   const { data } = req.body
-  if (!data) throw new ValidationError([{ path: 'data', message: 'Données IPN manquantes' }])
+  if (!data) throw new ValidationError([{ path: 'data', message: 'Donnees IPN manquantes' }])
 
   const config = await getPaydunyaConfig()
   const masterKey = config?.masterKey || ''
@@ -326,13 +308,18 @@ export const paydunyaIpn = handle('paydunya.ipn', async (req, res) => {
     await processCompletedPayment(data, data.invoice?.token || '', req.log)
   }
 
-  return ok(res, { message: 'IPN reçu' })
+  return ok(res, { message: 'IPN recu' })
 })
 
-/**
- * Traite un paiement complété : crédite score, wallet, ou marque le colis payé.
- */
 async function processCompletedPayment(result, token, reqLogger) {
+  const existing = await prisma.payment.findFirst({
+    where: { transactionId: token, status: 'completed' }
+  })
+  if (existing) {
+    reqLogger?.warn?.({ token }, 'PayDunya: duplicate completion ignored')
+    return
+  }
+
   const raw = result.raw || result
   const cd = raw.custom_data || result.customData || {}
   const type = cd.type || 'parcel'
@@ -350,11 +337,10 @@ async function processCompletedPayment(result, token, reqLogger) {
       })
       if (userId) {
         await createPaymentRecord(userId, cd.parcelId, amount, token)
-        await sendNotification(userId, 'payment_completed', 'Paiement confirmé',
-          `Votre paiement de ${amount} FCFA pour le colis a été confirmé.`, { parcelId: cd.parcelId, amount, token })
+        await sendNotification(userId, 'payment_completed', 'Paiement confirme',
+          `Votre paiement de ${amount} FCFA pour le colis a ete confirme.`, { parcelId: cd.parcelId, amount, token })
       }
 
-      // Si le colis est déjà livré, créditer le chauffeur
       if (parcel.status === 'delivered' && parcel.driverId) {
         await creditDriverForParcel(parcel, token)
       }
@@ -374,9 +360,6 @@ async function processCompletedPayment(result, token, reqLogger) {
   }
 }
 
-/**
- * GET /payments/paydunya/return — page de retour après paiement
- */
 export const paydunyaReturn = handle('paydunya.return', async (req, res) => {
   const frontUrl = env.CORS_ORIGIN === '*' ? 'http://localhost:5173' : (env.CORS_ORIGIN || '').split(',')[0]
   const { token } = req.query
@@ -406,9 +389,6 @@ export const paydunyaReturn = handle('paydunya.return', async (req, res) => {
   return res.redirect(`${frontUrl}/client/colis?payment=pending&token=${token}`)
 })
 
-/**
- * GET /payments/paydunya/cancel
- */
 export const paydunyaCancel = (_req, res) => {
   const frontUrl = env.CORS_ORIGIN === '*' ? 'http://localhost:5173' : (env.CORS_ORIGIN || '').split(',')[0]
   return res.redirect(`${frontUrl}/client/colis?payment=cancelled`)

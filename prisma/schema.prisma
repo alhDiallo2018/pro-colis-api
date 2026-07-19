@@ -131,6 +131,14 @@ enum CommissionProfileType {
   international
 }
 
+enum WithdrawalStatus {
+  pending
+  processing
+  completed
+  failed
+  cancelled
+}
+
 model User {
   id                   String                 @id @default(uuid()) @db.Uuid
   email                String?                @unique
@@ -172,6 +180,7 @@ model User {
   validatedPayments    Payment[]              @relation("PaymentValidator")
   score                Score?
   scoreTransactions    ScoreTransaction[]
+  notifiedTransactions ScoreTransaction[]  @relation("ScorePerformer")
   notifications        Notification[]          @relation("NotificationRecipient")
   sentNotifications    Notification[]          @relation("NotificationSender")
   otpCodes             OtpCode[]
@@ -194,6 +203,7 @@ model User {
   backups              Backup[]
   wallet               Wallet?
   walletTransactions   WalletTransaction[]
+  withdrawals          Withdrawal[]
 
   @@map("users")
 }
@@ -421,31 +431,38 @@ model ScoreTransaction {
   userId      String   @map("user_id") @db.Uuid
   amount      Int
   type        String
+  source      String?
   parcelId    String?  @map("parcel_id") @db.Uuid
   description String
   status      String   @default("completed")
+  performedBy String?  @map("performed_by") @db.Uuid
   metadata    Json     @default("{}")
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   parcel      Parcel?  @relation(fields: [parcelId], references: [id], onDelete: SetNull)
+  actor       User?    @relation("ScorePerformer", fields: [performedBy], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt])
   @@map("score_transactions")
 }
 
 model Wallet {
-  userId        String       @id @map("user_id") @db.Uuid
-  balance       Decimal      @default(0) @db.Decimal(12, 2)
-  totalDeposited Decimal     @default(0) @map("total_deposited") @db.Decimal(12, 2)
-  totalSpent    Decimal      @default(0) @map("total_spent") @db.Decimal(12, 2)
-  totalRefunded Decimal      @default(0) @map("total_refunded") @db.Decimal(12, 2)
-  status        WalletStatus @default(active)
-  lastDepositAt DateTime?    @map("last_deposit_at") @db.Timestamptz
-  lastActivityAt DateTime?   @map("last_activity_at") @db.Timestamptz
-  createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt     DateTime     @updatedAt @map("updated_at") @db.Timestamptz
-  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  transactions  WalletTransaction[]
+  userId          String               @id @map("user_id") @db.Uuid
+  balance         Decimal              @default(0) @db.Decimal(12, 2)
+  pendingBalance  Decimal              @default(0) @map("pending_balance") @db.Decimal(12, 2)
+  totalDeposited  Decimal              @default(0) @map("total_deposited") @db.Decimal(12, 2)
+  totalSpent      Decimal              @default(0) @map("total_spent") @db.Decimal(12, 2)
+  totalRefunded   Decimal              @default(0) @map("total_refunded") @db.Decimal(12, 2)
+  totalWithdrawn   Decimal             @default(0) @map("total_withdrawn") @db.Decimal(12, 2)
+  totalCommissionsPaid Decimal        @default(0) @map("total_commissions_paid") @db.Decimal(12, 2)
+  status          WalletStatus         @default(active)
+  lastDepositAt   DateTime?            @map("last_deposit_at") @db.Timestamptz
+  lastActivityAt  DateTime?            @map("last_activity_at") @db.Timestamptz
+  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz
+  user            User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions    WalletTransaction[]
+  withdrawals     Withdrawal[]
 
   @@map("wallets")
 }
@@ -469,6 +486,29 @@ model WalletTransaction {
 
   @@index([walletUserId, createdAt])
   @@map("wallet_transactions")
+}
+
+model Withdrawal {
+  id                String           @id @default(uuid()) @db.Uuid
+  walletUserId      String           @map("wallet_user_id") @db.Uuid
+  amount            Decimal          @db.Decimal(12, 2)
+  method            String           @default("wave")
+  phone             String?
+  status            WithdrawalStatus @default(pending)
+  reference         String?          @unique
+  failureReason     String?          @map("failure_reason")
+  requestedAt       DateTime         @default(now()) @map("requested_at") @db.Timestamptz
+  processedBy       String?          @map("processed_by") @db.Uuid
+  processedAt       DateTime?        @map("processed_at") @db.Timestamptz
+  completedAt       DateTime?        @map("completed_at") @db.Timestamptz
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  wallet            Wallet           @relation(fields: [walletUserId], references: [userId], onDelete: Cascade)
+  processor         User?            @relation(fields: [processedBy], references: [id], onDelete: SetNull)
+
+  @@index([walletUserId, createdAt])
+  @@index([status])
+  @@map("withdrawals")
 }
 
 model CommissionConfig {

@@ -65,3 +65,47 @@ export const verifyOtpSchema = z.object({
   params: z.object({}).default({}),
   query: z.object({}).default({})
 });
+
+export const forgotPasswordSchema = z.object({
+  body: z.object({
+    identifier: z.string().min(3)
+  }),
+  params: z.object({}).default({}),
+  query: z.object({}).default({})
+});
+
+export const resetPasswordSchema = z.object({
+  body: z.object({
+    identifier: z.string().min(3),
+    otpCode: z.string().min(4).max(10),
+    newPassword: z.string().min(8)
+  }),
+  params: z.object({}).default({}),
+  query: z.object({}).default({})
+});
+
+export const changePasswordSchema = z.object({
+  body: z.object({
+    currentPassword: z.string().min(8),
+    newPassword: z.string().min(8)
+  }),
+  params: z.object({}).default({}),
+  query: z.object({}).default({})
+});
+
+export const verifyEmailSchema = z.object({
+  body: z.object({
+    email: z.string().email(),
+    otpCode: z.string().min(4).max(10)
+  }),
+  params: z.object({}).default({}),
+  query: z.object({}).default({})
+});
+
+export const resendVerificationSchema = z.object({
+  body: z.object({
+    identifier: z.string().min(3)
+  }),
+  params: z.object({}).default({}),
+  query: z.object({}).default({})
+});

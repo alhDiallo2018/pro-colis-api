@@ -9,3 +9,5 @@ notificationRouter.get('/', notificationController.listNotifications);
 notificationRouter.get('/unread-count', notificationController.unreadCount);
 notificationRouter.patch('/:notificationId/read', notificationController.markAsRead);
 notificationRouter.post('/read-all', notificationController.markAllAsRead);
+notificationRouter.delete('/:notificationId', notificationController.deleteNotification);
+notificationRouter.delete('/all', notificationController.deleteAllNotifications);

@@ -609,11 +609,241 @@ export const getPayment = handle('finance.getPayment', async (req, res) => {
 });
 
 export const listPayouts = handle('finance.listPayouts', async (req, res) => {
-  const { page, limit } = getPagination(req.query);
+  const { page, limit, skip } = getPagination(req.query);
+  const { status, method } = req.query;
+
+  const where = cleanUndefined({
+    status,
+    method
+  });
+
+  const [total, withdrawals] = await Promise.all([
+    prisma.withdrawal.count({ where }),
+    prisma.withdrawal.findMany({
+      where,
+      include: { wallet: { include: { user: { select: { id: true, fullName: true, phone: true } } } }, processor: { select: { id: true, fullName: true } } },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    })
+  ]);
 
   return ok(res, {
     message: 'Retraits',
-    data: { payouts: [] },
-    meta: paginationMeta({ page, limit, total: 0 })
+    data: {
+      payouts: withdrawals.map((w) => ({
+        id: w.id,
+        userId: w.walletUserId,
+        driver: w.wallet?.user ? { id: w.wallet.user.id, fullName: w.wallet.user.fullName, phone: w.wallet.user.phone } : null,
+        amount: number(w.amount),
+        method: w.method,
+        phone: w.phone,
+        status: w.status,
+        reference: w.reference,
+        failureReason: w.failureReason,
+        requestedAt: w.requestedAt,
+        processedBy: w.processedBy,
+        processor: w.processor ? { id: w.processor.id, fullName: w.processor.fullName } : null,
+        processedAt: w.processedAt,
+        completedAt: w.completedAt,
+        createdAt: w.createdAt
+      }))
+    },
+    meta: paginationMeta({ page, limit, total })
   });
+});
+
+export const getWithdrawal = handle('finance.getWithdrawal', async (req, res) => {
+  const { withdrawalId } = req.params;
+
+  const withdrawal = await prisma.withdrawal.findUnique({
+    where: { id: withdrawalId },
+    include: { wallet: { include: { user: { select: { id: true, fullName: true, phone: true } } } }, processor: { select: { id: true, fullName: true } } }
+  });
+
+  if (!withdrawal) throw new NotFoundError('Retrait introuvable');
+
+  return ok(res, {
+    message: 'Detail retrait',
+    data: {
+      withdrawal: {
+        id: withdrawal.id,
+        userId: withdrawal.walletUserId,
+        driver: withdrawal.wallet?.user ? { id: withdrawal.wallet.user.id, fullName: withdrawal.wallet.user.fullName, phone: withdrawal.wallet.user.phone } : null,
+        amount: number(withdrawal.amount),
+        method: withdrawal.method,
+        phone: withdrawal.phone,
+        status: withdrawal.status,
+        reference: withdrawal.reference,
+        failureReason: withdrawal.failureReason,
+        requestedAt: withdrawal.requestedAt,
+        processedBy: withdrawal.processedBy,
+        processor: withdrawal.processor ? { id: withdrawal.processor.id, fullName: withdrawal.processor.fullName } : null,
+        processedAt: withdrawal.processedAt,
+        completedAt: withdrawal.completedAt,
+        createdAt: withdrawal.createdAt,
+        updatedAt: withdrawal.updatedAt
+      }
+    }
+  });
+});
+
+export const approveWithdrawal = handle('finance.approveWithdrawal', async (req, res) => {
+  const { withdrawalId } = req.params;
+
+  const result = await prisma.$transaction(async (tx) => {
+    const withdrawal = await tx.withdrawal.findUnique({ where: { id: withdrawalId } });
+    if (!withdrawal) throw new NotFoundError('Retrait introuvable');
+    if (withdrawal.status !== 'pending') {
+      throw new ValidationError([{ path: 'status', message: 'Seuls les retraits en attente peuvent etre approuves' }]);
+    }
+
+    const updated = await tx.withdrawal.update({
+      where: { id: withdrawalId },
+      data: {
+        status: 'processing',
+        processedBy: req.user.id,
+        processedAt: new Date()
+      }
+    });
+
+    await tx.walletTransaction.create({
+      data: {
+        walletUserId: withdrawal.walletUserId,
+        type: 'withdrawal',
+        amount: Number(withdrawal.amount),
+        balanceBefore: 0,
+        balanceAfter: 0,
+        description: `Retrait ${withdrawal.method} — ${withdrawal.reference}`,
+        origin: 'withdrawal',
+        status: 'processing',
+        performedBy: req.user.id
+      }
+    });
+
+    await audit(tx, req, {
+      action: 'withdrawal.approve',
+      entityType: 'withdrawal',
+      entityId: withdrawalId,
+      afterData: { status: 'processing' }
+    });
+
+    return updated;
+  });
+
+  return ok(res, { message: 'Retrait approuve', data: { status: result.status } });
+});
+
+export const completeWithdrawal = handle('finance.completeWithdrawal', async (req, res) => {
+  const { withdrawalId } = req.params;
+
+  const result = await prisma.$transaction(async (tx) => {
+    const withdrawal = await tx.withdrawal.findUnique({ where: { id: withdrawalId } });
+    if (!withdrawal) throw new NotFoundError('Retrait introuvable');
+    if (withdrawal.status !== 'processing') {
+      throw new ValidationError([{ path: 'status', message: 'Seuls les retraits en cours peuvent etre completes' }]);
+    }
+
+    await tx.withdrawal.update({
+      where: { id: withdrawalId },
+      data: {
+        status: 'completed',
+        completedAt: new Date()
+      }
+    });
+
+    await tx.wallet.update({
+      where: { userId: withdrawal.walletUserId },
+      data: {
+        pendingBalance: { decrement: Number(withdrawal.amount) },
+        totalSpent: { increment: Number(withdrawal.amount) },
+        totalWithdrawn: { increment: Number(withdrawal.amount) },
+        lastActivityAt: new Date()
+      }
+    });
+
+    await tx.walletTransaction.updateMany({
+      where: { walletUserId: withdrawal.walletUserId, origin: 'withdrawal', status: 'processing', description: { contains: withdrawal.reference } },
+      data: { status: 'completed' }
+    });
+
+    await tx.notification.create({
+      data: {
+        userId: withdrawal.walletUserId,
+        type: 'withdrawal_completed',
+        title: 'Retrait complete',
+        body: `Votre retrait de ${withdrawal.amount} FCFA a ete complete.`,
+        data: { withdrawalId, amount: number(withdrawal.amount), reference: withdrawal.reference }
+      }
+    });
+
+    await audit(tx, req, {
+      action: 'withdrawal.complete',
+      entityType: 'withdrawal',
+      entityId: withdrawalId,
+      afterData: { status: 'completed' }
+    });
+
+    return withdrawal;
+  });
+
+  return ok(res, { message: 'Retrait complete', data: { status: result.status } });
+});
+
+export const rejectWithdrawal = handle('finance.rejectWithdrawal', async (req, res) => {
+  const { withdrawalId } = req.params;
+  const { reason } = req.body;
+
+  const result = await prisma.$transaction(async (tx) => {
+    const withdrawal = await tx.withdrawal.findUnique({ where: { id: withdrawalId } });
+    if (!withdrawal) throw new NotFoundError('Retrait introuvable');
+    if (withdrawal.status !== 'pending' && withdrawal.status !== 'processing') {
+      throw new ValidationError([{ path: 'status', message: 'Retrait non modifiable dans cet etat' }]);
+    }
+
+    await tx.withdrawal.update({
+      where: { id: withdrawalId },
+      data: {
+        status: 'failed',
+        failureReason: reason || 'Rejete par l\'administrateur',
+        processedBy: req.user.id,
+        processedAt: new Date()
+      }
+    });
+
+    await tx.wallet.update({
+      where: { userId: withdrawal.walletUserId },
+      data: {
+        balance: { increment: Number(withdrawal.amount) },
+        pendingBalance: { decrement: Number(withdrawal.amount) },
+        lastActivityAt: new Date()
+      }
+    });
+
+    await tx.walletTransaction.updateMany({
+      where: { walletUserId: withdrawal.walletUserId, origin: 'withdrawal', status: { in: ['pending', 'processing'] }, description: { contains: withdrawal.reference } },
+      data: { status: 'failed' }
+    });
+
+    await tx.notification.create({
+      data: {
+        userId: withdrawal.walletUserId,
+        type: 'withdrawal_failed',
+        title: 'Retrait refuse',
+        body: `Votre retrait de ${withdrawal.amount} FCFA a ete refuse. ${reason || ''} Le montant est de nouveau disponible.`,
+        data: { withdrawalId, amount: number(withdrawal.amount), reason }
+      }
+    });
+
+    await audit(tx, req, {
+      action: 'withdrawal.reject',
+      entityType: 'withdrawal',
+      entityId: withdrawalId,
+      afterData: { status: 'failed', reason }
+    });
+
+    return withdrawal;
+  });
+
+  return ok(res, { message: 'Retrait refuse', data: { status: result.status } });
 });

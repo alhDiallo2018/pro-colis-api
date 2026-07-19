@@ -10,6 +10,8 @@ export const mobileRouter = Router();
 
 mobileRouter.get('/users/stats', authenticate, mobileController.userStats);
 mobileRouter.put('/users/pin', authenticate, mobileController.updatePin);
+mobileRouter.delete('/users/account', authenticate, mobileController.deleteAccount);
+mobileRouter.put('/users/profile-photo', authenticate, mobileController.updateProfilePhoto);
 
 mobileRouter.put('/client/profile', authenticate, requireRoles('client'), mobileController.updateProfile);
 mobileRouter.get('/client/parcels/my-parcels', authenticate, requireRoles('client'), mobileController.clientParcels);
@@ -84,6 +86,7 @@ mobileRouter.put('/super-admin/config', authenticate, requireRoles('super_admin'
 mobileRouter.post('/super-admin/backup', authenticate, requireRoles('super_admin'), mobileController.createBackup);
 mobileRouter.get('/super-admin/backups', authenticate, requireRoles('super_admin'), mobileController.listBackups);
 mobileRouter.post('/super-admin/restore', authenticate, requireRoles('super_admin'), mobileController.restoreBackup);
+mobileRouter.get('/super-admin/system/health', authenticate, requireRoles('super_admin'), mobileController.systemHealth);
 
 mobileRouter.post('/vehicles', authenticate, requireRoles('admin', 'super_admin'), mobileController.createVehicle);
 mobileRouter.get('/vehicles', authenticate, requireRoles('admin', 'super_admin'), mobileController.listVehicles);
@@ -113,6 +116,8 @@ mobileRouter.get('/score', authenticate, mobileController.getScore);
 mobileRouter.get('/score/balance', authenticate, mobileController.getScoreBalance);
 mobileRouter.get('/driver/wallet', authenticate, mobileController.getDriverWallet);
 mobileRouter.post('/driver/wallet/withdraw', authenticate, mobileController.withdrawWallet);
+mobileRouter.get('/driver/wallet/withdrawals', authenticate, mobileController.getDriverWithdrawals);
+mobileRouter.delete('/driver/wallet/withdrawals/:withdrawalId', authenticate, mobileController.cancelWithdrawal);
 mobileRouter.get('/score/history', authenticate, mobileController.getScoreHistory);
 mobileRouter.post('/score/purchase', authenticate, mobileController.purchaseScore);
 mobileRouter.post('/score/purchase/wallet', authenticate, mobileController.purchaseScoreWithWallet);
@@ -191,8 +196,12 @@ mobileRouter.post('/super-admin/commissions/simulate', authenticate, requireRole
 // Payments
 mobileRouter.get('/super-admin/payments', authenticate, requireRoles('super_admin'), adminFinanceController.listPayments);
 mobileRouter.get('/super-admin/payments/:paymentId', authenticate, requireRoles('super_admin'), adminFinanceController.getPayment);
-// Payouts (preparation)
-mobileRouter.get('/super-admin/payouts', authenticate, requireRoles('super_admin'), adminFinanceController.listPayouts);
+// Withdrawals
+mobileRouter.get('/super-admin/withdrawals', authenticate, requireRoles('super_admin'), adminFinanceController.listPayouts);
+mobileRouter.get('/super-admin/withdrawals/:withdrawalId', authenticate, requireRoles('super_admin'), adminFinanceController.getWithdrawal);
+mobileRouter.post('/super-admin/withdrawals/:withdrawalId/approve', authenticate, requireRoles('super_admin'), adminFinanceController.approveWithdrawal);
+mobileRouter.post('/super-admin/withdrawals/:withdrawalId/complete', authenticate, requireRoles('super_admin'), adminFinanceController.completeWithdrawal);
+mobileRouter.post('/super-admin/withdrawals/:withdrawalId/reject', authenticate, requireRoles('super_admin'), adminFinanceController.rejectWithdrawal);
 
 // ------------------------------------------------------------------
 // Super Admin – Reputation

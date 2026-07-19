@@ -735,10 +735,32 @@ async function seedProfileUsage({ customer, driver, garages }) {
   });
 }
 
+async function seedScoreConfigs() {
+  const configs = [
+    { key: 'score.cfaPerPoint', value: 1 },
+    { key: 'score.deliveryCompleted', value: 120 },
+    { key: 'score.commitmentFee', value: 1 },
+    { key: 'score.standardThreshold', value: 100 },
+    { key: 'score.premiumThreshold', value: 500 },
+    { key: 'score.eliteThreshold', value: 1000 },
+    { key: 'score.signupBonus', value: 0 },
+    { key: 'commission.insufficient_rule', value: 'block' }
+  ];
+
+  for (const cfg of configs) {
+    await prisma.systemConfig.upsert({
+      where: { key: cfg.key },
+      update: { value: cfg.value },
+      create: { key: cfg.key, value: cfg.value }
+    });
+  }
+}
+
 async function main() {
   const garages = await seedGarages();
   const users = await seedUsers(garages.dakar);
   await seedProfileUsage({ ...users, garages });
+  await seedScoreConfigs();
 
   console.log('Seed completed');
   console.table(
