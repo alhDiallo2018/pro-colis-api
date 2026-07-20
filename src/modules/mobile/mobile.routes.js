@@ -42,6 +42,11 @@ mobileRouter.post('/driver/location', authenticate, requireRoles('driver'), mobi
 mobileRouter.get('/driver/vehicle', authenticate, requireRoles('driver'), mobileController.getDriverVehicle);
 mobileRouter.put('/driver/vehicle', authenticate, requireRoles('driver'), mobileController.upsertDriverVehicle);
 
+// Commissions cote chauffeur
+mobileRouter.post('/commissions/estimate', optionalAuthenticate, mobileController.estimateCommission);
+mobileRouter.get('/driver/parcels/:parcelId/commission', authenticate, requireRoles('driver'), mobileController.driverParcelCommission);
+mobileRouter.post('/driver/parcels/:parcelId/pay-commission', authenticate, requireRoles('driver'), mobileController.driverPayCommission);
+
 mobileRouter.put('/garage-admin/profile', authenticate, requireRoles('admin'), mobileController.updateProfile);
 mobileRouter.get('/garage-admin/stats', authenticate, requireRoles('admin'), mobileController.garageStats);
 mobileRouter.get('/garage-admin/parcels', authenticate, requireRoles('admin'), mobileController.garageParcels);
@@ -66,6 +71,7 @@ mobileRouter.put('/super-admin/users/:userId', authenticate, requireRoles('super
 mobileRouter.patch('/super-admin/users/:userId/role', authenticate, requireRoles('super_admin'), mobileController.superAdminUpdateUserRole);
 mobileRouter.patch('/super-admin/users/:userId/status', authenticate, requireRoles('super_admin'), mobileController.superAdminUpdateUserStatus);
 mobileRouter.delete('/super-admin/users/:userId', authenticate, requireRoles('super_admin'), mobileController.superAdminDeleteUser);
+mobileRouter.post('/super-admin/users/:userId/reset-pin', authenticate, requireRoles('super_admin'), mobileController.superAdminResetUserPin);
 mobileRouter.get('/super-admin/garages', authenticate, requireRoles('super_admin'), mobileController.superAdminGarages);
 mobileRouter.post('/super-admin/garages', authenticate, requireRoles('super_admin'), mobileController.superAdminCreateGarage);
 mobileRouter.get('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin'), mobileController.superAdminGarageDetail);

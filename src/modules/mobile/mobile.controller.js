@@ -19,7 +19,7 @@ import {
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
 import { attemptDisbursement, toClientWithdrawalStatus } from '../../utils/withdrawal-flow.js';
 import { sendNotificationEmail, sendNotificationSms, sendOtpSms, isBrevoConfigured } from '../../utils/brevo.js';
-import { calculateCommission, deductCashCommission, getCfaPerPoint, getDeliveryPoints, getCommitmentFee } from '../../utils/commission.js';
+import { calculateCommission, calculateCommissionSync, deductCashCommission, getCfaPerPoint, getDeliveryPoints, getCommitmentFee } from '../../utils/commission.js';
 
 const parcelInclude = {
   departureGarage: true,
@@ -2189,3 +2189,303 @@ export const systemHealth = handle('system.health', async (_req, res) => {
   }
 });
 
+
+// ------------------------------------------------------------------
+// Super Admin – Reinitialisation du PIN d'un utilisateur
+// ------------------------------------------------------------------
+
+export const superAdminResetUserPin = handle('super.userResetPin', async (req, res) => {
+  const { userId } = req.params;
+
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user || user.status === 'deleted') throw new NotFoundError('Utilisateur introuvable');
+
+  // PIN aleatoire a 6 chiffres, hashe comme a l'inscription (bcrypt, cout 12).
+  const pin = String(Math.floor(100000 + Math.random() * 900000));
+  const pinHash = await bcrypt.hash(pin, 12);
+
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({ where: { id: userId }, data: { pinHash } });
+
+    await tx.notification.create({
+      data: {
+        userId,
+        type: 'pin_reset',
+        title: 'Code PIN reinitialise',
+        body: 'Votre code PIN a ete reinitialise par un administrateur. Utilisez le nouveau code qui vous a ete communique pour vous connecter.',
+        data: { resetBy: req.user.id },
+        priority: 'high'
+      }
+    });
+
+    await audit(tx, req, {
+      action: 'user.resetPin',
+      entityType: 'user',
+      entityId: userId,
+      afterData: { resetBy: req.user.id }
+    });
+  });
+
+  if (isBrevoConfigured()) {
+    if (user.phone) {
+      sendNotificationSms({
+        phone: user.phone,
+        message: `[PRO COLIS] Votre code PIN a ete reinitialise. Nouveau code : ${pin}. Ne le partagez avec personne.`,
+        tag: 'pin_reset'
+      }).catch(() => {});
+    }
+    if (user.email) {
+      sendNotificationEmail({
+        email: user.email,
+        subject: '[PRO COLIS] Votre code PIN a ete reinitialise',
+        message: `Votre code PIN a ete reinitialise par un administrateur. Nouveau code : ${pin}. Ne le partagez avec personne.`
+      }).catch(() => {});
+    }
+  }
+
+  // Le PIN en clair est renvoye une seule fois pour affichage a l'administrateur.
+  return ok(res, { message: 'PIN reinitialise', data: { pin, newPin: pin } });
+});
+
+// ------------------------------------------------------------------
+// Commissions cote chauffeur
+// ------------------------------------------------------------------
+
+async function activeCommissionConfig(profile = 'local') {
+  const configs = await prisma.commissionConfig.findMany({ where: { isActive: true } });
+  const cfg = configs.find((c) => c.profile === profile) || configs[0];
+  if (!cfg) return { profile, percentage: 5, minAmount: 100, maxAmount: 500 };
+  return {
+    profile: cfg.profile,
+    percentage: Number(cfg.percentage),
+    minAmount: Number(cfg.minAmount),
+    maxAmount: Number(cfg.maxAmount)
+  };
+}
+
+function commissionBreakdown(amount, cfg) {
+  const commission = calculateCommissionSync(amount, cfg.percentage, cfg.minAmount, cfg.maxAmount);
+  return {
+    amount,
+    commission,
+    netAmount: amount - commission,
+    percentage: cfg.percentage,
+    minAmount: cfg.minAmount,
+    maxAmount: cfg.maxAmount,
+    profile: cfg.profile
+  };
+}
+
+export const estimateCommission = handle('commission.estimate', async (req, res) => {
+  const amount = number(req.body.amount);
+  if (amount <= 0) {
+    throw new ValidationError([{ path: 'body.amount', message: 'Le montant doit etre positif' }]);
+  }
+
+  const cfg = await activeCommissionConfig(req.body.profile || 'local');
+  return ok(res, {
+    message: 'Estimation commission',
+    data: { commission: commissionBreakdown(amount, cfg) }
+  });
+});
+
+export const driverParcelCommission = handle('driver.parcelCommission', async (req, res) => {
+  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const amount = Number(parcel.price || parcel.totalAmount || 0);
+  const cfg = await activeCommissionConfig('local');
+  const breakdown = amount > 0
+    ? commissionBreakdown(amount, cfg)
+    : { amount: 0, commission: 0, netAmount: 0, percentage: cfg.percentage, minAmount: cfg.minAmount, maxAmount: cfg.maxAmount, profile: cfg.profile };
+
+  const alreadyPaid = await prisma.walletTransaction.findFirst({
+    where: { parcelId: parcel.id, walletUserId: req.user.id, type: 'commission', status: 'completed' }
+  });
+  const paidWithPoints = alreadyPaid
+    ? null
+    : await prisma.scoreTransaction.findFirst({
+        where: { parcelId: parcel.id, userId: req.user.id, type: 'commission_deduction' }
+      });
+
+  return ok(res, {
+    message: 'Commission du colis',
+    data: {
+      commission: {
+        parcelId: parcel.id,
+        trackingNumber: parcel.trackingNumber,
+        deliveryAmount: breakdown.amount,
+        ...breakdown,
+        alreadyPaid: Boolean(alreadyPaid || paidWithPoints)
+      }
+    }
+  });
+});
+
+export const driverPayCommission = handle('driver.payCommission', async (req, res) => {
+  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const source = req.body.source || 'auto';
+  if (!['auto', 'wallet', 'score'].includes(source)) {
+    throw new ValidationError([{ path: 'body.source', message: 'Source invalide (wallet, score ou auto)' }]);
+  }
+
+  const baseAmount = number(req.body.amount) || Number(parcel.price || parcel.totalAmount || 0);
+  if (baseAmount <= 0) {
+    throw new ValidationError([{ path: 'body.amount', message: 'Montant de livraison introuvable pour ce colis' }]);
+  }
+
+  const cfg = await activeCommissionConfig('local');
+  const commission = calculateCommissionSync(baseAmount, cfg.percentage, cfg.minAmount, cfg.maxAmount);
+
+  const [paidWallet, paidScore] = await Promise.all([
+    prisma.walletTransaction.findFirst({
+      where: { parcelId: parcel.id, walletUserId: req.user.id, type: 'commission', status: 'completed' }
+    }),
+    prisma.scoreTransaction.findFirst({
+      where: { parcelId: parcel.id, userId: req.user.id, type: 'commission_deduction' }
+    })
+  ]);
+  if (paidWallet || paidScore) {
+    throw new ConflictError('La commission de ce colis a deja ete payee');
+  }
+
+  const outcome = await prisma.$transaction(async (tx) => {
+    let walletDebited = 0;
+    let pointsDebited = 0;
+    let transaction = null;
+
+    if (source === 'auto') {
+      let deduction;
+      try {
+        deduction = await deductCashCommission({
+          parcelId: parcel.id,
+          driverId: req.user.id,
+          commission,
+          tx,
+          req
+        });
+      } catch (err) {
+        if (err.code === 'INSUFFICIENT_FUNDS') {
+          throw new ValidationError(
+            [{ path: 'commission', message: 'Ressources insuffisantes. Wallet + Points ne couvrent pas la commission.' }],
+            'Solde insuffisant pour la commission'
+          );
+        }
+        throw err;
+      }
+      walletDebited = deduction.walletDeducted;
+      pointsDebited = deduction.pointsDeducted;
+    } else if (source === 'wallet') {
+      const wallet = await tx.wallet.upsert({
+        where: { userId: req.user.id },
+        update: {},
+        create: { userId: req.user.id }
+      });
+      const balanceBefore = Number(wallet.balance);
+      if (balanceBefore < commission) {
+        throw new ValidationError(
+          [{ path: 'body.source', message: `Solde wallet insuffisant (${balanceBefore} FCFA disponibles)` }],
+          'Solde insuffisant pour la commission'
+        );
+      }
+
+      await tx.wallet.update({
+        where: { userId: req.user.id },
+        data: {
+          balance: { decrement: commission },
+          totalSpent: { increment: commission },
+          totalCommissionsPaid: { increment: commission },
+          lastActivityAt: new Date()
+        }
+      });
+      transaction = await tx.walletTransaction.create({
+        data: {
+          walletUserId: req.user.id,
+          type: 'commission',
+          amount: commission,
+          balanceBefore,
+          balanceAfter: balanceBefore - commission,
+          parcelId: parcel.id,
+          description: `Commission colis ${parcel.trackingNumber} (${commission} FCFA)`,
+          origin: 'driver_payment',
+          status: 'completed'
+        }
+      });
+      walletDebited = commission;
+    } else {
+      // source === 'score' : la commission est convertie en points.
+      const cfaPerPoint = await getCfaPerPoint(tx);
+      const pointsNeeded = Math.ceil(commission / cfaPerPoint);
+      const score = await tx.score.upsert({
+        where: { userId: req.user.id },
+        update: {},
+        create: { userId: req.user.id }
+      });
+      if (score.points < pointsNeeded) {
+        throw new ValidationError(
+          [{ path: 'body.source', message: `Points insuffisants (${score.points} disponibles, ${pointsNeeded} requis)` }],
+          'Points insuffisants pour la commission'
+        );
+      }
+
+      await tx.score.update({
+        where: { userId: req.user.id },
+        data: { points: { decrement: pointsNeeded }, totalSpent: { increment: pointsNeeded }, lastUpdated: new Date() }
+      });
+      await tx.scoreTransaction.create({
+        data: {
+          userId: req.user.id,
+          amount: -pointsNeeded,
+          type: 'commission_deduction',
+          source: 'driver_payment',
+          parcelId: parcel.id,
+          description: `Commission colis ${parcel.trackingNumber} (${pointsNeeded} pts = ${commission} FCFA)`,
+          metadata: { commission, cfaPerPoint }
+        }
+      });
+      pointsDebited = pointsNeeded;
+    }
+
+    await tx.notification.create({
+      data: {
+        userId: req.user.id,
+        type: 'commission_paid',
+        title: 'Commission payee',
+        body: `Commission de ${commission} FCFA payee pour le colis ${parcel.trackingNumber}`
+          + ` (Wallet: ${walletDebited} FCFA, Points: ${pointsDebited} pts).`,
+        data: { parcelId: parcel.id, commission, walletDebited, pointsDebited }
+      }
+    });
+
+    await audit(tx, req, {
+      action: 'commission.pay',
+      entityType: 'parcel',
+      entityId: parcel.id,
+      afterData: { commission, source, walletDebited, pointsDebited }
+    });
+
+    return { walletDebited, pointsDebited, transaction };
+  });
+
+  const [walletAfter, scoreAfter] = await Promise.all([
+    prisma.wallet.findUnique({ where: { userId: req.user.id } }),
+    prisma.score.findUnique({ where: { userId: req.user.id } })
+  ]);
+
+  return ok(res, {
+    message: 'Commission payee',
+    data: {
+      result: {
+        success: true,
+        message: 'Commission payee',
+        commission,
+        walletDebited: outcome.walletDebited,
+        pointsDebited: outcome.pointsDebited,
+        newWalletBalance: walletAfter ? Number(walletAfter.balance) : 0,
+        newScoreBalance: scoreAfter ? scoreAfter.points : 0,
+        debt: null,
+        transaction: outcome.transaction
+          ? { id: outcome.transaction.id, type: outcome.transaction.type, amount: Number(outcome.transaction.amount) }
+          : null
+      }
+    }
+  });
+});

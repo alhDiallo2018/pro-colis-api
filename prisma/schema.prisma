@@ -139,6 +139,11 @@ enum WithdrawalStatus {
   cancelled
 }
 
+enum ZoneType {
+  CIRCLE
+  POLYGON
+}
+
 model User {
   id                   String                 @id @default(uuid()) @db.Uuid
   email                String?                @unique
@@ -204,6 +209,8 @@ model User {
   wallet               Wallet?
   walletTransactions   WalletTransaction[]
   withdrawals          Withdrawal[]
+  driverZones          ZoneDriver[]
+  deviceTokens         DeviceToken[]
 
   @@map("users")
 }
@@ -786,4 +793,57 @@ model Backup {
   requester    User?        @relation(fields: [requestedBy], references: [id], onDelete: SetNull)
 
   @@map("backups")
+}
+
+model Zone {
+  id          String       @id @default(uuid()) @db.Uuid
+  name        String
+  displayName String?      @map("display_name")
+  placeId     String?      @unique @map("place_id")
+  type        ZoneType     @default(CIRCLE)
+  country     String?
+  region      String?
+  city        String?
+  latitude    Decimal      @db.Decimal(10, 7)
+  longitude   Decimal      @db.Decimal(10, 7)
+  radiusKm    Decimal?     @map("radius_km") @db.Decimal(8, 2)
+  boundary    Json?
+  isActive    Boolean      @default(true) @map("is_active")
+  parentId    String?      @map("parent_id") @db.Uuid
+  metadata    Json         @default("{}")
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+  parent      Zone?        @relation("ZoneHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children    Zone[]       @relation("ZoneHierarchy")
+  driverZones ZoneDriver[]
+
+  @@index([isActive])
+  @@index([parentId])
+  @@map("zones")
+}
+
+model ZoneDriver {
+  zoneId    String   @map("zone_id") @db.Uuid
+  driverId  String   @map("driver_id") @db.Uuid
+  isPrimary Boolean  @default(false) @map("is_primary")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  zone      Zone     @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+  driver    User     @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  @@id([zoneId, driverId])
+  @@index([driverId])
+  @@map("zone_drivers")
+}
+
+model DeviceToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  token     String   @unique
+  platform  String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_tokens")
 }
