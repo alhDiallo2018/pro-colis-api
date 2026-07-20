@@ -4,6 +4,7 @@ import { ok, fail } from '../utils/api-response.js';
 import { getPagination, paginationMeta } from '../utils/pagination.js';
 import { serializeUser } from '../utils/mobile-serializers.js';
 import { ValidationError, NotFoundError, normalizeError } from '../utils/errors.js';
+import { attemptDisbursement, toClientWithdrawalStatus, fromClientWithdrawalStatus } from '../utils/withdrawal-flow.js';
 
 function decimal(value, fallback = null) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -613,7 +614,7 @@ export const listPayouts = handle('finance.listPayouts', async (req, res) => {
   const { status, method } = req.query;
 
   const where = cleanUndefined({
-    status,
+    status: fromClientWithdrawalStatus(status),
     method
   });
 
@@ -628,17 +629,15 @@ export const listPayouts = handle('finance.listPayouts', async (req, res) => {
     })
   ]);
 
-  return ok(res, {
-    message: 'Retraits',
-    data: {
-      payouts: withdrawals.map((w) => ({
+  const mappedPayouts = withdrawals.map((w) => ({
         id: w.id,
         userId: w.walletUserId,
         driver: w.wallet?.user ? { id: w.wallet.user.id, fullName: w.wallet.user.fullName, phone: w.wallet.user.phone } : null,
         amount: number(w.amount),
         method: w.method,
         phone: w.phone,
-        status: w.status,
+        phoneNumber: w.phone,
+        status: toClientWithdrawalStatus(w.status),
         reference: w.reference,
         failureReason: w.failureReason,
         requestedAt: w.requestedAt,
@@ -647,7 +646,13 @@ export const listPayouts = handle('finance.listPayouts', async (req, res) => {
         processedAt: w.processedAt,
         completedAt: w.completedAt,
         createdAt: w.createdAt
-      }))
+  }));
+
+  return ok(res, {
+    message: 'Retraits',
+    data: {
+      withdrawals: mappedPayouts,
+      payouts: mappedPayouts
     },
     meta: paginationMeta({ page, limit, total })
   });
@@ -673,8 +678,11 @@ export const getWithdrawal = handle('finance.getWithdrawal', async (req, res) =>
         amount: number(withdrawal.amount),
         method: withdrawal.method,
         phone: withdrawal.phone,
-        status: withdrawal.status,
+        phoneNumber: withdrawal.phone,
+        status: toClientWithdrawalStatus(withdrawal.status),
         reference: withdrawal.reference,
+        transactionId: withdrawal.transactionId,
+        providerRef: withdrawal.providerRef,
         failureReason: withdrawal.failureReason,
         requestedAt: withdrawal.requestedAt,
         processedBy: withdrawal.processedBy,
@@ -731,7 +739,18 @@ export const approveWithdrawal = handle('finance.approveWithdrawal', async (req,
     return updated;
   });
 
-  return ok(res, { message: 'Retrait approuve', data: { status: result.status } });
+  // Déboursement PayDunya automatique (API PUSH) — sinon versement manuel puis /complete.
+  const disbursed = await attemptDisbursement(result.id, req.log);
+  const final = disbursed ?? result;
+  return ok(res, {
+    message:
+      final.status === 'completed'
+        ? 'Retrait approuve et verse via PayDunya'
+        : final.status === 'failed'
+          ? `Deboursement echoue : ${final.failureReason ?? 'erreur prestataire'} (montant recredite)`
+          : 'Retrait approuve',
+    data: { status: toClientWithdrawalStatus(final.status), withdrawal: { id: final.id, status: toClientWithdrawalStatus(final.status), failureReason: final.failureReason ?? null } }
+  });
 });
 
 export const completeWithdrawal = handle('finance.completeWithdrawal', async (req, res) => {
@@ -787,7 +806,7 @@ export const completeWithdrawal = handle('finance.completeWithdrawal', async (re
     return withdrawal;
   });
 
-  return ok(res, { message: 'Retrait complete', data: { status: result.status } });
+  return ok(res, { message: 'Retrait complete', data: { status: 'SUCCESS' } });
 });
 
 export const rejectWithdrawal = handle('finance.rejectWithdrawal', async (req, res) => {
@@ -845,5 +864,5 @@ export const rejectWithdrawal = handle('finance.rejectWithdrawal', async (req, r
     return withdrawal;
   });
 
-  return ok(res, { message: 'Retrait refuse', data: { status: result.status } });
+  return ok(res, { message: 'Retrait refuse', data: { status: toClientWithdrawalStatus(result.status) } });
 });

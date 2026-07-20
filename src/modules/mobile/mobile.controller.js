@@ -17,6 +17,7 @@ import {
   serializeUser
 } from '../../utils/mobile-serializers.js';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
+import { attemptDisbursement, toClientWithdrawalStatus } from '../../utils/withdrawal-flow.js';
 import { sendNotificationEmail, sendNotificationSms, sendOtpSms, isBrevoConfigured } from '../../utils/brevo.js';
 import { calculateCommission, deductCashCommission, getCfaPerPoint, getDeliveryPoints, getCommitmentFee } from '../../utils/commission.js';
 
@@ -1162,18 +1163,30 @@ export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
     return withdrawal;
   });
 
+  // Retrait libre-service : déboursement PayDunya immédiat (API PUSH) quand configuré.
+  // Sans clés PayDunya, le retrait reste en attente de traitement admin.
+  const disbursed = await attemptDisbursement(result.id, req.log);
+  const final = disbursed ?? result;
+
   return ok(res, {
     status: 201,
-    message: 'Demande de retrait enregistree',
+    message:
+      final.status === 'completed'
+        ? 'Retrait effectue — votre argent est en route'
+        : final.status === 'failed'
+          ? `Retrait echoue : ${final.failureReason ?? 'erreur du prestataire'} (montant recredite)`
+          : 'Demande de retrait enregistree',
     data: {
       withdrawal: {
-        id: result.id,
-        amount: number(result.amount),
-        method: result.method,
-        phone: result.phone,
-        status: result.status,
-        reference: result.reference,
-        requestedAt: result.requestedAt
+        id: final.id,
+        amount: number(final.amount),
+        method: final.method,
+        phone: final.phone,
+        phoneNumber: final.phone,
+        status: toClientWithdrawalStatus(final.status),
+        reference: final.reference,
+        failureReason: final.failureReason ?? null,
+        requestedAt: final.requestedAt
       }
     }
   });
@@ -1201,7 +1214,8 @@ export const getDriverWithdrawals = handle('driver.withdrawals.list', async (req
         amount: number(w.amount),
         method: w.method,
         phone: w.phone,
-        status: w.status,
+        phoneNumber: w.phone,
+        status: toClientWithdrawalStatus(w.status),
         reference: w.reference,
         failureReason: w.failureReason,
         requestedAt: w.requestedAt,
@@ -1252,7 +1266,7 @@ export const cancelWithdrawal = handle('driver.withdrawal.cancel', async (req, r
     });
   });
 
-  return ok(res, { message: 'Retrait annule', data: { status: 'cancelled' } });
+  return ok(res, { message: 'Retrait annule', data: { status: 'CANCELLED', withdrawal: { id: withdrawalId, status: 'CANCELLED' } } });
 });
 
 export const getScoreHistory = handle('score.history', async (req, res) => {

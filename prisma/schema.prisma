@@ -497,6 +497,9 @@ model Withdrawal {
   status            WithdrawalStatus @default(pending)
   reference         String?          @unique
   failureReason     String?          @map("failure_reason")
+  disburseToken     String?          @unique @map("disburse_token")
+  transactionId     String?          @map("transaction_id")
+  providerRef       String?          @map("provider_ref")
   requestedAt       DateTime         @default(now()) @map("requested_at") @db.Timestamptz
   processedBy       String?          @map("processed_by") @db.Uuid
   processedAt       DateTime?        @map("processed_at") @db.Timestamptz

@@ -393,3 +393,36 @@ export const paydunyaCancel = (_req, res) => {
   const frontUrl = env.CORS_ORIGIN === '*' ? 'http://localhost:5173' : (env.CORS_ORIGIN || '').split(',')[0]
   return res.redirect(`${frontUrl}/client/colis?payment=cancelled`)
 }
+
+// --- Callback de déboursement (API PUSH) ---
+// PayDunya notifie le statut final d'un retrait ; `hash` = SHA-512 de la MasterKey.
+// Doc : https://developers.paydunya.com/doc/FR/api_deboursement
+export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', async (req, res) => {
+  const { verifyCallbackHash } = await import('../utils/paydunya-disburse.js')
+  const { finalizeWithdrawalSuccess, failWithdrawal } = await import('../utils/withdrawal-flow.js')
+
+  const payload = req.body ?? {}
+  if (!verifyCallbackHash(payload.hash)) {
+    req.log?.warn?.({ requestId: req.requestId }, 'PayDunya disburse callback rejected: invalid hash')
+    return fail(res, { status: 403, message: 'Signature invalide', code: 'FORBIDDEN' })
+  }
+
+  const token = String(payload.token ?? payload.disburse_invoice ?? '').trim()
+  const withdrawal = token
+    ? await prisma.withdrawal.findUnique({ where: { disburseToken: token } })
+    : payload.disburse_id
+      ? await prisma.withdrawal.findFirst({ where: { reference: String(payload.disburse_id) } })
+      : null
+  if (!withdrawal) return ok(res, { message: 'Transaction inconnue' })
+
+  const status = String(payload.status ?? '').toLowerCase()
+  if (status === 'success') {
+    await finalizeWithdrawalSuccess(withdrawal.id, {
+      transactionId: payload.transaction_id ?? null,
+      providerRef: payload.disburse_tx_id ?? null
+    })
+  } else if (status === 'failed') {
+    await failWithdrawal(withdrawal.id, 'Transaction refusée par l’opérateur (callback)')
+  }
+  return ok(res, { message: 'Callback traité' })
+})

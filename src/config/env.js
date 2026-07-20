@@ -23,6 +23,7 @@ const envSchema = z.object({
   PAYDUNYA_TOKEN: z.string().optional(),
   PAYDUNYA_MODE: z.enum(['test', 'live']).default('test'),
   PAYDUNYA_STORE_NAME: z.string().default('ProColis'),
+  PAYDUNYA_DISBURSE_BASE_URL: z.string().url().default('https://app.paydunya.com/api/v2/disburse'),
   BREVO_API_KEY: z.string().optional(),
   BREVO_SENDER_EMAIL: z.string().email().optional(),
   BREVO_SENDER_NAME: z.string().optional(),

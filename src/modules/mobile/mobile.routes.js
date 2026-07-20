@@ -152,6 +152,7 @@ mobileRouter.get('/payments/paydunya/confirm/:token', authenticate, paydunyaCont
 mobileRouter.post('/payments/paydunya/ipn', paydunyaController.paydunyaIpn);
 mobileRouter.get('/payments/paydunya/return', paydunyaController.paydunyaReturn);
 mobileRouter.get('/payments/paydunya/cancel', paydunyaController.paydunyaCancel);
+mobileRouter.post('/payments/paydunya/disburse-callback', paydunyaController.paydunyaDisburseCallback);
 
 mobileRouter.get('/coupons/available', authenticate, mobileController.availableCoupons);
 mobileRouter.get('/search/parcels', authenticate, mobileController.searchParcels);
