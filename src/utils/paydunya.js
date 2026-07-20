@@ -1,32 +1,14 @@
 import { createHash } from 'node:crypto'
 import { env } from '../config/env.js'
 import { prisma } from '../config/prisma.js'
+import { loadPaydunyaConfig, paydunyaConfigSnapshot } from './paydunya-config.js'
 
 const SANDBOX_API = 'https://app.paydunya.com/sandbox-api/v1'
 const PROD_API = 'https://app.paydunya.com/api/v1'
 
+// La config en base (gérable par l'admin) prime sur l'env — chargeur partagé.
 async function getConfig() {
-  if (env.PAYDUNYA_MASTER_KEY && env.PAYDUNYA_PRIVATE_KEY && env.PAYDUNYA_TOKEN) {
-    return {
-      masterKey: env.PAYDUNYA_MASTER_KEY,
-      privateKey: env.PAYDUNYA_PRIVATE_KEY,
-      token: env.PAYDUNYA_TOKEN,
-      mode: env.PAYDUNYA_MODE || 'test'
-    }
-  }
-
-  const rows = await prisma.systemConfig.findMany({
-    where: { key: { startsWith: 'paydunya.' } }
-  })
-  const cfg = {}
-  for (const row of rows) cfg[row.key] = row.value
-
-  return {
-    masterKey: cfg['paydunya.masterKey'] ?? '',
-    privateKey: cfg['paydunya.privateKey'] ?? '',
-    token: cfg['paydunya.token'] ?? '',
-    mode: cfg['paydunya.mode'] ?? 'test'
-  }
+  return loadPaydunyaConfig()
 }
 
 async function api(config, method, path, body) {
@@ -78,7 +60,7 @@ export async function createInvoice({
       description: description || `Paiement de ${amount} FCFA`
     },
     store: {
-      name: env.PAYDUNYA_STORE_NAME || 'ProColis'
+      name: paydunyaConfigSnapshot().storeName
     },
     actions: {}
   }

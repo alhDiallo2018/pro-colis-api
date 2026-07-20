@@ -426,3 +426,89 @@ export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', asyn
   }
   return ok(res, { message: 'Callback traité' })
 })
+
+// --- Config PayDunya gérable par le super admin (SystemConfig "paydunya.*") ---
+// Les clés sont des secrets financiers : masquées en lecture (4 derniers caractères).
+const PAYDUNYA_CONFIG_FIELDS = ['masterKey', 'privateKey', 'token', 'mode', 'storeName']
+const PAYDUNYA_SECRET_FIELDS = ['masterKey', 'privateKey', 'token']
+
+function maskSecret(value) {
+  const v = String(value ?? '')
+  if (!v) return ''
+  return v.length <= 4 ? '****' : `****${v.slice(-4)}`
+}
+
+export const getPaydunyaAdminConfig = handle('paydunya.configGet', async (_req, res) => {
+  const { loadPaydunyaConfig } = await import('../utils/paydunya-config.js')
+  const cfg = await loadPaydunyaConfig(true)
+  return ok(res, {
+    message: 'Configuration PayDunya',
+    data: {
+      config: {
+        masterKey: maskSecret(cfg.masterKey),
+        privateKey: maskSecret(cfg.privateKey),
+        token: maskSecret(cfg.token),
+        mode: cfg.mode,
+        storeName: cfg.storeName,
+        configured: Boolean(cfg.masterKey && cfg.privateKey && cfg.token)
+      }
+    }
+  })
+})
+
+export const updatePaydunyaAdminConfig = handle('paydunya.configUpdate', async (req, res) => {
+  const { invalidatePaydunyaConfigCache, loadPaydunyaConfig } = await import('../utils/paydunya-config.js')
+
+  const patch = {}
+  for (const field of PAYDUNYA_CONFIG_FIELDS) {
+    const value = req.body[field]
+    if (value === undefined) continue
+    // Une valeur masquée renvoyée telle quelle par l'écran admin est ignorée.
+    if (PAYDUNYA_SECRET_FIELDS.includes(field) && String(value).startsWith('****')) continue
+    patch[field] = String(value)
+  }
+  if (patch.mode && !['test', 'live'].includes(patch.mode)) {
+    throw new ValidationError([{ path: 'body.mode', message: 'mode doit être "test" ou "live"' }])
+  }
+  if (Object.keys(patch).length === 0) {
+    throw new ValidationError([{ path: 'body', message: 'Au moins un paramètre requis' }])
+  }
+
+  await prisma.$transaction([
+    ...Object.entries(patch).map(([field, value]) =>
+      prisma.systemConfig.upsert({
+        where: { key: `paydunya.${field}` },
+        update: { value, updatedBy: req.user.id, updatedAt: new Date() },
+        create: { key: `paydunya.${field}`, value, updatedBy: req.user.id }
+      })
+    ),
+    prisma.auditLog.create({
+      data: {
+        actorId: req.user.id,
+        actorRole: req.user.role,
+        action: 'paydunya.configUpdate',
+        entityType: 'system_config',
+        afterData: { keys: Object.keys(patch) }, // jamais les valeurs en clair dans l'audit
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+        requestId: req.requestId
+      }
+    })
+  ])
+
+  invalidatePaydunyaConfigCache()
+  const cfg = await loadPaydunyaConfig(true)
+  return ok(res, {
+    message: 'Configuration PayDunya mise à jour',
+    data: {
+      config: {
+        masterKey: maskSecret(cfg.masterKey),
+        privateKey: maskSecret(cfg.privateKey),
+        token: maskSecret(cfg.token),
+        mode: cfg.mode,
+        storeName: cfg.storeName,
+        configured: Boolean(cfg.masterKey && cfg.privateKey && cfg.token)
+      }
+    }
+  })
+})

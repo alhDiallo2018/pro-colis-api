@@ -159,6 +159,8 @@ mobileRouter.post('/payments/paydunya/ipn', paydunyaController.paydunyaIpn);
 mobileRouter.get('/payments/paydunya/return', paydunyaController.paydunyaReturn);
 mobileRouter.get('/payments/paydunya/cancel', paydunyaController.paydunyaCancel);
 mobileRouter.post('/payments/paydunya/disburse-callback', paydunyaController.paydunyaDisburseCallback);
+mobileRouter.get('/admin/payments/paydunya-config', authenticate, requireRoles('super_admin'), paydunyaController.getPaydunyaAdminConfig);
+mobileRouter.put('/admin/payments/paydunya-config', authenticate, requireRoles('super_admin'), paydunyaController.updatePaydunyaAdminConfig);
 
 mobileRouter.get('/coupons/available', authenticate, mobileController.availableCoupons);
 mobileRouter.get('/search/parcels', authenticate, mobileController.searchParcels);

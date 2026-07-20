@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { env } from '../config/env.js';
+import { loadPaydunyaConfig, paydunyaConfigSnapshot } from './paydunya-config.js';
 
 /**
  * Client de l'API de déboursement PayDunya (API PUSH).
@@ -19,7 +20,8 @@ const WITHDRAW_MODES = {
 };
 
 export function isPaydunyaConfigured() {
-  return Boolean(env.PAYDUNYA_MASTER_KEY && env.PAYDUNYA_PRIVATE_KEY && env.PAYDUNYA_TOKEN);
+  const cfg = paydunyaConfigSnapshot();
+  return Boolean(cfg.masterKey && cfg.privateKey && cfg.token);
 }
 
 export function withdrawModeFor(method) {
@@ -37,19 +39,20 @@ export function toAccountAlias(phone) {
   return digits;
 }
 
-function headers() {
+async function headers() {
+  const cfg = await loadPaydunyaConfig();
   return {
     'Content-Type': 'application/json',
-    'PAYDUNYA-MASTER-KEY': env.PAYDUNYA_MASTER_KEY,
-    'PAYDUNYA-PRIVATE-KEY': env.PAYDUNYA_PRIVATE_KEY,
-    'PAYDUNYA-TOKEN': env.PAYDUNYA_TOKEN
+    'PAYDUNYA-MASTER-KEY': cfg.masterKey,
+    'PAYDUNYA-PRIVATE-KEY': cfg.privateKey,
+    'PAYDUNYA-TOKEN': cfg.token
   };
 }
 
 async function post(path, body) {
   const response = await fetch(`${env.PAYDUNYA_DISBURSE_BASE_URL}${path}`, {
     method: 'POST',
-    headers: headers(),
+    headers: await headers(),
     body: JSON.stringify(body)
   });
   let data = null;
@@ -122,8 +125,9 @@ export async function checkStatus(disburseToken) {
  * que la notification provient bien de leurs serveurs.
  */
 export function verifyCallbackHash(hash) {
-  if (!env.PAYDUNYA_MASTER_KEY || !hash) return false;
-  const expected = createHash('sha512').update(env.PAYDUNYA_MASTER_KEY).digest('hex');
+  const { masterKey } = paydunyaConfigSnapshot();
+  if (!masterKey || !hash) return false;
+  const expected = createHash('sha512').update(masterKey).digest('hex');
   return String(hash).toLowerCase() === expected;
 }
 
