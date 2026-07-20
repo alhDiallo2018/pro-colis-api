@@ -8,7 +8,8 @@ import {
   sendSms,
   getSenderEmail,
   getSenderName,
-  getSmsSender
+  getSmsSender,
+  invalidateBrevoConfigCache
 } from '../../utils/brevo.js';
 
 const BREVO_CONFIG_KEY = 'brevo';
@@ -74,7 +75,7 @@ export const sendSmsMessage = handle('notifications.smsSend', async (req, res) =
     return fail(res, { status: 503, message: 'Brevo non configure', code: 'BREVO_NOT_CONFIGURED' });
   }
 
-  const result = await sendSms({ to, content, tag: req.body.tag || 'manual' });
+  const result = await sendSms({ to, content, tag: req.body.tag || 'manual', sender: req.body.senderName || req.body.sender });
   if (!result) {
     return fail(res, { status: 502, message: 'Echec de l\'envoi du SMS', code: 'SMS_SEND_FAILED' });
   }
@@ -181,6 +182,9 @@ export const updateBrevoConfig = handle('notifications.brevoConfigUpdate', async
       }
     })
   ]);
+
+  // La config en base prime sur l'env : prise en compte immédiate pour les envois.
+  invalidateBrevoConfigCache();
 
   const config = { ...defaultBrevoConfig(), ...value };
   return ok(res, { message: 'Configuration Brevo mise a jour', data: { config } });
