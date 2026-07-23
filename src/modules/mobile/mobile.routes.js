@@ -1,10 +1,10 @@
 import { Router } from 'express';
 import { authenticate, optionalAuthenticate } from '../../middlewares/auth.middleware.js';
 import { requireRoles } from '../../middlewares/rbac.middleware.js';
-import * as mobileController from './mobile.controller.js';
 import * as adminFinanceController from '../admin-finance.controller.js';
 import * as adminReputationController from '../admin-reputation.controller.js';
 import * as paydunyaController from '../paydunya.controller.js';
+import * as mobileController from './mobile.controller.js';
 
 export const mobileRouter = Router();
 
@@ -61,38 +61,38 @@ mobileRouter.get('/garage-admin/reports/daily', authenticate, requireRoles('admi
 mobileRouter.get('/garage-admin/reports/monthly', authenticate, requireRoles('admin'), mobileController.garageMonthlyReport);
 mobileRouter.get('/garage-admin/reports/export', authenticate, requireRoles('admin'), mobileController.garageExport);
 
-mobileRouter.put('/super-admin/profile', authenticate, requireRoles('super_admin'), mobileController.updateProfile);
-mobileRouter.get('/super-admin/stats', authenticate, requireRoles('super_admin'), mobileController.superAdminStats);
-mobileRouter.get('/super-admin/stats/advanced', authenticate, requireRoles('super_admin'), mobileController.superAdminStats);
-mobileRouter.get('/super-admin/users', authenticate, requireRoles('super_admin'), mobileController.superAdminUsers);
-mobileRouter.post('/super-admin/users', authenticate, requireRoles('super_admin'), mobileController.superAdminCreateUser);
-mobileRouter.get('/super-admin/users/:userId', authenticate, requireRoles('super_admin'), mobileController.superAdminUserDetail);
-mobileRouter.put('/super-admin/users/:userId', authenticate, requireRoles('super_admin'), mobileController.superAdminUpdateUser);
-mobileRouter.patch('/super-admin/users/:userId/role', authenticate, requireRoles('super_admin'), mobileController.superAdminUpdateUserRole);
-mobileRouter.patch('/super-admin/users/:userId/status', authenticate, requireRoles('super_admin'), mobileController.superAdminUpdateUserStatus);
-mobileRouter.delete('/super-admin/users/:userId', authenticate, requireRoles('super_admin'), mobileController.superAdminDeleteUser);
-mobileRouter.post('/super-admin/users/:userId/reset-pin', authenticate, requireRoles('super_admin'), mobileController.superAdminResetUserPin);
-mobileRouter.get('/super-admin/garages', authenticate, requireRoles('super_admin'), mobileController.superAdminGarages);
-mobileRouter.post('/super-admin/garages', authenticate, requireRoles('super_admin'), mobileController.superAdminCreateGarage);
-mobileRouter.get('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin'), mobileController.superAdminGarageDetail);
-mobileRouter.put('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin'), mobileController.superAdminUpdateGarage);
-mobileRouter.delete('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin'), mobileController.superAdminDeleteGarage);
-mobileRouter.get('/super-admin/parcels', authenticate, requireRoles('super_admin'), mobileController.superAdminParcels);
-mobileRouter.post('/super-admin/parcels/create', authenticate, requireRoles('super_admin'), mobileController.createParcel);
-mobileRouter.get('/super-admin/parcels/:parcelId', authenticate, requireRoles('super_admin'), mobileController.getParcelDetail);
-mobileRouter.put('/super-admin/parcels/:parcelId', authenticate, requireRoles('super_admin'), mobileController.superAdminUpdateParcel);
-mobileRouter.put('/super-admin/parcels/:parcelId/status', authenticate, requireRoles('super_admin'), mobileController.updateParcelStatus);
-mobileRouter.delete('/super-admin/parcels/:parcelId', authenticate, requireRoles('super_admin'), mobileController.cancelParcel);
-mobileRouter.get('/super-admin/reports/daily', authenticate, requireRoles('super_admin'), mobileController.superAdminDailyReport);
-mobileRouter.get('/super-admin/reports/monthly', authenticate, requireRoles('super_admin'), mobileController.superAdminMonthlyReport);
-mobileRouter.get('/super-admin/export', authenticate, requireRoles('super_admin'), mobileController.superAdminExport);
-mobileRouter.get('/super-admin/audit-logs', authenticate, requireRoles('super_admin'), mobileController.auditLogs);
-mobileRouter.get('/super-admin/config', authenticate, requireRoles('super_admin'), mobileController.getSystemConfig);
-mobileRouter.put('/super-admin/config', authenticate, requireRoles('super_admin'), mobileController.updateSystemConfig);
-mobileRouter.post('/super-admin/backup', authenticate, requireRoles('super_admin'), mobileController.createBackup);
-mobileRouter.get('/super-admin/backups', authenticate, requireRoles('super_admin'), mobileController.listBackups);
-mobileRouter.post('/super-admin/restore', authenticate, requireRoles('super_admin'), mobileController.restoreBackup);
-mobileRouter.get('/super-admin/system/health', authenticate, requireRoles('super_admin'), mobileController.systemHealth);
+mobileRouter.put('/super-admin/profile', authenticate, requireRoles('super_admin', 'support'), mobileController.updateProfile);
+mobileRouter.get('/super-admin/stats', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminStats);
+mobileRouter.get('/super-admin/stats/advanced', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminStats);
+mobileRouter.get('/super-admin/users', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUsers);
+mobileRouter.post('/super-admin/users', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminCreateUser);
+mobileRouter.get('/super-admin/users/:userId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUserDetail);
+mobileRouter.put('/super-admin/users/:userId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateUser);
+mobileRouter.patch('/super-admin/users/:userId/role', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateUserRole);
+mobileRouter.patch('/super-admin/users/:userId/status', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateUserStatus);
+mobileRouter.delete('/super-admin/users/:userId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminDeleteUser);
+mobileRouter.post('/super-admin/users/:userId/reset-pin', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminResetUserPin);
+mobileRouter.get('/super-admin/garages', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminGarages);
+mobileRouter.post('/super-admin/garages', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminCreateGarage);
+mobileRouter.get('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminGarageDetail);
+mobileRouter.put('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateGarage);
+mobileRouter.delete('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminDeleteGarage);
+mobileRouter.get('/super-admin/parcels', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminParcels);
+mobileRouter.post('/super-admin/parcels/create', authenticate, requireRoles('super_admin', 'support'), mobileController.createParcel);
+mobileRouter.get('/super-admin/parcels/:parcelId', authenticate, requireRoles('super_admin', 'support'), mobileController.getParcelDetail);
+mobileRouter.put('/super-admin/parcels/:parcelId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateParcel);
+mobileRouter.put('/super-admin/parcels/:parcelId/status', authenticate, requireRoles('super_admin', 'support'), mobileController.updateParcelStatus);
+mobileRouter.delete('/super-admin/parcels/:parcelId', authenticate, requireRoles('super_admin', 'support'), mobileController.cancelParcel);
+mobileRouter.get('/super-admin/reports/daily', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminDailyReport);
+mobileRouter.get('/super-admin/reports/monthly', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminMonthlyReport);
+mobileRouter.get('/super-admin/export', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminExport);
+mobileRouter.get('/super-admin/audit-logs', authenticate, requireRoles('super_admin', 'support'), mobileController.auditLogs);
+mobileRouter.get('/super-admin/config', authenticate, requireRoles('super_admin', 'support'), mobileController.getSystemConfig);
+mobileRouter.put('/super-admin/config', authenticate, requireRoles('super_admin', 'support'), mobileController.updateSystemConfig);
+mobileRouter.post('/super-admin/backup', authenticate, requireRoles('super_admin', 'support'), mobileController.createBackup);
+mobileRouter.get('/super-admin/backups', authenticate, requireRoles('super_admin', 'support'), mobileController.listBackups);
+mobileRouter.post('/super-admin/restore', authenticate, requireRoles('super_admin', 'support'), mobileController.restoreBackup);
+mobileRouter.get('/super-admin/system/health', authenticate, requireRoles('super_admin', 'support'), mobileController.systemHealth);
 
 mobileRouter.post('/vehicles', authenticate, requireRoles('admin', 'super_admin'), mobileController.createVehicle);
 mobileRouter.get('/vehicles', authenticate, requireRoles('admin', 'super_admin'), mobileController.listVehicles);
@@ -115,7 +115,7 @@ mobileRouter.post('/parcels/estimate', optionalAuthenticate, mobileController.es
 
 mobileRouter.post('/payments/initiate', authenticate, mobileController.initiatePayment);
 mobileRouter.post('/payments/:paymentId/confirm', authenticate, mobileController.confirmPayment);
-mobileRouter.post('/super-admin/parcels/:parcelId/confirm-cash', authenticate, requireRoles('super_admin'), mobileController.confirmCashPayment);
+mobileRouter.post('/super-admin/parcels/:parcelId/confirm-cash', authenticate, requireRoles('super_admin', 'support'), mobileController.confirmCashPayment);
 mobileRouter.get('/payments/history', authenticate, mobileController.paymentHistory);
 
 mobileRouter.get('/score', authenticate, mobileController.getScore);
@@ -149,6 +149,27 @@ mobileRouter.patch('/messages/:messageId/read', authenticate, mobileController.r
 
 mobileRouter.post('/support/messages', authenticate, mobileController.createSupportMessage);
 mobileRouter.get('/support/messages', authenticate, mobileController.listSupportMessages);
+// Admin routes for support
+mobileRouter.get(
+    '/messages/admin/support/conversations',
+    authenticate,
+    requireRoles('super_admin', 'admin', 'support'),
+    mobileController.adminSupportConversations
+);
+
+mobileRouter.get(
+    '/messages/admin/support/conversations/:supportUserId/:userId',
+    authenticate,
+    requireRoles('super_admin', 'admin', 'support'),
+    mobileController.adminSupportThread
+);
+
+mobileRouter.post(
+    '/messages/admin/support/reply',
+    authenticate,
+    requireRoles('super_admin', 'admin', 'support'),
+    mobileController.adminSupportReply
+);
 mobileRouter.post('/ratings', authenticate, mobileController.createRating);
 mobileRouter.get('/ratings/driver/:driverId', optionalAuthenticate, mobileController.driverRatings);
 
@@ -159,8 +180,8 @@ mobileRouter.post('/payments/paydunya/ipn', paydunyaController.paydunyaIpn);
 mobileRouter.get('/payments/paydunya/return', paydunyaController.paydunyaReturn);
 mobileRouter.get('/payments/paydunya/cancel', paydunyaController.paydunyaCancel);
 mobileRouter.post('/payments/paydunya/disburse-callback', paydunyaController.paydunyaDisburseCallback);
-mobileRouter.get('/admin/payments/paydunya-config', authenticate, requireRoles('super_admin'), paydunyaController.getPaydunyaAdminConfig);
-mobileRouter.put('/admin/payments/paydunya-config', authenticate, requireRoles('super_admin'), paydunyaController.updatePaydunyaAdminConfig);
+mobileRouter.get('/admin/payments/paydunya-config', authenticate, requireRoles('super_admin', 'support'), paydunyaController.getPaydunyaAdminConfig);
+mobileRouter.put('/admin/payments/paydunya-config', authenticate, requireRoles('super_admin', 'support'), paydunyaController.updatePaydunyaAdminConfig);
 
 mobileRouter.get('/coupons/available', authenticate, mobileController.availableCoupons);
 mobileRouter.get('/search/parcels', authenticate, mobileController.searchParcels);
@@ -184,45 +205,45 @@ mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/accept', aut
 mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/reject', authenticate, mobileController.rejectAdvertisementOffer);
 mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/negotiate', authenticate, mobileController.negotiateAdvertisementOffer);
 
-mobileRouter.get('/webhooks', authenticate, requireRoles('super_admin'), mobileController.listWebhooks);
-mobileRouter.post('/webhooks', authenticate, requireRoles('super_admin'), mobileController.createWebhook);
-mobileRouter.delete('/webhooks/:webhookId', authenticate, requireRoles('super_admin'), mobileController.deleteWebhook);
+mobileRouter.get('/webhooks', authenticate, requireRoles('super_admin', 'support'), mobileController.listWebhooks);
+mobileRouter.post('/webhooks', authenticate, requireRoles('super_admin', 'support'), mobileController.createWebhook);
+mobileRouter.delete('/webhooks/:webhookId', authenticate, requireRoles('super_admin', 'support'), mobileController.deleteWebhook);
 
 // ------------------------------------------------------------------
 // Super Admin – Finance
 // ------------------------------------------------------------------
-mobileRouter.get('/super-admin/finance/dashboard', authenticate, requireRoles('super_admin'), adminFinanceController.financeDashboard);
+mobileRouter.get('/super-admin/finance/dashboard', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.financeDashboard);
 // Wallets
-mobileRouter.get('/super-admin/wallets', authenticate, requireRoles('super_admin'), adminFinanceController.listWallets);
-mobileRouter.get('/super-admin/wallets/:userId', authenticate, requireRoles('super_admin'), adminFinanceController.getWallet);
-mobileRouter.post('/super-admin/wallets/:userId/recharge', authenticate, requireRoles('super_admin'), adminFinanceController.rechargeWallet);
-mobileRouter.post('/super-admin/wallets/:userId/debit', authenticate, requireRoles('super_admin'), adminFinanceController.debitWallet);
-mobileRouter.get('/super-admin/wallets/:userId/transactions', authenticate, requireRoles('super_admin'), adminFinanceController.walletTransactions);
+mobileRouter.get('/super-admin/wallets', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.listWallets);
+mobileRouter.get('/super-admin/wallets/:userId', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.getWallet);
+mobileRouter.post('/super-admin/wallets/:userId/recharge', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.rechargeWallet);
+mobileRouter.post('/super-admin/wallets/:userId/debit', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.debitWallet);
+mobileRouter.get('/super-admin/wallets/:userId/transactions', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.walletTransactions);
 // Commissions
-mobileRouter.get('/super-admin/commissions/config', authenticate, requireRoles('super_admin'), adminFinanceController.getCommissionConfig);
-mobileRouter.put('/super-admin/commissions/config', authenticate, requireRoles('super_admin'), adminFinanceController.updateCommissionConfig);
-mobileRouter.post('/super-admin/commissions/simulate', authenticate, requireRoles('super_admin'), adminFinanceController.simulateCommission);
+mobileRouter.get('/super-admin/commissions/config', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.getCommissionConfig);
+mobileRouter.put('/super-admin/commissions/config', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.updateCommissionConfig);
+mobileRouter.post('/super-admin/commissions/simulate', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.simulateCommission);
 // Payments
-mobileRouter.get('/super-admin/payments', authenticate, requireRoles('super_admin'), adminFinanceController.listPayments);
-mobileRouter.get('/super-admin/payments/:paymentId', authenticate, requireRoles('super_admin'), adminFinanceController.getPayment);
+mobileRouter.get('/super-admin/payments', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.listPayments);
+mobileRouter.get('/super-admin/payments/:paymentId', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.getPayment);
 // Withdrawals
-mobileRouter.get('/super-admin/withdrawals', authenticate, requireRoles('super_admin'), adminFinanceController.listPayouts);
-mobileRouter.get('/super-admin/withdrawals/:withdrawalId', authenticate, requireRoles('super_admin'), adminFinanceController.getWithdrawal);
-mobileRouter.post('/super-admin/withdrawals/:withdrawalId/approve', authenticate, requireRoles('super_admin'), adminFinanceController.approveWithdrawal);
-mobileRouter.post('/super-admin/withdrawals/:withdrawalId/complete', authenticate, requireRoles('super_admin'), adminFinanceController.completeWithdrawal);
-mobileRouter.post('/super-admin/withdrawals/:withdrawalId/reject', authenticate, requireRoles('super_admin'), adminFinanceController.rejectWithdrawal);
+mobileRouter.get('/super-admin/withdrawals', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.listPayouts);
+mobileRouter.get('/super-admin/withdrawals/:withdrawalId', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.getWithdrawal);
+mobileRouter.post('/super-admin/withdrawals/:withdrawalId/approve', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.approveWithdrawal);
+mobileRouter.post('/super-admin/withdrawals/:withdrawalId/complete', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.completeWithdrawal);
+mobileRouter.post('/super-admin/withdrawals/:withdrawalId/reject', authenticate, requireRoles('super_admin', 'support'), adminFinanceController.rejectWithdrawal);
 
 // ------------------------------------------------------------------
 // Super Admin – Reputation
 // ------------------------------------------------------------------
-mobileRouter.get('/super-admin/reputation/dashboard', authenticate, requireRoles('super_admin'), adminReputationController.reputationDashboard);
+mobileRouter.get('/super-admin/reputation/dashboard', authenticate, requireRoles('super_admin', 'support'), adminReputationController.reputationDashboard);
 // Scores
-mobileRouter.get('/super-admin/scores', authenticate, requireRoles('super_admin'), adminReputationController.listScores);
-mobileRouter.get('/super-admin/scores/ranking', authenticate, requireRoles('super_admin'), adminReputationController.driverRanking);
-mobileRouter.get('/super-admin/scores/:userId', authenticate, requireRoles('super_admin'), adminReputationController.getScore);
-mobileRouter.get('/super-admin/scores/:userId/history', authenticate, requireRoles('super_admin'), adminReputationController.scoreHistory);
-mobileRouter.post('/super-admin/scores/:userId/add', authenticate, requireRoles('super_admin'), adminReputationController.addPoints);
-mobileRouter.post('/super-admin/scores/:userId/remove', authenticate, requireRoles('super_admin'), adminReputationController.removePoints);
+mobileRouter.get('/super-admin/scores', authenticate, requireRoles('super_admin', 'support'), adminReputationController.listScores);
+mobileRouter.get('/super-admin/scores/ranking', authenticate, requireRoles('super_admin', 'support'), adminReputationController.driverRanking);
+mobileRouter.get('/super-admin/scores/:userId', authenticate, requireRoles('super_admin', 'support'), adminReputationController.getScore);
+mobileRouter.get('/super-admin/scores/:userId/history', authenticate, requireRoles('super_admin', 'support'), adminReputationController.scoreHistory);
+mobileRouter.post('/super-admin/scores/:userId/add', authenticate, requireRoles('super_admin', 'support'), adminReputationController.addPoints);
+mobileRouter.post('/super-admin/scores/:userId/remove', authenticate, requireRoles('super_admin', 'support'), adminReputationController.removePoints);
 // Driver detail (combined reputation + finance)
-mobileRouter.get('/super-admin/drivers/:userId', authenticate, requireRoles('super_admin'), adminReputationController.driverDetail);
+mobileRouter.get('/super-admin/drivers/:userId', authenticate, requireRoles('super_admin', 'support'), adminReputationController.driverDetail);
 

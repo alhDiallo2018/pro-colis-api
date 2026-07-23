@@ -5,7 +5,7 @@ import * as zoneController from './zone.controller.js';
 
 export const zoneRouter = Router();
 
-const superAdmin = [authenticate, requireRoles('super_admin')];
+const superAdmin = [authenticate, requireRoles('super_admin', 'support')];
 
 zoneRouter.get('/public/zones', optionalAuthenticate, zoneController.listPublicZones);
 zoneRouter.get('/zones/detect', optionalAuthenticate, zoneController.detectZones);

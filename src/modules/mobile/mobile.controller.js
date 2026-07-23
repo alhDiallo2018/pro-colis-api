@@ -1,9 +1,10 @@
 import bcrypt from 'bcryptjs';
-import { prisma } from '../../config/prisma.js';
 import { env } from '../../config/env.js';
-import { ok, fail } from '../../utils/api-response.js';
-import { getPagination, paginationMeta } from '../../utils/pagination.js';
-import { generateTrackingNumber } from '../../utils/tracking-number.js';
+import { prisma } from '../../config/prisma.js';
+import { fail, ok } from '../../utils/api-response.js';
+import { isBrevoConfigured, sendNotificationEmail, sendNotificationSms, sendOtpSms } from '../../utils/brevo.js';
+import { calculateCommission, calculateCommissionSync, deductCashCommission, getCfaPerPoint, getCommitmentFee, getDeliveryPoints } from '../../utils/commission.js';
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
 import {
   serializeAdvertisement,
   serializeAdvertisementOffer,
@@ -16,10 +17,9 @@ import {
   serializeScoreTransaction,
   serializeUser
 } from '../../utils/mobile-serializers.js';
-import { ConflictError, ForbiddenError, NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
+import { getPagination, paginationMeta } from '../../utils/pagination.js';
+import { generateTrackingNumber } from '../../utils/tracking-number.js';
 import { attemptDisbursement, toClientWithdrawalStatus } from '../../utils/withdrawal-flow.js';
-import { sendNotificationEmail, sendNotificationSms, sendOtpSms, isBrevoConfigured } from '../../utils/brevo.js';
-import { calculateCommission, calculateCommissionSync, deductCashCommission, getCfaPerPoint, getDeliveryPoints, getCommitmentFee } from '../../utils/commission.js';
 
 const parcelInclude = {
   departureGarage: true,
@@ -2489,3 +2489,448 @@ export const driverPayCommission = handle('driver.payCommission', async (req, re
     }
   });
 });
+// ============================================================
+// ADMIN SUPPORT FUNCTIONS - Version corrigée (Prisma)
+// ============================================================
+
+/**
+ * Admin: Récupérer toutes les conversations de support
+ * GET /messages/admin/support/conversations
+ */
+export const adminSupportConversations = async (req, res) => {
+  try {
+    console.log('📨 adminSupportConversations - Début');
+
+    // Récupérer les messages de support (parcel_id IS NULL)
+    // où au moins un participant est admin/super_admin/support
+    const supportMessages = await prisma.message.findMany({
+      where: {
+        parcelId: null,
+        OR: [
+          { sender: { role: { in: ['admin', 'super_admin', 'support'] } } },
+          { receiver: { role: { in: ['admin', 'super_admin', 'support'] } } }
+        ]
+      },
+      include: {
+        sender: {
+          select: {
+            id: true,
+            fullName: true,      // ✅ Prisma utilise fullName (camelCase)
+            profilePhoto: true,   // ✅ Prisma utilise profilePhoto
+            role: true,
+            email: true,
+            phone: true
+          }
+        },
+        receiver: {
+          select: {
+            id: true,
+            fullName: true,      // ✅ Prisma utilise fullName
+            profilePhoto: true,   // ✅ Prisma utilise profilePhoto
+            role: true,
+            email: true,
+            phone: true
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    console.log(`📨 ${supportMessages.length} messages de support trouvés`);
+
+    // Grouper par utilisateur (non-support)
+    const conversationMap = new Map();
+
+    for (const msg of supportMessages) {
+      const isSupportSender = ['admin', 'super_admin', 'support'].includes(msg.sender.role);
+      const isSupportReceiver = ['admin', 'super_admin', 'support'].includes(msg.receiver.role);
+      const isSupport = isSupportSender || isSupportReceiver;
+
+      if (!isSupport) continue;
+
+      const user = isSupportSender ? msg.receiver : msg.sender;
+      const supportUser = isSupportSender ? msg.sender : msg.receiver;
+
+      if (!conversationMap.has(user.id)) {
+        conversationMap.set(user.id, {
+          id: user.id,
+          body: msg.body,
+          createdAt: msg.createdAt,
+          senderId: msg.senderId,
+          receiverId: msg.receiverId,
+          user: {
+            id: user.id,
+            fullName: user.fullName,
+            profilePhoto: user.profilePhoto,
+            role: user.role,
+            email: user.email,
+            phone: user.phone
+          },
+          supportUser: {
+            id: supportUser.id,
+            fullName: supportUser.fullName,
+            profilePhoto: supportUser.profilePhoto,
+            role: supportUser.role
+          },
+          lastMessage: msg.body,
+          lastMessageDate: msg.createdAt,
+          messageCount: 1
+        });
+      } else {
+        const existing = conversationMap.get(user.id);
+        existing.messageCount += 1;
+        if (new Date(msg.createdAt) > new Date(existing.lastMessageDate)) {
+          existing.lastMessage = msg.body;
+          existing.lastMessageDate = msg.createdAt;
+          existing.body = msg.body;
+          existing.createdAt = msg.createdAt;
+        }
+      }
+    }
+
+    const result = Array.from(conversationMap.values())
+      .sort((a, b) => new Date(b.lastMessageDate) - new Date(a.lastMessageDate));
+
+    console.log(`📨 ${result.length} conversations trouvées`);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Conversations support',
+      data: result
+    });
+  } catch (error) {
+    console.error('❌ Erreur adminSupportConversations:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Erreur lors de la récupération des conversations',
+      error: {
+        code: 'INTERNAL_ERROR',
+        details: [{ message: error.message }]
+      }
+    });
+  }
+};
+
+/**
+ * Admin: Récupérer une conversation spécifique
+ * GET /messages/admin/support/conversations/:supportUserId/:userId
+ */
+export const adminSupportThread = async (req, res) => {
+  try {
+    const { supportUserId, userId } = req.params;
+
+    console.log('📨 adminSupportThread - supportUserId:', supportUserId);
+    console.log('📨 adminSupportThread - userId:', userId);
+
+    if (!supportUserId || !userId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Paramètres manquants',
+        error: {
+          code: 'VALIDATION_ERROR',
+          details: [
+            !supportUserId ? { path: 'supportUserId', message: 'supportUserId est requis' } : null,
+            !userId ? { path: 'userId', message: 'userId est requis' } : null
+          ].filter(Boolean)
+        }
+      });
+    }
+
+    // Vérifier que le support existe
+    const support = await prisma.user.findUnique({
+      where: { id: supportUserId },
+      select: {
+        id: true,
+        fullName: true,
+        role: true,
+        profilePhoto: true,
+        email: true,
+        phone: true
+      }
+    });
+
+    if (!support) {
+      return res.status(404).json({
+        success: false,
+        message: 'Support utilisateur introuvable',
+        error: {
+          code: 'NOT_FOUND',
+          details: [{ path: 'supportUserId', message: `Utilisateur ${supportUserId} non trouvé` }]
+        }
+      });
+    }
+
+    if (!['admin', 'super_admin', 'support'].includes(support.role)) {
+      return res.status(403).json({
+        success: false,
+        message: 'L\'utilisateur n\'est pas un support valide',
+        error: {
+          code: 'FORBIDDEN',
+          details: [{ path: 'supportUserId', message: `Rôle: ${support.role}` }]
+        }
+      });
+    }
+
+    // Vérifier que l'utilisateur existe
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        fullName: true,
+        phone: true,
+        profilePhoto: true,
+        role: true
+      }
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'Utilisateur introuvable',
+        error: {
+          code: 'NOT_FOUND',
+          details: [{ path: 'userId', message: `Utilisateur ${userId} non trouvé` }]
+        }
+      });
+    }
+
+    console.log('✅ Support trouvé:', support.fullName);
+    console.log('✅ Utilisateur trouvé:', user.fullName);
+
+    // Récupérer les messages entre les deux utilisateurs
+    const messages = await prisma.message.findMany({
+      where: {
+        parcelId: null,
+        OR: [
+          { senderId: userId, receiverId: supportUserId },
+          { senderId: supportUserId, receiverId: userId }
+        ]
+      },
+      include: {
+        sender: {
+          select: {
+            id: true,
+            fullName: true,
+            profilePhoto: true,
+            role: true,
+            email: true,
+            phone: true
+          }
+        },
+        receiver: {
+          select: {
+            id: true,
+            fullName: true,
+            profilePhoto: true,
+            role: true,
+            email: true,
+            phone: true
+          }
+        }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    console.log('📨 Messages trouvés:', messages.length);
+
+    // Marquer les messages non lus comme lus
+    if (messages.length > 0) {
+      await prisma.message.updateMany({
+        where: {
+          receiverId: supportUserId,
+          senderId: userId,
+          parcelId: null,
+          isRead: false
+        },
+        data: {
+          isRead: true,
+          readAt: new Date()
+        }
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Conversation support',
+      data: {
+        user: {
+          id: user.id,
+          fullName: user.fullName,
+          profilePhoto: user.profilePhoto,
+          role: user.role,
+          email: user.email,
+          phone: user.phone
+        },
+        support: {
+          id: support.id,
+          fullName: support.fullName,
+          profilePhoto: support.profilePhoto,
+          role: support.role,
+          email: support.email,
+          phone: support.phone
+        },
+        messages: messages.map(m => ({
+          id: m.id,
+          body: m.body,
+          isRead: m.isRead,
+          readAt: m.readAt,
+          createdAt: m.createdAt,
+          senderId: m.senderId,
+          receiverId: m.receiverId,
+          parcelId: m.parcelId,
+          audioUrl: m.audioUrl,
+          sender: m.sender ? {
+            id: m.sender.id,
+            fullName: m.sender.fullName,
+            profilePhoto: m.sender.profilePhoto,
+            role: m.sender.role,
+            email: m.sender.email,
+            phone: m.sender.phone
+          } : null,
+          receiver: m.receiver ? {
+            id: m.receiver.id,
+            fullName: m.receiver.fullName,
+            profilePhoto: m.receiver.profilePhoto,
+            role: m.receiver.role,
+            email: m.receiver.email,
+            phone: m.receiver.phone
+          } : null
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('❌ Erreur adminSupportThread:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Erreur interne du serveur',
+      error: {
+        code: 'INTERNAL_ERROR',
+        details: [{ message: error.message }]
+      }
+    });
+  }
+};
+
+/**
+ * Admin: Répondre en tant que support
+ * POST /messages/admin/support/reply
+ */
+export const adminSupportReply = async (req, res) => {
+  try {
+    const { supportUserId, receiverId, body } = req.body;
+
+    console.log('📨 adminSupportReply - supportUserId:', supportUserId);
+    console.log('📨 adminSupportReply - receiverId:', receiverId);
+
+    if (!supportUserId || !receiverId || !body) {
+      return res.status(400).json({
+        success: false,
+        message: 'Données manquantes',
+        error: {
+          code: 'VALIDATION_ERROR',
+          details: [
+            !supportUserId ? { path: 'supportUserId', message: 'supportUserId est requis' } : null,
+            !receiverId ? { path: 'receiverId', message: 'receiverId est requis' } : null,
+            !body ? { path: 'body', message: 'body est requis' } : null
+          ].filter(Boolean)
+        }
+      });
+    }
+
+    // Vérifier que le support existe
+    const support = await prisma.user.findUnique({
+      where: { id: supportUserId },
+      select: { id: true, fullName: true, role: true }
+    });
+
+    if (!support) {
+      return res.status(404).json({
+        success: false,
+        message: 'Support utilisateur introuvable',
+        error: {
+          code: 'NOT_FOUND',
+          details: [{ path: 'supportUserId', message: `Utilisateur ${supportUserId} non trouvé` }]
+        }
+      });
+    }
+
+    if (!['admin', 'super_admin', 'support'].includes(support.role)) {
+      return res.status(403).json({
+        success: false,
+        message: 'L\'utilisateur n\'est pas un support valide',
+        error: {
+          code: 'FORBIDDEN',
+          details: [{ path: 'supportUserId', message: `Rôle: ${support.role}` }]
+        }
+      });
+    }
+
+    // Vérifier que le destinataire existe
+    const receiver = await prisma.user.findUnique({
+      where: { id: receiverId },
+      select: { id: true, fullName: true, phone: true, email: true }
+    });
+
+    if (!receiver) {
+      return res.status(404).json({
+        success: false,
+        message: 'Destinataire introuvable',
+        error: {
+          code: 'NOT_FOUND',
+          details: [{ path: 'receiverId', message: `Utilisateur ${receiverId} non trouvé` }]
+        }
+      });
+    }
+
+    // Créer le message
+    const message = await prisma.message.create({
+      data: {
+        senderId: supportUserId,
+        receiverId: receiverId,
+        body: body,
+        parcelId: null,
+        isRead: false
+      },
+      select: {
+        id: true,
+        body: true,
+        senderId: true,
+        receiverId: true,
+        isRead: true,
+        createdAt: true,
+        audioUrl: true
+      }
+    });
+
+    console.log('✅ Message créé:', message.id);
+
+    // Créer une notification
+    await prisma.notification.create({
+      data: {
+        userId: receiverId,
+        type: 'support_reply',
+        title: 'Nouvelle réponse du support',
+        body: `Le support vous a répondu: ${body.substring(0, 100)}${body.length > 100 ? '...' : ''}`,
+        data: { supportUserId, messageId: message.id },
+        priority: 'high'
+      }
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Réponse envoyée',
+      data: message
+    });
+  } catch (error) {
+    console.error('❌ Erreur adminSupportReply:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Erreur interne du serveur',
+      error: {
+        code: 'INTERNAL_ERROR',
+        details: [{ message: error.message }]
+      }
+    });
+  }
+};

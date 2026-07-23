@@ -12,6 +12,7 @@ enum UserRole {
   driver
   admin
   super_admin
+  support
 }
 
 enum UserStatus {
