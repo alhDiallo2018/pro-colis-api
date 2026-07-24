@@ -219,13 +219,25 @@ export const createPaydunyaPayment = handle('paydunya.create', async (req, res) 
   const amount = number(rawAmount || points || req.body.amount || 0)
 
   if (amount <= 0) throw new ValidationError([{ path: 'body.amount', message: 'Montant invalide' }])
+  const minAmount = env.PAYDUNYA_MIN_AMOUNT
+  if (amount < minAmount) {
+    throw new ValidationError([{ path: 'body.amount', message: `Le montant minimum est de ${minAmount} FCFA` }])
+  }
   if (!['parcel', 'score', 'wallet'].includes(paymentType)) {
     throw new ValidationError([{ path: 'body.type', message: 'Type invalide (parcel, score, wallet)' }])
   }
 
   let description = ''
   let redirectPath = '/client/colis'
-  const customData = { type: paymentType, userId: req.user.id }
+  // Métadonnées renvoyées telles quelles par PayDunya (confirm + IPN) : servent à
+  // rattacher le paiement à l'utilisateur/colis et à la réconciliation.
+  const customData = {
+    type: paymentType,
+    userId: req.user.id,
+    amount,
+    mode: config.mode || 'test',
+    initiatedAt: new Date().toISOString()
+  }
 
   if (paymentType === 'parcel') {
     if (!parcelId) throw new ValidationError([{ path: 'body.parcelId', message: 'Colis requis' }])
@@ -300,8 +312,10 @@ export const paydunyaIpn = handle('paydunya.ipn', async (req, res) => {
   const config = await getPaydunyaConfig()
   const masterKey = config?.masterKey || ''
 
-  if (data.hash && !verifyIpnHash(masterKey, data.hash)) {
-    return fail(res, { status: 403, message: 'Hash invalide', code: 'FORBIDDEN' })
+  // Sécurité : l'IPN DOIT être signé. Un hash absent OU invalide est rejeté —
+  // sinon une requête forgée pourrait créditer un wallet / valider un colis.
+  if (!masterKey || !data.hash || !verifyIpnHash(masterKey, data.hash)) {
+    return fail(res, { status: 403, message: 'Signature IPN invalide ou manquante', code: 'FORBIDDEN' })
   }
 
   if (data.status === 'completed') {

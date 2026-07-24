@@ -9,9 +9,12 @@ const superAdmin = [authenticate, requireRoles('super_admin', 'support')];
 
 zoneRouter.get('/public/zones', optionalAuthenticate, zoneController.listPublicZones);
 zoneRouter.get('/zones/detect', optionalAuthenticate, zoneController.detectZones);
+// Résolution d'un lieu Google Places → zone (création à la volée en "pending").
+zoneRouter.post('/zones/resolve', authenticate, zoneController.resolveZone);
 
 zoneRouter.get('/super-admin/zones', ...superAdmin, zoneController.listZones);
 zoneRouter.post('/super-admin/zones', ...superAdmin, zoneController.createZone);
+zoneRouter.patch('/super-admin/zones/:zoneId/status', ...superAdmin, zoneController.setZoneStatus);
 zoneRouter.post('/super-admin/zones/migrate', ...superAdmin, zoneController.migrateGarages);
 zoneRouter.get('/super-admin/zones/:zoneId', ...superAdmin, zoneController.getZone);
 zoneRouter.put('/super-admin/zones/:zoneId', ...superAdmin, zoneController.updateZone);

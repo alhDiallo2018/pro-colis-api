@@ -167,7 +167,12 @@ model User {
   cancelledDeliveries  Int                    @default(0) @map("cancelled_deliveries")
   isEmailVerified      Boolean                @default(false) @map("is_email_verified")
   isPhoneVerified      Boolean                @default(false) @map("is_phone_verified")
+  // Vérification d'identité (KYC) validée par un admin — conditionne certaines
+  // activités chauffeur (enchérir, publier une annonce) si l'option est activée.
+  isVerified           Boolean                @default(false) @map("is_verified")
   isProfileComplete    Boolean                @default(false) @map("is_profile_complete")
+  // Préférences de notification par type d'événement / canal (JSON libre).
+  notificationPreferences Json?               @map("notification_preferences")
   lastLogin            DateTime?              @map("last_login") @db.Timestamptz
   lastActiveAt         DateTime?              @map("last_active_at") @db.Timestamptz
   deletedAt            DateTime?              @map("deleted_at") @db.Timestamptz
@@ -203,6 +208,7 @@ model User {
   addresses            Address[]
   sentMessages         Message[]               @relation("MessageSender")
   receivedMessages     Message[]               @relation("MessageReceiver")
+  handledSupportMessages Message[]             @relation("MessageHandledBy")
   auditLogs            AuditLog[]              @relation("AuditActor")
   systemConfigs        SystemConfig[]
   webhooks             Webhook[]
@@ -212,6 +218,9 @@ model User {
   withdrawals          Withdrawal[]
   driverZones          ZoneDriver[]
   deviceTokens         DeviceToken[]
+  expensesCreated      Expense[]              @relation("ExpenseCreatedBy")
+  assistances          Assistance[]           @relation("AssistanceUser")
+  assistancesHandled   Assistance[]           @relation("AssistanceHandledBy")
 
   @@map("users")
 }
@@ -728,14 +737,66 @@ model Message {
   parcelId   String?   @map("parcel_id") @db.Uuid
   body       String    @default("")
   audioUrl   String?   @map("audio_url")
+  photoUrl   String?   @map("photo_url")
+  videoUrl   String?   @map("video_url")
   isRead     Boolean   @default(false) @map("is_read")
   readAt     DateTime? @map("read_at") @db.Timestamptz
+  handledById String?  @map("handled_by") @db.Uuid
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
   sender     User      @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
   receiver   User      @relation("MessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+  handledBy  User?     @relation("MessageHandledBy", fields: [handledById], references: [id], onDelete: SetNull)
   parcel     Parcel?   @relation(fields: [parcelId], references: [id], onDelete: SetNull)
 
   @@map("messages")
+}
+
+/// Journal des assistances : chaque cas où un utilisateur est assisté,
+/// avec le canal utilisé (email / chat / call), pour tracer les interactions.
+model Assistance {
+  id           String    @id @default(uuid()) @db.Uuid
+  code         String    @unique
+  userId       String?   @map("user_id") @db.Uuid
+  contactName  String?   @map("contact_name")
+  contactPhone String?   @map("contact_phone")
+  channel      String    @default("chat")
+  subject      String
+  notes        String?
+  status       String    @default("open")
+  handledById  String?   @map("handled_by") @db.Uuid
+  resolvedAt   DateTime? @map("resolved_at") @db.Timestamptz
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  user         User?     @relation("AssistanceUser", fields: [userId], references: [id], onDelete: SetNull)
+  handledBy    User?     @relation("AssistanceHandledBy", fields: [handledById], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([channel])
+  @@index([createdAt])
+  @@map("assistances")
+}
+
+/// Registre des dépenses de l'entreprise : date, montant, justificatif photo…
+model Expense {
+  id          String   @id @default(uuid()) @db.Uuid
+  reference   String   @unique
+  title       String
+  category    String   @default("autre")
+  amount      Decimal  @db.Decimal(14, 2)
+  currency    String   @default("XOF")
+  description String?
+  proofUrl    String?  @map("proof_url")
+  status      String   @default("paid")
+  spentAt     DateTime @map("spent_at") @db.Timestamptz
+  createdById String   @map("created_by") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  createdBy   User     @relation("ExpenseCreatedBy", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([category])
+  @@index([spentAt])
+  @@map("expenses")
 }
 
 model AuditLog {
@@ -810,6 +871,10 @@ model Zone {
   radiusKm    Decimal?     @map("radius_km") @db.Decimal(8, 2)
   boundary    Json?
   isActive    Boolean      @default(true) @map("is_active")
+  // Modération des zones auto-créées depuis Google Places : approved | pending | rejected.
+  // Seules les zones "approved" (et actives) sont proposées publiquement.
+  status      String       @default("approved")
+  source      String       @default("manual")
   parentId    String?      @map("parent_id") @db.Uuid
   metadata    Json         @default("{}")
   createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz
@@ -819,6 +884,7 @@ model Zone {
   driverZones ZoneDriver[]
 
   @@index([isActive])
+  @@index([status])
   @@index([parentId])
   @@map("zones")
 }

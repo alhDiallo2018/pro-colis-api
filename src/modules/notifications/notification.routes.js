@@ -9,6 +9,8 @@ export const notificationRouter = Router();
 notificationRouter.use(authenticate);
 notificationRouter.get('/', notificationController.listNotifications);
 notificationRouter.get('/unread-count', notificationController.unreadCount);
+notificationRouter.get('/preferences', notificationController.getPreferences);
+notificationRouter.put('/preferences', notificationController.updatePreferences);
 notificationRouter.post('/device-token', messagingController.registerDeviceToken);
 notificationRouter.post('/sms/send', requireRoles('admin', 'super_admin'), messagingController.sendSmsMessage);
 notificationRouter.post('/email/send', requireRoles('admin', 'super_admin'), messagingController.sendEmailMessage);

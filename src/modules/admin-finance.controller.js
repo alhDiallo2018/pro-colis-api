@@ -308,6 +308,18 @@ export const rechargeWallet = handle('finance.rechargeWallet', async (req, res) 
       afterData: { balance: balanceAfter, amount: numericAmount }
     });
 
+    // P1 : notifier l'utilisateur du mouvement d'argent sur son compte.
+    await tx.notification.create({
+      data: {
+        userId,
+        type: 'wallet_recharged',
+        title: 'Portefeuille crédité',
+        body: `${numericAmount} FCFA ont été ajoutés à votre portefeuille par l'administration.`,
+        data: { amount: numericAmount, balanceAfter, origin: origin || 'admin' },
+        priority: 'high'
+      }
+    });
+
     return { wallet, transaction };
   });
 
@@ -387,6 +399,18 @@ export const debitWallet = handle('finance.debitWallet', async (req, res) => {
       entityId: userId,
       beforeData: { balance: balanceBefore },
       afterData: { balance: balanceAfter, amount: numericAmount }
+    });
+
+    // P1 : notifier l'utilisateur du mouvement d'argent sur son compte.
+    await tx.notification.create({
+      data: {
+        userId,
+        type: 'wallet_debited',
+        title: 'Portefeuille débité',
+        body: `${numericAmount} FCFA ont été retirés de votre portefeuille par l'administration.`,
+        data: { amount: numericAmount, balanceAfter, origin: origin || 'admin' },
+        priority: 'high'
+      }
     });
 
     return { wallet, transaction };

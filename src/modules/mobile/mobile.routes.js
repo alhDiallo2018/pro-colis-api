@@ -3,6 +3,9 @@ import { authenticate, optionalAuthenticate } from '../../middlewares/auth.middl
 import { requireRoles } from '../../middlewares/rbac.middleware.js';
 import * as adminFinanceController from '../admin-finance.controller.js';
 import * as adminReputationController from '../admin-reputation.controller.js';
+import * as adminAssistanceController from '../admin-assistance.controller.js';
+import * as adminExpenseController from '../admin-expense.controller.js';
+import * as adminIdentityController from '../admin-identity.controller.js';
 import * as paydunyaController from '../paydunya.controller.js';
 import * as mobileController from './mobile.controller.js';
 
@@ -246,4 +249,23 @@ mobileRouter.post('/super-admin/scores/:userId/add', authenticate, requireRoles(
 mobileRouter.post('/super-admin/scores/:userId/remove', authenticate, requireRoles('super_admin', 'support'), adminReputationController.removePoints);
 // Driver detail (combined reputation + finance)
 mobileRouter.get('/super-admin/drivers/:userId', authenticate, requireRoles('super_admin', 'support'), adminReputationController.driverDetail);
+
+// Assistances — journal des interactions d'assistance (mail / chat / appel)
+mobileRouter.get('/super-admin/assistances', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.listAssistances);
+mobileRouter.post('/super-admin/assistances', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.createAssistance);
+mobileRouter.get('/super-admin/assistances/:assistanceId', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.getAssistance);
+mobileRouter.put('/super-admin/assistances/:assistanceId', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.updateAssistance);
+mobileRouter.delete('/super-admin/assistances/:assistanceId', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.deleteAssistance);
+
+// Vérifications d'identité chauffeur (KYC) — revue admin
+mobileRouter.get('/super-admin/identity-verifications', authenticate, requireRoles('super_admin', 'support'), adminIdentityController.listIdentityVerifications);
+mobileRouter.post('/super-admin/identity-verifications/:verificationId/approve', authenticate, requireRoles('super_admin', 'support'), adminIdentityController.approveIdentity);
+mobileRouter.post('/super-admin/identity-verifications/:verificationId/reject', authenticate, requireRoles('super_admin', 'support'), adminIdentityController.rejectIdentity);
+
+// Dépenses — registre des dépenses (date / montant / justificatif)
+mobileRouter.get('/super-admin/expenses', authenticate, requireRoles('super_admin', 'support'), adminExpenseController.listExpenses);
+mobileRouter.post('/super-admin/expenses', authenticate, requireRoles('super_admin', 'support'), adminExpenseController.createExpense);
+mobileRouter.get('/super-admin/expenses/:expenseId', authenticate, requireRoles('super_admin', 'support'), adminExpenseController.getExpense);
+mobileRouter.put('/super-admin/expenses/:expenseId', authenticate, requireRoles('super_admin', 'support'), adminExpenseController.updateExpense);
+mobileRouter.delete('/super-admin/expenses/:expenseId', authenticate, requireRoles('super_admin', 'support'), adminExpenseController.deleteExpense);
 

@@ -144,3 +144,47 @@ export async function deleteAllNotifications(req, res) {
     return fail(res, { status: 500, message: 'Impossible de supprimer les notifications' });
   }
 }
+
+export async function getPreferences(req, res) {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { notificationPreferences: true }
+    });
+    return ok(res, {
+      message: 'Preferences de notification',
+      data: { preferences: user?.notificationPreferences ?? {} }
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'notification.getPreferences', userId: req.user?.id, requestId: req.requestId },
+      'Failed to load notification preferences'
+    );
+    return fail(res, { status: 500, message: 'Impossible de charger les preferences' });
+  }
+}
+
+export async function updatePreferences(req, res) {
+  try {
+    const prefs = req.body?.preferences ?? req.body ?? {};
+    // Accepte un objet (map type→canaux) OU un tableau ([{eventType, channels}]).
+    if (prefs === null || typeof prefs !== 'object') {
+      return fail(res, { status: 422, message: 'Preferences invalides', code: 'VALIDATION_ERROR' });
+    }
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data: { notificationPreferences: prefs },
+      select: { notificationPreferences: true }
+    });
+    return ok(res, {
+      message: 'Preferences mises a jour',
+      data: { preferences: user.notificationPreferences ?? {} }
+    });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'notification.updatePreferences', userId: req.user?.id, requestId: req.requestId },
+      'Failed to update notification preferences'
+    );
+    return fail(res, { status: 500, message: 'Impossible de mettre a jour les preferences' });
+  }
+}

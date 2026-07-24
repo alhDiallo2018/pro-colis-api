@@ -24,6 +24,13 @@ const envSchema = z.object({
   PAYDUNYA_MODE: z.enum(['test', 'live']).default('test'),
   PAYDUNYA_STORE_NAME: z.string().default('ProColis'),
   PAYDUNYA_DISBURSE_BASE_URL: z.string().url().default('https://app.paydunya.com/api/v2/disburse'),
+  // Montant minimum accepté par les canaux PayDunya (XOF). Encaissement (pay-in)
+  // et déboursement (pay-out) refusent en dessous de ce seuil.
+  PAYDUNYA_MIN_AMOUNT: z.coerce.number().int().positive().default(200),
+  PAYDUNYA_MIN_WITHDRAWAL: z.coerce.number().int().positive().default(500),
+  // Si "true", un chauffeur doit avoir son identité vérifiée (isVerified) pour
+  // enchérir / publier une annonce. Mettre à "true" quand la revue KYC est prête.
+  REQUIRE_DRIVER_VERIFICATION: z.string().default('false').transform((v) => v === 'true'),
   BREVO_API_KEY: z.string().optional(),
   BREVO_SENDER_EMAIL: z.string().email().optional(),
   BREVO_SENDER_NAME: z.string().optional(),

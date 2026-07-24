@@ -167,6 +167,20 @@ async function notify(tx, { userId, parcelId, bidId, senderId, senderName = 'PRO
   return notification;
 }
 
+/**
+ * Gating KYC : si REQUIRE_DRIVER_VERIFICATION est actif, le chauffeur doit avoir
+ * son identité vérifiée (isVerified) pour enchérir / publier une annonce.
+ */
+async function assertDriverVerified(req) {
+  if (!env.REQUIRE_DRIVER_VERIFICATION) return;
+  const me = await prisma.user.findUnique({ where: { id: req.user.id }, select: { isVerified: true } });
+  if (!me?.isVerified) {
+    throw new ForbiddenError(
+      "Votre identité doit être vérifiée pour cette action. Envoyez vos documents d'identité depuis votre profil."
+    );
+  }
+}
+
 function statusDescription(status) {
   return {
     pending: 'Colis cree',
@@ -233,6 +247,22 @@ async function changeParcelStatus(req, parcel, status, extra = {}) {
       body: `Votre colis ${updated.trackingNumber} : ${statusDescription(status)}.`,
       data: { trackingNumber: updated.trackingNumber, status }
     });
+
+    // P1 : lors d'une assignation (extra.driverId fourni), notifier aussi le
+    // chauffeur assigné — l'acceptation d'enchère notifie déjà de son côté.
+    if (extra.driverId) {
+      await notify(tx, {
+        userId: extra.driverId,
+        parcelId: updated.id,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'driver_assigned',
+        title: 'Nouveau colis assigné',
+        body: `Le colis ${updated.trackingNumber} vous a été assigné${updated.arrivalGarage?.name ? ` (destination ${updated.arrivalGarage.name})` : ''}.`,
+        data: { trackingNumber: updated.trackingNumber, parcelId: updated.id },
+        priority: 'high'
+      });
+    }
 
     return { parcel: updated, event };
   });
@@ -778,6 +808,7 @@ export const estimateParcel = handle('parcel.estimate', async (req, res) => {
 });
 
 export const createBid = handle('bid.create', async (req, res) => {
+  await assertDriverVerified(req);
   const parcel = await prisma.parcel.findFirst({ where: { id: req.body.parcelId, status: 'free', isFreeForBidding: true } });
   if (!parcel) throw new NotFoundError('Annonce introuvable');
   const bid = await prisma.$transaction(async (tx) => {
@@ -938,6 +969,21 @@ export const confirmPayment = handle('payment.confirm', async (req, res) => {
       await tx.parcel.update({ where: { id: updated.parcelId }, data: { paymentStatus: 'completed' } });
     }
     await audit(tx, req, { action: 'payment.confirm', entityType: 'payment', entityId: updated.id, afterData: { status: 'completed' } });
+
+    // P1 : notifier le payeur. Le crédit chauffeur reste géré par les flux de
+    // paiement réels (confirmCashPayment + IPN PayDunya) pour éviter un double crédit.
+    if (updated.userId) {
+      await notify(tx, {
+        userId: updated.userId,
+        parcelId: updated.parcelId ?? undefined,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'payment_confirmed',
+        title: 'Paiement confirmé',
+        body: `Votre paiement de ${Number(updated.amount)} FCFA${updated.parcel?.trackingNumber ? ` pour le colis ${updated.parcel.trackingNumber}` : ''} a été confirmé.`,
+        data: { paymentId: updated.id, parcelId: updated.parcelId, amount: Number(updated.amount) }
+      });
+    }
     return updated;
   });
   return ok(res, { message: 'Paiement confirme', data: { payment: serializePayment(payment) } });
@@ -1108,8 +1154,9 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
 
 export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
   const amount = Number(req.body.amount || 0);
-  if (!amount || amount < 500) {
-    throw new ValidationError([{ path: 'body.amount', message: 'Montant minimum 500 FCFA' }]);
+  const minWithdrawal = env.PAYDUNYA_MIN_WITHDRAWAL;
+  if (!amount || amount < minWithdrawal) {
+    throw new ValidationError([{ path: 'body.amount', message: `Montant minimum ${minWithdrawal} FCFA` }]);
   }
 
   const method = req.body.method || 'wave';
@@ -1459,6 +1506,8 @@ function serializeMessage(m) {
     parcelId: m.parcelId,
     body: m.body,
     audioUrl: m.audioUrl,
+    photoUrl: m.photoUrl,
+    videoUrl: m.videoUrl,
     isRead: m.isRead,
     createdAt: m.createdAt
   };
@@ -1466,16 +1515,50 @@ function serializeMessage(m) {
 
 export const sendMessage = handle('messages.send', async (req, res) => {
   if (!req.body.receiverId) throw new ValidationError([{ path: 'receiverId', message: 'Destinataire requis' }]);
-  if (!req.body.body && !req.body.audioUrl) throw new ValidationError([{ path: 'body', message: 'Message vide' }]);
+  if (!req.body.body && !req.body.audioUrl && !req.body.photoUrl && !req.body.videoUrl) {
+    throw new ValidationError([{ path: 'body', message: 'Message vide' }]);
+  }
   const message = await prisma.message.create({
     data: {
       senderId: req.user.id,
       receiverId: req.body.receiverId,
       parcelId: req.body.parcelId || null,
       body: req.body.body || '',
-      audioUrl: req.body.audioUrl || null
+      audioUrl: req.body.audioUrl || null,
+      photoUrl: req.body.photoUrl || null,
+      videoUrl: req.body.videoUrl || null
     }
   });
+
+  // P1 : notifier le destinataire (in-app seulement — pas d'email/SMS par message
+  // pour éviter le spam). Une notif ratée ne doit pas casser l'envoi du message.
+  try {
+    const sender = await prisma.user.findUnique({ where: { id: req.user.id }, select: { fullName: true } });
+    const preview = message.photoUrl
+      ? '📷 Photo'
+      : message.videoUrl
+        ? '🎥 Vidéo'
+        : message.audioUrl
+          ? '🎤 Message vocal'
+          : (message.body || '').startsWith('__PRIX__')
+            ? '💰 Proposition de prix'
+            : (message.body || '').slice(0, 80) || 'Nouveau message';
+    await prisma.notification.create({
+      data: {
+        userId: req.body.receiverId,
+        senderId: req.user.id,
+        senderName: sender?.fullName || 'PRO COLIS',
+        parcelId: req.body.parcelId || null,
+        type: 'message',
+        title: sender?.fullName ? `Nouveau message de ${sender.fullName}` : 'Nouveau message',
+        body: preview,
+        data: { messageId: message.id, parcelId: req.body.parcelId || null }
+      }
+    });
+  } catch {
+    /* noop */
+  }
+
   return ok(res, { status: 201, message: 'Message envoye', data: { message: serializeMessage(message) } });
 });
 
@@ -1657,6 +1740,7 @@ export const myAdvertisements = handle('advertisements.my', async (req, res) => 
 });
 
 export const createAdvertisement = handle('advertisements.create', async (req, res) => {
+  await assertDriverVerified(req);
   const advertisement = await prisma.advertisement.create({
     data: {
       driverId: req.user.id,
@@ -2531,6 +2615,9 @@ export const adminSupportConversations = async (req, res) => {
             email: true,
             phone: true
           }
+        },
+        handledBy: {
+          select: { id: true, fullName: true, role: true }
         }
       },
       orderBy: { createdAt: 'desc' }
@@ -2574,7 +2661,9 @@ export const adminSupportConversations = async (req, res) => {
           },
           lastMessage: msg.body,
           lastMessageDate: msg.createdAt,
-          messageCount: 1
+          messageCount: 1,
+          agents: [],
+          lastAgent: null
         });
       } else {
         const existing = conversationMap.get(user.id);
@@ -2585,6 +2674,15 @@ export const adminSupportConversations = async (req, res) => {
           existing.body = msg.body;
           existing.createdAt = msg.createdAt;
         }
+      }
+
+      // Traçabilité : agent réel ayant répondu (sur les messages du support).
+      if (isSupportSender && msg.handledBy) {
+        const entry = conversationMap.get(user.id);
+        const agent = { id: msg.handledBy.id, fullName: msg.handledBy.fullName };
+        // Messages triés desc → le premier vu est le plus récent.
+        if (!entry.lastAgent) entry.lastAgent = agent;
+        if (!entry.agents.some((a) => a.id === agent.id)) entry.agents.push(agent);
       }
     }
 
@@ -2727,6 +2825,13 @@ export const adminSupportThread = async (req, res) => {
             email: true,
             phone: true
           }
+        },
+        handledBy: {
+          select: {
+            id: true,
+            fullName: true,
+            role: true
+          }
         }
       },
       orderBy: { createdAt: 'asc' }
@@ -2780,6 +2885,12 @@ export const adminSupportThread = async (req, res) => {
           receiverId: m.receiverId,
           parcelId: m.parcelId,
           audioUrl: m.audioUrl,
+          photoUrl: m.photoUrl,
+          videoUrl: m.videoUrl,
+          handledById: m.handledById,
+          handledBy: m.handledBy
+            ? { id: m.handledBy.id, fullName: m.handledBy.fullName, role: m.handledBy.role }
+            : null,
           sender: m.sender ? {
             id: m.sender.id,
             fullName: m.sender.fullName,
@@ -2818,12 +2929,13 @@ export const adminSupportThread = async (req, res) => {
  */
 export const adminSupportReply = async (req, res) => {
   try {
-    const { supportUserId, receiverId, body } = req.body;
+    const { supportUserId, receiverId, body, audioUrl, photoUrl, videoUrl } = req.body;
 
     console.log('📨 adminSupportReply - supportUserId:', supportUserId);
     console.log('📨 adminSupportReply - receiverId:', receiverId);
 
-    if (!supportUserId || !receiverId || !body) {
+    const hasContent = Boolean(body || audioUrl || photoUrl || videoUrl);
+    if (!supportUserId || !receiverId || !hasContent) {
       return res.status(400).json({
         success: false,
         message: 'Données manquantes',
@@ -2832,7 +2944,7 @@ export const adminSupportReply = async (req, res) => {
           details: [
             !supportUserId ? { path: 'supportUserId', message: 'supportUserId est requis' } : null,
             !receiverId ? { path: 'receiverId', message: 'receiverId est requis' } : null,
-            !body ? { path: 'body', message: 'body est requis' } : null
+            !hasContent ? { path: 'body', message: 'Message vide (texte ou pièce jointe requis)' } : null
           ].filter(Boolean)
         }
       });
@@ -2884,11 +2996,18 @@ export const adminSupportReply = async (req, res) => {
     }
 
     // Créer le message
+    // On attribue le message au compte support partagé (identité vue par le
+    // client : "Support Commercial/Technique"), MAIS on enregistre l'agent réel
+    // qui a répondu (req.user) dans handledById, pour la traçabilité interne.
     const message = await prisma.message.create({
       data: {
         senderId: supportUserId,
         receiverId: receiverId,
-        body: body,
+        body: body || '',
+        audioUrl: audioUrl || null,
+        photoUrl: photoUrl || null,
+        videoUrl: videoUrl || null,
+        handledById: req.user?.id || null,
         parcelId: null,
         isRead: false
       },
@@ -2899,7 +3018,11 @@ export const adminSupportReply = async (req, res) => {
         receiverId: true,
         isRead: true,
         createdAt: true,
-        audioUrl: true
+        audioUrl: true,
+        photoUrl: true,
+        videoUrl: true,
+        handledById: true,
+        handledBy: { select: { id: true, fullName: true, role: true } }
       }
     });
 
@@ -2911,7 +3034,13 @@ export const adminSupportReply = async (req, res) => {
         userId: receiverId,
         type: 'support_reply',
         title: 'Nouvelle réponse du support',
-        body: `Le support vous a répondu: ${body.substring(0, 100)}${body.length > 100 ? '...' : ''}`,
+        body: body
+          ? `Le support vous a répondu: ${body.substring(0, 100)}${body.length > 100 ? '...' : ''}`
+          : photoUrl
+            ? 'Le support vous a envoyé une photo'
+            : videoUrl
+              ? 'Le support vous a envoyé une vidéo'
+              : 'Le support vous a envoyé un message vocal',
         data: { supportUserId, messageId: message.id },
         priority: 'high'
       }

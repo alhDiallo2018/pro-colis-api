@@ -54,6 +54,7 @@ export function serializeUser(user) {
     cancelledDeliveries: user.cancelledDeliveries,
     isEmailVerified: user.isEmailVerified,
     isPhoneVerified: user.isPhoneVerified,
+    isVerified: user.isVerified ?? false,
     isProfileComplete: user.isProfileComplete,
     lastLogin: dateToIso(user.lastLogin),
     lastActiveAt: dateToIso(user.lastActiveAt),

@@ -98,6 +98,8 @@ function serializeZone(zone, extra = {}) {
     radiusKm: zone.radiusKm != null ? number(zone.radiusKm) : DEFAULT_RADIUS_KM,
     boundary: zone.boundary ?? null,
     isActive: zone.isActive,
+    status: zone.status ?? 'approved',
+    source: zone.source ?? 'manual',
     parentId: zone.parentId ?? null,
     metadata: zone.metadata ?? {},
     _count: zone._count ? { driverZones: zone._count.driverZones ?? 0 } : undefined,
@@ -143,6 +145,8 @@ function zonePayload(body, { partial = false } = {}) {
           : undefined,
     boundary: body.boundary,
     isActive: body.isActive,
+    status: body.status,
+    source: body.source,
     parentId: body.parentId,
     metadata: body.metadata
   });
@@ -168,7 +172,7 @@ function zonePayload(body, { partial = false } = {}) {
 
 export const listPublicZones = handle('zones.public', async (_req, res) => {
   const zones = await prisma.zone.findMany({
-    where: { isActive: true },
+    where: { isActive: true, status: 'approved' },
     orderBy: { name: 'asc' },
     include: { _count: { select: { driverZones: true } } }
   });
@@ -191,7 +195,7 @@ export const detectZones = handle('zones.detect', async (req, res) => {
   }
 
   const zones = await prisma.zone.findMany({
-    where: { isActive: true },
+    where: { isActive: true, status: 'approved' },
     include: { _count: { select: { driverZones: true } } }
   });
 
@@ -215,9 +219,104 @@ export const detectZones = handle('zones.detect', async (req, res) => {
   });
 });
 
+/**
+ * Résout un lieu Google Places en zone, en la créant à la volée si besoin.
+ * Idempotent : keyé par placeId (contrainte unique) puis par proximité.
+ * Une zone créée automatiquement est en statut "pending" (à valider par un admin)
+ * et n'est donc pas encore proposée publiquement.
+ * Body : { placeId?, name, displayName?, latitude, longitude, country?, region?, city? }
+ */
+export const resolveZone = handle('zones.resolve', async (req, res) => {
+  const { placeId, name, displayName, country, region, city } = req.body;
+  const latitude = number(req.body.latitude, NaN);
+  const longitude = number(req.body.longitude, NaN);
+
+  if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
+    throw new ValidationError([{ path: 'body.latitude', message: 'Latitude et longitude requises' }]);
+  }
+  if (!placeId && !name) {
+    throw new ValidationError([{ path: 'body.placeId', message: 'placeId ou name requis' }]);
+  }
+
+  // 1) Correspondance exacte par Google Place ID (idempotence).
+  if (placeId) {
+    const byPlace = await prisma.zone.findUnique({
+      where: { placeId },
+      include: { _count: { select: { driverZones: true } }, parent: { select: { id: true, name: true } } }
+    });
+    if (byPlace) {
+      return ok(res, {
+        message: 'Zone existante',
+        data: { data: serializeZone(byPlace), created: false, matchedBy: 'placeId' }
+      });
+    }
+  }
+
+  // 2) Sinon, une zone approuvée couvre-t-elle déjà ce point ? (évite les doublons)
+  const approved = await prisma.zone.findMany({
+    where: { isActive: true, status: 'approved' },
+    include: { _count: { select: { driverZones: true } }, parent: { select: { id: true, name: true } } }
+  });
+  let nearestContainer = null;
+  let nearestContainerDist = Infinity;
+  let nearestAny = null;
+  let nearestAnyDist = Infinity;
+  for (const z of approved) {
+    const d = haversineKm(latitude, longitude, number(z.latitude), number(z.longitude));
+    const radius = z.radiusKm != null ? number(z.radiusKm) : DEFAULT_RADIUS_KM;
+    if (d <= radius && d < nearestContainerDist) { nearestContainer = z; nearestContainerDist = d; }
+    if (d < nearestAnyDist) { nearestAny = z; nearestAnyDist = d; }
+  }
+  if (nearestContainer) {
+    return ok(res, {
+      message: 'Zone existante (proximité)',
+      data: { data: serializeZone(nearestContainer, { distanceKm: Math.round(nearestContainerDist * 100) / 100 }), created: false, matchedBy: 'proximity' }
+    });
+  }
+
+  // 3) Création à la volée en attente de validation. Rattachement best-effort au
+  // plus proche parent approuvé (≤ 150 km) pour amorcer la hiérarchie.
+  const parentId = nearestAny && nearestAnyDist <= 150 ? nearestAny.id : undefined;
+  const created = await prisma.$transaction(async (tx) => {
+    const zone = await tx.zone.create({
+      data: cleanUndefined({
+        name: name || displayName || city || 'Zone',
+        displayName: displayName || name,
+        placeId: placeId || undefined,
+        type: 'CIRCLE',
+        country,
+        region,
+        city,
+        latitude: String(latitude),
+        longitude: String(longitude),
+        radiusKm: String(DEFAULT_RADIUS_KM),
+        isActive: true,
+        status: 'pending',
+        source: 'places',
+        parentId,
+        metadata: { createdBy: req.user?.id ?? null }
+      }),
+      include: { _count: { select: { driverZones: true } }, parent: { select: { id: true, name: true } } }
+    });
+    await audit(tx, req, {
+      action: 'zone.autocreate',
+      entityType: 'zone',
+      entityId: zone.id,
+      afterData: { name: zone.name, placeId: zone.placeId, status: 'pending', source: 'places' }
+    });
+    return zone;
+  });
+
+  return ok(res, {
+    status: 201,
+    message: 'Zone créée (en attente de validation)',
+    data: { data: serializeZone(created), created: true, pending: true }
+  });
+});
+
 export const listZones = handle('zones.list', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const { country, city, type, search } = req.query;
+  const { country, city, type, search, status, source } = req.query;
   const isActive =
     req.query.isActive === undefined ? undefined : String(req.query.isActive) === 'true';
 
@@ -226,6 +325,8 @@ export const listZones = handle('zones.list', async (req, res) => {
     city: city ? { contains: city, mode: 'insensitive' } : undefined,
     type: type || undefined,
     isActive,
+    status: status && ['approved', 'pending', 'rejected'].includes(status) ? status : undefined,
+    source: source || undefined,
     ...(search
       ? {
           OR: [
@@ -294,6 +395,38 @@ export const createZone = handle('zones.create', async (req, res) => {
   });
 
   return ok(res, { status: 201, message: 'Zone creee', data: { data: serializeZone(zone) } });
+});
+
+/** Admin : approuver / rejeter une zone en attente (status = approved | rejected). */
+export const setZoneStatus = handle('zones.setStatus', async (req, res) => {
+  const status = String(req.body.status || '').toLowerCase();
+  if (!['approved', 'rejected', 'pending'].includes(status)) {
+    throw new ValidationError([{ path: 'body.status', message: 'Statut invalide (approved, rejected, pending)' }]);
+  }
+  const existing = await prisma.zone.findUnique({ where: { id: req.params.zoneId } });
+  if (!existing) throw new NotFoundError('Zone introuvable');
+
+  const zone = await prisma.$transaction(async (tx) => {
+    const updated = await tx.zone.update({
+      where: { id: existing.id },
+      data: cleanUndefined({
+        status,
+        // Une zone rejetée est désactivée ; une zone approuvée est (ré)activée.
+        isActive: status === 'rejected' ? false : status === 'approved' ? true : undefined
+      }),
+      include: { _count: { select: { driverZones: true } }, parent: { select: { id: true, name: true } } }
+    });
+    await audit(tx, req, {
+      action: 'zone.setStatus',
+      entityType: 'zone',
+      entityId: existing.id,
+      beforeData: { status: existing.status },
+      afterData: { status }
+    });
+    return updated;
+  });
+
+  return ok(res, { message: 'Statut de la zone mis à jour', data: { data: serializeZone(zone) } });
 });
 
 export const updateZone = handle('zones.update', async (req, res) => {
