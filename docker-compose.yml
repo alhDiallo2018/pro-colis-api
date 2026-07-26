@@ -24,6 +24,11 @@ services:
       POSTGRES_DB: procolis
       POSTGRES_USER: procolis
       POSTGRES_PASSWORD: procolis
+    # Expose la base a l'hote pour que la suite de tests et le CLI Prisma
+    # puissent l'atteindre : le hostname `postgres` n'existe que dans le
+    # reseau Docker. Port decale, 5432 etant deja pris sur l'hote.
+    ports:
+      - "${POSTGRES_PORT:-15432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:

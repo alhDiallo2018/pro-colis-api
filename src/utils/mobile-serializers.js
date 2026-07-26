@@ -33,6 +33,14 @@ export function serializeGarage(garage) {
 
 export function serializeUser(user) {
   if (!user) return null;
+
+  // Le vehicule est une relation (table `vehicles`), pas des colonnes de
+  // `users`. On l'aplatit ici pour que les clients disposent de la plaque et
+  // du modele sans requete supplementaire — a condition que l'appelant ait
+  // inclus la relation. Sans include, on n'invente rien : les champs restent
+  // absents plutot que faussement vides.
+  const vehicle = Array.isArray(user.vehicles) ? user.vehicles[0] : user.vehicle;
+
   return {
     id: user.id,
     email: user.email,
@@ -47,6 +55,11 @@ export function serializeUser(user) {
     gender: user.gender,
     garageId: user.garageId,
     garageName: user.garage?.name,
+    vehicleId: vehicle?.id,
+    vehiclePlate: vehicle?.plateNumber,
+    vehicleModel: vehicle?.model,
+    vehicleType: vehicle?.type,
+    vehicleCapacity: vehicle?.capacity,
     driverStatus: user.driverStatus,
     rating: decimalToString(user.rating),
     totalDeliveries: user.totalDeliveries,
@@ -161,6 +174,11 @@ export function serializeParcel(parcel) {
     isFreeForBidding: parcel.isFreeForBidding,
     selectedBidId: parcel.selectedBidId,
     paymentMethod: parcel.paymentMethod,
+    paymentChannel: parcel.paymentChannel,
+    acceptedPaymentChannels: parcel.acceptedPaymentChannels || [],
+    cashCollectionPoint: parcel.cashCollectionPoint,
+    cashCollectedAmount: decimalToString(parcel.cashCollectedAmount),
+    cashCollectedAt: dateToIso(parcel.cashCollectedAt),
     paymentPhoneNumber: parcel.paymentPhoneNumber,
     paymentStatus: parcel.paymentStatus,
     signatureUrl: parcel.signatureUrl,
@@ -185,11 +203,18 @@ export function serializeParcel(parcel) {
 
 export function serializePayment(payment) {
   if (!payment) return null;
+  const metadata = payment.metadata && typeof payment.metadata === 'object'
+    ? payment.metadata
+    : {};
+
+  // Les détails propres à une déclaration cash restent dans metadata en base,
+  // mais sont aussi exposés à plat pour un contrat identique sur mobile et web.
   return {
     id: payment.id,
     userId: payment.userId,
     parcelId: payment.parcelId,
     trackingNumber: payment.parcel?.trackingNumber,
+    parcel: serializeParcel(payment.parcel),
     amount: decimalToString(payment.amount),
     currency: payment.currency,
     method: payment.method,
@@ -197,7 +222,18 @@ export function serializePayment(payment) {
     transactionId: payment.transactionId,
     phoneNumber: payment.phoneNumber,
     reference: payment.reference,
-    metadata: payment.metadata,
+    metadata,
+    userName: payment.user?.fullName || metadata.declaredByName,
+    channel: metadata.channel || (payment.method === 'cash' ? 'cash' : 'platform'),
+    cashCollectionPoint: metadata.cashCollectionPoint,
+    declaredBy: metadata.declaredBy,
+    declaredByName: metadata.declaredByName,
+    declaredAt: metadata.declaredAt,
+    declarationNote: metadata.declarationNote,
+    declarationProofUrl: metadata.declarationProofUrl,
+    rejectionReason: metadata.rejectionReason,
+    rejectedAt: metadata.rejectedAt,
+    rejectedBy: metadata.rejectedBy,
     receiptUrl: payment.receiptUrl,
     validatedBy: payment.validatedBy,
     validatedAt: dateToIso(payment.validatedAt),

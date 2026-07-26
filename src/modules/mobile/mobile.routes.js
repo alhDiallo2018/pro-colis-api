@@ -39,6 +39,8 @@ mobileRouter.put('/driver/parcels/:parcelId/transit', authenticate, requireRoles
 mobileRouter.put('/driver/parcels/:parcelId/arrived', authenticate, requireRoles('driver'), mobileController.driverArrived);
 mobileRouter.put('/driver/parcels/:parcelId/out-for-delivery', authenticate, requireRoles('driver'), mobileController.driverOutForDelivery);
 mobileRouter.put('/driver/parcels/:parcelId/deliver', authenticate, requireRoles('driver'), mobileController.driverDeliver);
+mobileRouter.post('/driver/parcels/:parcelId/declare-cash', authenticate, requireRoles('driver'), mobileController.declareCashCollection);
+mobileRouter.get('/driver/cash-declarations', authenticate, requireRoles('driver'), mobileController.driverCashDeclarations);
 mobileRouter.post('/driver/bids', authenticate, requireRoles('driver'), mobileController.createBid);
 mobileRouter.get('/driver/bids/sent', authenticate, requireRoles('driver'), mobileController.driverBidsSent);
 mobileRouter.post('/driver/location', authenticate, requireRoles('driver'), mobileController.saveDriverLocation);
@@ -64,12 +66,18 @@ mobileRouter.get('/garage-admin/reports/daily', authenticate, requireRoles('admi
 mobileRouter.get('/garage-admin/reports/monthly', authenticate, requireRoles('admin'), mobileController.garageMonthlyReport);
 mobileRouter.get('/garage-admin/reports/export', authenticate, requireRoles('admin'), mobileController.garageExport);
 
+// L'espace support du web (super admin, support, support technique et
+// commercial) consulte les colis, les utilisateurs et les compteurs globaux.
+// La lecture est ouverte aux quatre rôles ; les écritures restent réservées au
+// super admin et au rôle support historique.
+const supportReadRoles = requireRoles('super_admin', 'support', 'support_technique', 'support_commercial');
+
 mobileRouter.put('/super-admin/profile', authenticate, requireRoles('super_admin', 'support'), mobileController.updateProfile);
-mobileRouter.get('/super-admin/stats', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminStats);
-mobileRouter.get('/super-admin/stats/advanced', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminStats);
-mobileRouter.get('/super-admin/users', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUsers);
+mobileRouter.get('/super-admin/stats', authenticate, supportReadRoles, mobileController.superAdminStats);
+mobileRouter.get('/super-admin/stats/advanced', authenticate, supportReadRoles, mobileController.superAdminStats);
+mobileRouter.get('/super-admin/users', authenticate, supportReadRoles, mobileController.superAdminUsers);
 mobileRouter.post('/super-admin/users', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminCreateUser);
-mobileRouter.get('/super-admin/users/:userId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUserDetail);
+mobileRouter.get('/super-admin/users/:userId', authenticate, supportReadRoles, mobileController.superAdminUserDetail);
 mobileRouter.put('/super-admin/users/:userId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateUser);
 mobileRouter.patch('/super-admin/users/:userId/role', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateUserRole);
 mobileRouter.patch('/super-admin/users/:userId/status', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateUserStatus);
@@ -80,9 +88,9 @@ mobileRouter.post('/super-admin/garages', authenticate, requireRoles('super_admi
 mobileRouter.get('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminGarageDetail);
 mobileRouter.put('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateGarage);
 mobileRouter.delete('/super-admin/garages/:garageId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminDeleteGarage);
-mobileRouter.get('/super-admin/parcels', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminParcels);
+mobileRouter.get('/super-admin/parcels', authenticate, supportReadRoles, mobileController.superAdminParcels);
 mobileRouter.post('/super-admin/parcels/create', authenticate, requireRoles('super_admin', 'support'), mobileController.createParcel);
-mobileRouter.get('/super-admin/parcels/:parcelId', authenticate, requireRoles('super_admin', 'support'), mobileController.getParcelDetail);
+mobileRouter.get('/super-admin/parcels/:parcelId', authenticate, supportReadRoles, mobileController.getParcelDetail);
 mobileRouter.put('/super-admin/parcels/:parcelId', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminUpdateParcel);
 mobileRouter.put('/super-admin/parcels/:parcelId/status', authenticate, requireRoles('super_admin', 'support'), mobileController.updateParcelStatus);
 mobileRouter.delete('/super-admin/parcels/:parcelId', authenticate, requireRoles('super_admin', 'support'), mobileController.cancelParcel);
@@ -90,6 +98,12 @@ mobileRouter.get('/super-admin/reports/daily', authenticate, requireRoles('super
 mobileRouter.get('/super-admin/reports/monthly', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminMonthlyReport);
 mobileRouter.get('/super-admin/export', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminExport);
 mobileRouter.get('/super-admin/audit-logs', authenticate, requireRoles('super_admin', 'support'), mobileController.auditLogs);
+mobileRouter.get('/super-admin/payments/cash-declarations', authenticate, requireRoles('super_admin', 'support'), mobileController.pendingCashDeclarations);
+mobileRouter.post('/super-admin/payments/:paymentId/validate-cash', authenticate, requireRoles('super_admin', 'support'), mobileController.validateCashDeclaration);
+mobileRouter.post('/super-admin/payments/:paymentId/reject-cash', authenticate, requireRoles('super_admin', 'support'), mobileController.rejectCashDeclaration);
+// Lecture des annonces ouverte a tous les roles (la configuration complete
+// reste protegee juste en dessous).
+mobileRouter.get('/public/broadcasts', optionalAuthenticate, mobileController.getPublicBroadcasts);
 mobileRouter.get('/super-admin/config', authenticate, requireRoles('super_admin', 'support'), mobileController.getSystemConfig);
 mobileRouter.put('/super-admin/config', authenticate, requireRoles('super_admin', 'support'), mobileController.updateSystemConfig);
 mobileRouter.post('/super-admin/backup', authenticate, requireRoles('super_admin', 'support'), mobileController.createBackup);
@@ -114,6 +128,7 @@ mobileRouter.get('/parcels/:parcelId/timeline', authenticate, mobileController.p
 mobileRouter.post('/parcels/:parcelId/notes', authenticate, mobileController.addParcelNote);
 mobileRouter.get('/parcels/:parcelId/notes', authenticate, mobileController.getParcelNotes);
 mobileRouter.get('/parcels/:parcelId/proof', authenticate, mobileController.deliveryProof);
+mobileRouter.patch('/parcels/:parcelId/payment-channel', authenticate, mobileController.setParcelPaymentChannel);
 mobileRouter.post('/parcels/estimate', optionalAuthenticate, mobileController.estimateParcel);
 
 mobileRouter.post('/payments/initiate', authenticate, mobileController.initiatePayment);
@@ -153,24 +168,35 @@ mobileRouter.patch('/messages/:messageId/read', authenticate, mobileController.r
 mobileRouter.post('/support/messages', authenticate, mobileController.createSupportMessage);
 mobileRouter.get('/support/messages', authenticate, mobileController.listSupportMessages);
 // Admin routes for support
+// Les agents support technique et commercial traitent les conversations au
+// même titre que le rôle support historique — sans eux, l'espace /support-admin
+// du web renvoyait 403 sur sa page principale.
+const supportChatRoles = requireRoles(
+    'super_admin',
+    'admin',
+    'support',
+    'support_technique',
+    'support_commercial'
+);
+
 mobileRouter.get(
     '/messages/admin/support/conversations',
     authenticate,
-    requireRoles('super_admin', 'admin', 'support'),
+    supportChatRoles,
     mobileController.adminSupportConversations
 );
 
 mobileRouter.get(
     '/messages/admin/support/conversations/:supportUserId/:userId',
     authenticate,
-    requireRoles('super_admin', 'admin', 'support'),
+    supportChatRoles,
     mobileController.adminSupportThread
 );
 
 mobileRouter.post(
     '/messages/admin/support/reply',
     authenticate,
-    requireRoles('super_admin', 'admin', 'support'),
+    supportChatRoles,
     mobileController.adminSupportReply
 );
 mobileRouter.post('/ratings', authenticate, mobileController.createRating);
@@ -190,7 +216,7 @@ mobileRouter.get('/coupons/available', authenticate, mobileController.availableC
 mobileRouter.get('/search/parcels', authenticate, mobileController.searchParcels);
 
 mobileRouter.post('/identity/verify', authenticate, mobileController.createIdentityVerification);
-mobileRouter.post('/identity/upload', authenticate, mobileController.identityUploadPlaceholder);
+mobileRouter.post('/identity/upload', authenticate, mobileController.identityUpload);
 mobileRouter.get('/identity/status', authenticate, mobileController.identityStatus);
 
 mobileRouter.get('/advertisements', optionalAuthenticate, mobileController.listAdvertisements);
@@ -250,11 +276,19 @@ mobileRouter.post('/super-admin/scores/:userId/remove', authenticate, requireRol
 // Driver detail (combined reputation + finance)
 mobileRouter.get('/super-admin/drivers/:userId', authenticate, requireRoles('super_admin', 'support'), adminReputationController.driverDetail);
 
-// Assistances — journal des interactions d'assistance (mail / chat / appel)
-mobileRouter.get('/super-admin/assistances', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.listAssistances);
-mobileRouter.post('/super-admin/assistances', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.createAssistance);
-mobileRouter.get('/super-admin/assistances/:assistanceId', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.getAssistance);
-mobileRouter.put('/super-admin/assistances/:assistanceId', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.updateAssistance);
+// Assistances — journal des interactions d'assistance (mail / chat / appel).
+// Les supports technique et commercial codifient eux-mêmes l'assistance qu'ils
+// viennent de rendre : ils lisent, créent et mettent à jour. La suppression
+// reste réservée au super admin (et au rôle `support` historique) pour ne pas
+// effacer la trace d'une intervention.
+// `/assistances/users/search` est déclarée avant `/:assistanceId`, sinon Express
+// prendrait « users » pour un identifiant.
+const assistanceRoles = requireRoles('super_admin', 'support', 'support_technique', 'support_commercial');
+mobileRouter.get('/super-admin/assistances', authenticate, assistanceRoles, adminAssistanceController.listAssistances);
+mobileRouter.post('/super-admin/assistances', authenticate, assistanceRoles, adminAssistanceController.createAssistance);
+mobileRouter.get('/super-admin/assistances/users/search', authenticate, assistanceRoles, adminAssistanceController.searchAssistanceUsers);
+mobileRouter.get('/super-admin/assistances/:assistanceId', authenticate, assistanceRoles, adminAssistanceController.getAssistance);
+mobileRouter.put('/super-admin/assistances/:assistanceId', authenticate, assistanceRoles, adminAssistanceController.updateAssistance);
 mobileRouter.delete('/super-admin/assistances/:assistanceId', authenticate, requireRoles('super_admin', 'support'), adminAssistanceController.deleteAssistance);
 
 // Vérifications d'identité chauffeur (KYC) — revue admin
@@ -268,4 +302,3 @@ mobileRouter.post('/super-admin/expenses', authenticate, requireRoles('super_adm
 mobileRouter.get('/super-admin/expenses/:expenseId', authenticate, requireRoles('super_admin', 'support'), adminExpenseController.getExpense);
 mobileRouter.put('/super-admin/expenses/:expenseId', authenticate, requireRoles('super_admin', 'support'), adminExpenseController.updateExpense);
 mobileRouter.delete('/super-admin/expenses/:expenseId', authenticate, requireRoles('super_admin', 'support'), adminExpenseController.deleteExpense);
-

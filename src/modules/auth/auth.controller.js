@@ -1,5 +1,5 @@
 import { ok, fail } from '../../utils/api-response.js';
-import { serializeUser } from '../../utils/user-serializer.js';
+import { serializeUser } from '../../utils/mobile-serializers.js';
 import * as authService from './auth.service.js';
 import { sendOtpSms, sendOtpEmail, isBrevoConfigured } from '../../utils/brevo.js';
 

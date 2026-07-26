@@ -71,11 +71,54 @@ const includeRelations = {
   handledBy: { select: { id: true, fullName: true } }
 };
 
+/**
+ * Recherche d'utilisateurs pour rattacher une assistance à un compte existant :
+ * le support choisit la personne assistée au lieu de retaper son nom. Sans
+ * terme de recherche, on renvoie les comptes les plus récemment actifs pour que
+ * la liste ne soit jamais vide à l'ouverture.
+ */
+export const searchAssistanceUsers = handle('assistance.users.search', async (req, res) => {
+  const search = String(req.query.search ?? req.query.q ?? '').trim();
+  const limit = Math.min(Math.max(Number(req.query.limit) || 12, 1), 25);
+
+  const users = await prisma.user.findMany({
+    where: {
+      deletedAt: null,
+      ...(search
+        ? {
+            OR: [
+              { fullName: { contains: search, mode: 'insensitive' } },
+              { phone: { contains: search } },
+              { email: { contains: search, mode: 'insensitive' } }
+            ]
+          }
+        : {})
+    },
+    select: {
+      id: true,
+      fullName: true,
+      phone: true,
+      email: true,
+      role: true,
+      city: true,
+      status: true
+    },
+    orderBy: search ? { fullName: 'asc' } : [{ lastActiveAt: 'desc' }, { createdAt: 'desc' }],
+    take: limit
+  });
+
+  return ok(res, { message: 'Utilisateurs', data: { users } });
+});
+
 export const listAssistances = handle('assistance.list', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const { search, channel, status } = req.query;
+  const { search, channel, status, mine } = req.query;
+
+  // `mine=1` : le support ne voit que les assistances qu'il a lui-même codifiées.
+  const onlyMine = (mine === '1' || mine === 'true') && Boolean(req.user?.id);
 
   const where = {
+    ...(onlyMine ? { handledById: req.user.id } : {}),
     ...(channel && CHANNELS.includes(channel) ? { channel } : {}),
     ...(status && STATUSES.includes(status) ? { status } : {}),
     ...(search
@@ -134,6 +177,14 @@ export const createAssistance = handle('assistance.create', async (req, res) => 
   if (!subject || !String(subject).trim()) {
     errors.push({ path: 'subject', message: 'Motif requis' });
   }
+  // La personne assistée doit être identifiée : soit un compte existant
+  // (le cas normal), soit une saisie libre quand elle n'est pas inscrite.
+  if (!userId && !String(contactName ?? '').trim()) {
+    errors.push({
+      path: 'userId',
+      message: 'Sélectionnez l’utilisateur assisté, ou saisissez son nom s’il n’est pas inscrit'
+    });
+  }
   if (errors.length) throw new ValidationError(errors);
 
   if (userId) {
@@ -144,6 +195,8 @@ export const createAssistance = handle('assistance.create', async (req, res) => 
   const finalStatus = STATUSES.includes(status) ? status : 'open';
   const code = await generateCode();
 
+  // Compte rattaché : la relation porte déjà nom et téléphone, la saisie libre
+  // n'a plus lieu d'être conservée en double.
   const assistance = await prisma.assistance.create({
     data: {
       code,
@@ -151,8 +204,8 @@ export const createAssistance = handle('assistance.create', async (req, res) => 
       subject: String(subject).trim(),
       notes: notes ? String(notes) : null,
       userId: userId || null,
-      contactName: contactName ? String(contactName) : null,
-      contactPhone: contactPhone ? String(contactPhone) : null,
+      contactName: userId ? null : contactName ? String(contactName) : null,
+      contactPhone: userId ? null : contactPhone ? String(contactPhone) : null,
       status: finalStatus,
       handledById: req.user?.id || null,
       resolvedAt: finalStatus === 'resolved' ? new Date() : null
@@ -184,14 +237,30 @@ export const updateAssistance = handle('assistance.update', async (req, res) => 
     ...(subject !== undefined ? { subject: String(subject).trim() } : {}),
     ...(notes !== undefined ? { notes: notes ? String(notes) : null } : {}),
     ...(contactName !== undefined ? { contactName: contactName ? String(contactName) : null } : {}),
-    ...(contactPhone !== undefined ? { contactPhone: contactPhone ? String(contactPhone) : null } : {}),
-    ...(userId !== undefined ? { userId: userId || null } : {})
+    ...(contactPhone !== undefined ? { contactPhone: contactPhone ? String(contactPhone) : null } : {})
   };
+
+  if (userId !== undefined) {
+    if (userId) {
+      const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
+      if (!user) throw new ValidationError([{ path: 'userId', message: 'Utilisateur introuvable' }]);
+      // Rattachement à un compte : la saisie libre devient redondante.
+      data.userId = userId;
+      data.contactName = null;
+      data.contactPhone = null;
+    } else {
+      data.userId = null;
+    }
+  }
 
   if (status !== undefined && status !== existing.status) {
     data.status = status;
     data.resolvedAt = status === 'resolved' ? new Date() : null;
   }
+
+  // Fiche sans traitant (import, ancienne saisie) : celui qui la reprend en
+  // devient le traitant, sinon la colonne resterait vide indéfiniment.
+  if (!existing.handledById && req.user?.id) data.handledById = req.user.id;
 
   const assistance = await prisma.assistance.update({
     where: { id: req.params.assistanceId },

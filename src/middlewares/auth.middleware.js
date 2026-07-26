@@ -12,7 +12,20 @@ export async function authenticate(req, _res, next) {
     }
 
     const payload = verifyAccessToken(token);
-    const user = await prisma.user.findUnique({ where: { id: payload.sub } });
+    // Garage et vehicule sont des relations : sans include, /auth/me renvoie un
+    // utilisateur sans nom de zone ni plaque, et les clients affichent des
+    // champs vides alors que la donnee existe.
+    const user = await prisma.user.findUnique({
+      where: { id: payload.sub },
+      include: {
+        garage: true,
+        vehicles: {
+          where: { deletedAt: null },
+          orderBy: { createdAt: 'desc' },
+          take: 1
+        }
+      }
+    });
 
     if (!user || user.status !== 'active') {
       throw new UnauthorizedError('Session invalide');

@@ -16,7 +16,7 @@ export async function listPublicGarages(req, res) {
     ]);
 
     return ok(res, {
-      message: 'Garages actifs',
+      message: 'Zones actives',
       data: { data: garages, garages },
       meta: paginationMeta({ page, limit, total })
     });
@@ -32,7 +32,7 @@ export async function listPublicGarages(req, res) {
 
     return fail(res, {
       status: 500,
-      message: 'Impossible de charger les garages'
+      message: 'Impossible de charger les zones'
     });
   }
 }

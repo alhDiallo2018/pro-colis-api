@@ -58,7 +58,7 @@ export function normalizeError(error) {
       const field = meta.field_name || meta.constraint;
       return new ValidationError(
         field ? [{ path: String(field), message: 'Reference introuvable' }] : [],
-        'Reference invalide (garage, chauffeur ou colis introuvable)'
+        'Reference invalide (zone, chauffeur ou colis introuvable)'
       );
     }
     if (error.code === 'P2025') {

@@ -14,6 +14,7 @@ import { garageRouter } from './modules/garages/garage.routes.js';
 import { notificationRouter, adminNotificationRouter } from './modules/notifications/notification.routes.js';
 import { uploadRouter } from './modules/uploads/upload.routes.js';
 import { mobileRouter } from './modules/mobile/mobile.routes.js';
+import { supportRouter } from './modules/support/support.routes.js';
 import { zoneRouter } from './modules/zones/zone.routes.js';
 
 const app = express();
@@ -52,6 +53,7 @@ apiV1.use('/notifications', notificationRouter);
 apiV1.use('/admin/notifications', adminNotificationRouter);
 apiV1.use('/upload', uploadRouter);
 apiV1.use('/', zoneRouter);
+apiV1.use('/', supportRouter);
 apiV1.use('/', mobileRouter);
 
 app.use('/api/v1', apiV1);
@@ -64,6 +66,7 @@ app.use('/notifications', notificationRouter);
 app.use('/admin/notifications', adminNotificationRouter);
 app.use('/upload', uploadRouter);
 app.use('/', zoneRouter);
+app.use('/', supportRouter);
 app.use('/', mobileRouter);
 
 app.use(notFoundMiddleware);

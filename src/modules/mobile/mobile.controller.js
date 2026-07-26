@@ -21,6 +21,73 @@ import { getPagination, paginationMeta } from '../../utils/pagination.js';
 import { generateTrackingNumber } from '../../utils/tracking-number.js';
 import { attemptDisbursement, toClientWithdrawalStatus } from '../../utils/withdrawal-flow.js';
 
+// Relations a charger des qu'un chauffeur est renvoye au client : le vehicule
+// vit dans sa propre table, il est absent de la reponse sans cet include et
+// les ecrans affichent « plaque non renseignee » alors qu'elle existe.
+const driverInclude = {
+  garage: true,
+  vehicles: {
+    where: { deletedAt: null },
+    orderBy: { createdAt: 'desc' },
+    take: 1
+  }
+};
+
+// Le vehicule etant une table a part, les formulaires admin qui envoient
+// `vehiclePlate` / `vehicleModel` doivent ecrire ici : sans cela ces champs
+// etaient silencieusement ignores et l'admin croyait avoir enregistre.
+async function syncDriverVehicle(client, user, body) {
+  const plateNumber = (body.vehiclePlate || '').trim();
+  const model = (body.vehicleModel || '').trim();
+  const type = (body.vehicleType || '').trim();
+  const hasCapacity = body.vehicleCapacity !== undefined && body.vehicleCapacity !== null;
+
+  if (!plateNumber && !model && !type && !hasCapacity) return;
+
+  const existing = await client.vehicle.findFirst({
+    where: { driverId: user.id, deletedAt: null },
+    orderBy: { createdAt: 'desc' }
+  });
+
+  // La plaque est unique : refuser explicitement plutot que de laisser
+  // l'erreur Prisma faire echouer toute l'operation sans message clair.
+  if (plateNumber) {
+    const clash = await client.vehicle.findFirst({
+      where: { plateNumber, deletedAt: null, NOT: { driverId: user.id } }
+    });
+    if (clash) {
+      throw new ConflictError('Cette plaque est deja attribuee a un autre vehicule');
+    }
+  }
+
+  if (existing) {
+    await client.vehicle.update({
+      where: { id: existing.id },
+      data: cleanUndefined({
+        plateNumber: plateNumber || undefined,
+        model: model || undefined,
+        type: type || undefined,
+        capacity: hasCapacity ? Number(body.vehicleCapacity) || 0 : undefined
+      })
+    });
+    return;
+  }
+
+  // Creation : plaque et modele sont obligatoires cote schema.
+  if (plateNumber && model) {
+    await client.vehicle.create({
+      data: {
+        plateNumber,
+        model,
+        type: type || 'van',
+        capacity: hasCapacity ? Number(body.vehicleCapacity) || 0 : 0,
+        garageId: user.garageId || null,
+        driverId: user.id
+      }
+    });
+  }
+}
+
 const parcelInclude = {
   departureGarage: true,
   arrivalGarage: true,
@@ -30,7 +97,21 @@ const parcelInclude = {
   media: { orderBy: { createdAt: 'asc' } }
 };
 
+// Les files cash affichent aussi le trajet du colis. Charger uniquement les
+// deux garages évite le graphe complet (offres, événements, médias) de
+// parcelInclude sur chaque ligne de paiement.
+const cashPaymentInclude = {
+  user: true,
+  parcel: {
+    include: {
+      departureGarage: true,
+      arrivalGarage: true
+    }
+  }
+};
+
 const ACTIVE_PARCEL_STATUSES = ['pending', 'free', 'confirmed', 'picked_up', 'in_transit', 'arrived', 'out_for_delivery'];
+const CASH_PAYMENT_STATUSES = ['processing', 'completed', 'failed'];
 
 function decimal(value, fallback = null) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -105,6 +186,15 @@ function handle(action, fn) {
 
 function parcelAccessWhere(user, parcelId) {
   if (user.role === 'super_admin') return { id: parcelId };
+  // `support` est le compte partage historique, co-equivalent de super_admin
+  // sur toutes les routes /super-admin/*.
+  if (user.role === 'support') return { id: parcelId };
+  // Le support instruit tickets et reclamations : il lit n'importe quel colis.
+  // L'ecriture reste refusee, aucune route de modification n'etant exposee
+  // sous les prefixes /support-technique et /support-commercial.
+  if (user.role === 'support_technique' || user.role === 'support_commercial') {
+    return { id: parcelId };
+  }
   if (user.role === 'client') return { id: parcelId, senderId: user.id };
   if (user.role === 'driver') return { id: parcelId, driverId: user.id };
   if (user.role === 'admin') {
@@ -113,6 +203,7 @@ function parcelAccessWhere(user, parcelId) {
       OR: [{ departureGarageId: user.garageId }, { arrivalGarageId: user.garageId }]
     };
   }
+  // Refus par defaut : un role non traite ne doit pas heriter d'un acces large.
   return { id: parcelId, senderId: '__none__' };
 }
 
@@ -188,7 +279,7 @@ function statusDescription(status) {
     confirmed: 'Colis confirme',
     picked_up: 'Colis ramasse',
     in_transit: 'Colis en transit',
-    arrived: 'Colis arrive au garage destination',
+    arrived: 'Colis arrive a la zone destination',
     out_for_delivery: 'Colis en livraison finale',
     delivered: 'Livraison confirmee',
     cancelled: 'Colis annule'
@@ -212,6 +303,32 @@ async function changeParcelStatus(req, parcel, status, extra = {}) {
       }),
       include: parcelInclude
     });
+
+    // Compteurs du chauffeur : ils alimentent le profil et les listes admin.
+    // Sans cette mise a jour ils restent a 0 a vie, ce qui affiche « 0
+    // livraison » a un chauffeur qui en a effectue plusieurs.
+    // La garde sur `parcel.status !== status` evite le double comptage si la
+    // meme transition est rejouee.
+    const driverId = updated.driverId;
+    if (driverId && parcel.status !== status) {
+      if (status === 'delivered') {
+        await tx.user.update({
+          where: { id: driverId },
+          data: {
+            completedDeliveries: { increment: 1 },
+            totalDeliveries: { increment: 1 }
+          }
+        });
+      } else if (status === 'cancelled') {
+        await tx.user.update({
+          where: { id: driverId },
+          data: {
+            cancelledDeliveries: { increment: 1 },
+            totalDeliveries: { increment: 1 }
+          }
+        });
+      }
+    }
 
     const event = await tx.parcelEvent.create({
       data: {
@@ -423,6 +540,11 @@ function buildParcelData(user, body) {
     isUrgent: Boolean(body.isUrgent),
     isFreeForBidding: isFree,
     paymentMethod: body.paymentMethod,
+    paymentChannel: body.paymentChannel,
+    acceptedPaymentChannels: Array.isArray(body.acceptedPaymentChannels)
+      ? body.acceptedPaymentChannels
+      : undefined,
+    cashCollectionPoint: body.cashCollectionPoint,
     paymentPhoneNumber: body.paymentPhoneNumber,
     notes: body.notes,
     createdBy: user.id
@@ -466,7 +588,19 @@ export const createParcel = handle('parcel.create', async (req, res) => {
 
 export const clientParcels = handle('client.parcels', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const where = cleanUndefined({ senderId: req.user.id, status: req.query.status, deletedAt: null });
+  // Le schéma ne lie pas encore le destinataire à un User : le numéro saisi à
+  // la création est donc l'unique critère fiable pour « colis reçus ». Sans
+  // filtre, on renvoie les deux côtés afin de préserver la vue agrégée.
+  const ownership = req.query.filter === 'received'
+    ? { receiverPhone: req.user.phone }
+    : req.query.filter === 'sent'
+      ? { senderId: req.user.id }
+      : { OR: [{ senderId: req.user.id }, { receiverPhone: req.user.phone }] };
+  const where = cleanUndefined({
+    ...ownership,
+    status: req.query.status,
+    deletedAt: null
+  });
   const [total, parcels] = await Promise.all([
     prisma.parcel.count({ where }),
     prisma.parcel.findMany({ where, include: parcelInclude, orderBy: { createdAt: 'desc' }, skip, take: limit })
@@ -495,7 +629,7 @@ export const garageParcels = handle('garage.parcels', async (req, res) => {
     prisma.parcel.count({ where }),
     prisma.parcel.findMany({ where, include: parcelInclude, orderBy: { createdAt: 'desc' }, skip, take: limit })
   ]);
-  return ok(res, { message: 'Colis garage', data: { parcels: parcels.map(serializeParcel) }, meta: paginationMeta({ page, limit, total }) });
+  return ok(res, { message: 'Colis zone', data: { parcels: parcels.map(serializeParcel) }, meta: paginationMeta({ page, limit, total }) });
 });
 
 export const superAdminParcels = handle('super.parcels', async (req, res) => {
@@ -619,7 +753,7 @@ export const driverTransit = handle('driver.transit', async (req, res) => {
 export const driverArrived = handle('driver.arrived', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'arrived', req.body);
-  return ok(res, { message: 'Colis arrive au garage', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
+  return ok(res, { message: 'Colis arrive a la zone', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
 export const driverOutForDelivery = handle('driver.outForDelivery', async (req, res) => {
@@ -997,6 +1131,324 @@ export const paymentHistory = handle('payment.history', async (req, res) => {
     prisma.payment.findMany({ where, include: { parcel: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
   ]);
   return ok(res, { message: 'Historique paiements', data: { payments: payments.map(serializePayment) }, meta: paginationMeta({ page, limit, total }) });
+});
+
+export const declareCashCollection = handle('payment.declareCash', async (req, res) => {
+  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const amount = Number(req.body.amount);
+  const collectionPoint = req.body.collectionPoint || parcel.cashCollectionPoint;
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new ValidationError([{ path: 'amount', message: 'Le montant encaissé doit être supérieur à zéro' }]);
+  }
+  if (!['sender_pickup', 'receiver_delivery'].includes(collectionPoint)) {
+    throw new ValidationError([{ path: 'collectionPoint', message: 'Point d’encaissement invalide' }]);
+  }
+
+  const resolvedChannel = parcel.paymentChannel || (parcel.paymentMethod === 'cash' ? 'cash' : null);
+  if (resolvedChannel !== 'cash') {
+    throw new ValidationError([{ path: 'parcelId', message: 'Ce colis n’est pas réglé en espèces' }]);
+  }
+
+  // Une déclaration n'est possible qu'après le jalon où l'argent est remis au
+  // chauffeur. Le contrôle serveur empêche un appel direct prématuré.
+  const pickedUpStatuses = ['picked_up', 'in_transit', 'arrived', 'out_for_delivery', 'delivered'];
+  const milestoneReached = collectionPoint === 'sender_pickup'
+    ? Boolean(parcel.pickupDate) || pickedUpStatuses.includes(parcel.status)
+    : parcel.status === 'delivered';
+  if (!milestoneReached) {
+    throw new ValidationError([{ path: 'parcelId', message: 'Le jalon d’encaissement de ce colis n’est pas encore atteint' }]);
+  }
+
+  const current = await prisma.payment.findFirst({
+    where: { parcelId: parcel.id, method: 'cash', status: { in: ['processing', 'completed'] } },
+    include: cashPaymentInclude,
+    orderBy: { createdAt: 'desc' }
+  });
+  if (current?.status === 'completed') {
+    throw new ConflictError('Cet encaissement a déjà été validé');
+  }
+  // L'appel est idempotent tant que la déclaration est en cours : un double
+  // tap ou une reprise réseau ne crée pas deux lignes à réconcilier.
+  if (current) {
+    return ok(res, { message: 'Encaissement déjà déclaré', data: { payment: serializePayment(current) } });
+  }
+
+  const declaredAt = new Date();
+  const result = await prisma.$transaction(async (tx) => {
+    const metadata = {
+      channel: 'cash',
+      cashCollectionPoint: collectionPoint,
+      declaredBy: req.user.id,
+      declaredByName: req.user.fullName,
+      declaredAt: declaredAt.toISOString(),
+      declarationNote: req.body.note || null,
+      declarationProofUrl: req.body.proofUrl || null
+    };
+    const payment = await tx.payment.create({
+      data: {
+        userId: req.user.id,
+        parcelId: parcel.id,
+        amount: decimal(amount, '0'),
+        currency: 'XOF',
+        method: 'cash',
+        status: 'processing',
+        reference: `CASH-${parcel.trackingNumber}-${Date.now()}`,
+        receiptUrl: req.body.proofUrl || null,
+        metadata
+      },
+      include: cashPaymentInclude
+    });
+    await tx.parcel.update({
+      where: { id: parcel.id },
+      data: {
+        paymentMethod: 'cash',
+        paymentChannel: 'cash',
+        cashCollectionPoint: collectionPoint,
+        cashCollectedAmount: decimal(amount, '0'),
+        cashCollectedAt: declaredAt,
+        paymentStatus: 'processing'
+      }
+    });
+    await audit(tx, req, {
+      action: 'payment.cash.declare',
+      entityType: 'payment',
+      entityId: payment.id,
+      afterData: { parcelId: parcel.id, amount, collectionPoint, status: 'processing' }
+    });
+    await notifyAdmins(
+      tx,
+      'payment_cash',
+      'Nouvel encaissement espèces',
+      `${req.user.fullName} a déclaré ${amount} FCFA pour le colis ${parcel.trackingNumber}.`,
+      { paymentId: payment.id, parcelId: parcel.id, amount, collectionPoint }
+    );
+    return payment;
+  });
+
+  return ok(res, { status: 201, message: 'Encaissement déclaré', data: { payment: serializePayment(result) } });
+});
+
+export const driverCashDeclarations = handle('payment.driverCashDeclarations', async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  if (req.query.status && !CASH_PAYMENT_STATUSES.includes(req.query.status)) {
+    throw new ValidationError([{ path: 'status', message: 'Statut de déclaration invalide' }]);
+  }
+  const where = {
+    userId: req.user.id,
+    method: 'cash',
+    ...(req.query.status ? { status: req.query.status } : {})
+  };
+  const [total, payments] = await Promise.all([
+    prisma.payment.count({ where }),
+    prisma.payment.findMany({
+      where,
+      include: cashPaymentInclude,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    })
+  ]);
+  return ok(res, {
+    message: 'Déclarations espèces chauffeur',
+    data: { declarations: payments.map(serializePayment) },
+    meta: paginationMeta({ page, limit, total })
+  });
+});
+
+export const pendingCashDeclarations = handle('payment.pendingCashDeclarations', async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  if (req.query.status && !CASH_PAYMENT_STATUSES.includes(req.query.status)) {
+    throw new ValidationError([{ path: 'status', message: 'Statut de déclaration invalide' }]);
+  }
+  const where = { method: 'cash', status: req.query.status || 'processing' };
+  const [total, payments] = await Promise.all([
+    prisma.payment.count({ where }),
+    prisma.payment.findMany({
+      where,
+      include: cashPaymentInclude,
+      orderBy: { createdAt: 'asc' },
+      skip,
+      take: limit
+    })
+  ]);
+  return ok(res, {
+    message: 'Encaissements espèces à réconcilier',
+    data: { declarations: payments.map(serializePayment) },
+    meta: paginationMeta({ page, limit, total })
+  });
+});
+
+export const validateCashDeclaration = handle('payment.validateCashDeclaration', async (req, res) => {
+  const result = await prisma.$transaction(async (tx) => {
+    const payment = await tx.payment.findFirst({
+      where: { id: req.params.paymentId, method: 'cash' },
+      include: cashPaymentInclude
+    });
+    if (!payment) throw new NotFoundError('Déclaration espèces introuvable');
+    if (payment.status !== 'processing') {
+      throw new ConflictError('Cette déclaration a déjà été traitée');
+    }
+
+    // La condition sur le statut rend la validation atomique : deux admins ne
+    // peuvent pas confirmer simultanément la même déclaration.
+    const claimed = await tx.payment.updateMany({
+      where: { id: payment.id, status: 'processing' },
+      data: {
+        status: 'completed',
+        validatedBy: req.user.id,
+        validatedAt: new Date(),
+        completedAt: new Date()
+      }
+    });
+    if (claimed.count !== 1) throw new ConflictError('Cette déclaration vient d’être traitée');
+
+    if (payment.parcelId) {
+      await tx.parcel.update({
+        where: { id: payment.parcelId },
+        data: {
+          paymentStatus: 'completed',
+          paymentChannel: 'cash',
+          cashCollectedAmount: payment.amount,
+          cashCollectedAt: payment.parcel?.cashCollectedAt || payment.createdAt
+        }
+      });
+    }
+    await audit(tx, req, {
+      action: 'payment.cash.validate',
+      entityType: 'payment',
+      entityId: payment.id,
+      beforeData: { status: 'processing' },
+      afterData: { status: 'completed' }
+    });
+    await notify(tx, {
+      userId: payment.userId,
+      parcelId: payment.parcelId || undefined,
+      senderId: req.user.id,
+      senderName: req.user.fullName,
+      type: 'payment_confirmed',
+      title: 'Encaissement espèces validé',
+      body: `Votre déclaration de ${Number(payment.amount)} FCFA a été validée.`,
+      data: { paymentId: payment.id, parcelId: payment.parcelId }
+    });
+    return tx.payment.findUnique({
+      where: { id: payment.id },
+      include: cashPaymentInclude
+    });
+  });
+  return ok(res, { message: 'Encaissement espèces validé', data: { payment: serializePayment(result) } });
+});
+
+export const rejectCashDeclaration = handle('payment.rejectCashDeclaration', async (req, res) => {
+  const reason = String(req.body.reason || '').trim();
+  if (!reason) {
+    throw new ValidationError([{ path: 'reason', message: 'Le motif du rejet est obligatoire' }]);
+  }
+
+  const result = await prisma.$transaction(async (tx) => {
+    const payment = await tx.payment.findFirst({
+      where: { id: req.params.paymentId, method: 'cash' },
+      include: cashPaymentInclude
+    });
+    if (!payment) throw new NotFoundError('Déclaration espèces introuvable');
+    if (payment.status !== 'processing') {
+      throw new ConflictError('Cette déclaration a déjà été traitée');
+    }
+
+    const rejectedAt = new Date();
+    const metadata = payment.metadata && typeof payment.metadata === 'object'
+      ? payment.metadata
+      : {};
+    const updated = await tx.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: 'failed',
+        validatedBy: req.user.id,
+        validatedAt: rejectedAt,
+        metadata: {
+          ...metadata,
+          rejectionReason: reason,
+          rejectedAt: rejectedAt.toISOString(),
+          rejectedBy: req.user.id
+        }
+      },
+      include: cashPaymentInclude
+    });
+    if (payment.parcelId) {
+      await tx.parcel.update({
+        where: { id: payment.parcelId },
+        data: {
+          paymentStatus: 'failed',
+          cashCollectedAmount: null,
+          cashCollectedAt: null
+        }
+      });
+    }
+    await audit(tx, req, {
+      action: 'payment.cash.reject',
+      entityType: 'payment',
+      entityId: payment.id,
+      beforeData: { status: 'processing' },
+      afterData: { status: 'failed', reason }
+    });
+    await notify(tx, {
+      userId: payment.userId,
+      parcelId: payment.parcelId || undefined,
+      senderId: req.user.id,
+      senderName: req.user.fullName,
+      type: 'payment_cash',
+      title: 'Déclaration espèces rejetée',
+      body: `Votre déclaration de ${Number(payment.amount)} FCFA a été rejetée : ${reason}`,
+      data: { paymentId: payment.id, parcelId: payment.parcelId, reason },
+      priority: 'high'
+    });
+    return updated;
+  });
+  return ok(res, { message: 'Déclaration espèces rejetée', data: { payment: serializePayment(result) } });
+});
+
+export const setParcelPaymentChannel = handle('parcel.setPaymentChannel', async (req, res) => {
+  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const channel = req.body.paymentChannel;
+  const collectionPoint = req.body.cashCollectionPoint;
+  if (!['cash', 'platform'].includes(channel)) {
+    throw new ValidationError([{ path: 'paymentChannel', message: 'Canal de paiement invalide' }]);
+  }
+  if (channel === 'cash' && !['sender_pickup', 'receiver_delivery'].includes(collectionPoint)) {
+    throw new ValidationError([{ path: 'cashCollectionPoint', message: 'Point d’encaissement obligatoire pour un paiement espèces' }]);
+  }
+  if (parcel.paymentStatus === 'completed') {
+    throw new ConflictError('Le canal d’un colis déjà payé ne peut plus être modifié');
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const value = await tx.parcel.update({
+      where: { id: parcel.id },
+      data: {
+        paymentChannel: channel,
+        paymentMethod: channel === 'cash'
+          ? 'cash'
+          : parcel.paymentMethod === 'cash' ? null : parcel.paymentMethod,
+        cashCollectionPoint: channel === 'cash' ? collectionPoint : null
+      },
+      include: parcelInclude
+    });
+    await audit(tx, req, {
+      action: 'parcel.paymentChannel.update',
+      entityType: 'parcel',
+      entityId: parcel.id,
+      beforeData: {
+        paymentChannel: parcel.paymentChannel,
+        cashCollectionPoint: parcel.cashCollectionPoint
+      },
+      afterData: {
+        paymentChannel: channel,
+        cashCollectionPoint: channel === 'cash' ? collectionPoint : null
+      }
+    });
+    return value;
+  });
+  return ok(res, { message: 'Canal de paiement mis à jour', data: { parcel: serializeParcel(updated) } });
 });
 
 export const confirmCashPayment = handle('payment.confirmCash', async (req, res) => {
@@ -1484,17 +1936,17 @@ export const addFavoriteGarage = handle('favorites.addGarage', async (req, res) 
     update: {},
     create: { userId: req.user.id, garageId: req.params.garageId }
   });
-  return ok(res, { message: 'Garage ajoute aux favoris' });
+  return ok(res, { message: 'Zone ajoutee aux favoris' });
 });
 
 export const removeFavoriteGarage = handle('favorites.removeGarage', async (req, res) => {
   await prisma.favoriteGarage.deleteMany({ where: { userId: req.user.id, garageId: req.params.garageId } });
-  return ok(res, { message: 'Garage retire des favoris' });
+  return ok(res, { message: 'Zone retiree des favoris' });
 });
 
 export const favoriteGarages = handle('favorites.garages', async (req, res) => {
   const favorites = await prisma.favoriteGarage.findMany({ where: { userId: req.user.id }, include: { garage: true } });
-  return ok(res, { message: 'Garages favoris', data: { garages: favorites.map((favorite) => serializeGarage(favorite.garage)) } });
+  return ok(res, { message: 'Zones favorites', data: { garages: favorites.map((favorite) => serializeGarage(favorite.garage)) } });
 });
 
 function serializeMessage(m) {
@@ -1679,21 +2131,21 @@ export const searchParcels = handle('search.parcels', async (req, res) => {
 export const searchDrivers = handle('drivers.search', async (req, res) => {
   const drivers = await prisma.user.findMany({
     where: cleanUndefined({ role: 'driver', status: 'active', city: req.query.city, garageId: req.query.garageId }),
-    include: { garage: true },
+    include: driverInclude,
     take: Number(req.query.limit || 100)
   });
   return ok(res, { message: 'Chauffeurs', data: { drivers: drivers.map(serializeUser) } });
 });
 
 export const publicDriverDetail = handle('drivers.detail', async (req, res) => {
-  const driver = await prisma.user.findFirst({ where: { id: req.params.driverId, role: 'driver' }, include: { garage: true } });
+  const driver = await prisma.user.findFirst({ where: { id: req.params.driverId, role: 'driver' }, include: driverInclude });
   if (!driver) throw new NotFoundError('Chauffeur introuvable');
   return ok(res, { message: 'Detail chauffeur', data: { driver: serializeUser(driver) } });
 });
 
 export const garagePublicDrivers = handle('drivers.garage', async (req, res) => {
-  const drivers = await prisma.user.findMany({ where: { role: 'driver', garageId: req.params.garageId, status: 'active' }, include: { garage: true } });
-  return ok(res, { message: 'Chauffeurs garage', data: { drivers: drivers.map(serializeUser) } });
+  const drivers = await prisma.user.findMany({ where: { role: 'driver', garageId: req.params.garageId, status: 'active' }, include: driverInclude });
+  return ok(res, { message: 'Chauffeurs zone', data: { drivers: drivers.map(serializeUser) } });
 });
 
 export const saveDriverLocation = handle('driver.location', async (req, res) => {
@@ -1708,20 +2160,67 @@ export const createIdentityVerification = handle('identity.verify', async (req, 
   return ok(res, { status: 201, message: 'Verification identite creee', data: { identity } });
 });
 
-export const identityUploadPlaceholder = handle('identity.upload', async (req, res) => {
+export const identityUpload = handle('identity.upload', async (req, res) => {
   const url = req.body.url || null;
+  const documentType = req.body.documentType;
   const side = req.body.side === 'back' ? 'documentBackUrl' : 'documentFrontUrl';
-  const identity = await prisma.identityVerification.upsert({
-    where: { id: req.body.identityId || '00000000-0000-4000-8000-000000000000' },
-    update: { [side]: url },
-    create: { userId: req.user.id, documentType: req.body.documentType, [side]: url }
-  }).catch(async () => prisma.identityVerification.create({ data: { userId: req.user.id, documentType: req.body.documentType, [side]: url } }));
+
+  if (!documentType) {
+    throw new ValidationError([{ path: 'body.documentType', message: 'Type de document requis' }]);
+  }
+
+  let identity;
+
+  // Les photos de vehicule forment une galerie : chaque envoi ajoute une
+  // entree. Les documents officiels, eux, sont uniques par type et portent
+  // leurs deux faces sur la meme ligne — les regrouper par (userId,
+  // documentType) evite que le recto et le verso atterrissent dans deux
+  // enregistrements distincts, ce qui rendait le verso irrecuperable.
+  if (documentType === 'vehicle_photo') {
+    identity = await prisma.identityVerification.create({
+      data: { userId: req.user.id, documentType, [side]: url }
+    });
+  } else {
+    const existing = await prisma.identityVerification.findFirst({
+      where: { userId: req.user.id, documentType },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    identity = existing
+      ? await prisma.identityVerification.update({
+        where: { id: existing.id },
+        // Un document renvoye repart en attente de validation.
+        data: { [side]: url, status: 'pending', rejectionReason: null }
+      })
+      : await prisma.identityVerification.create({
+        data: { userId: req.user.id, documentType, [side]: url }
+      });
+  }
+
   return ok(res, { message: 'Document identite enregistre', data: { url, identity } });
 });
 
 export const identityStatus = handle('identity.status', async (req, res) => {
-  const identity = await prisma.identityVerification.findFirst({ where: { userId: req.user.id }, orderBy: { createdAt: 'desc' } });
-  return ok(res, { message: 'Statut identite', data: { status: identity?.status || 'pending', identity } });
+  const documents = await prisma.identityVerification.findMany({
+    where: { userId: req.user.id },
+    orderBy: { createdAt: 'desc' }
+  });
+
+  const identity = documents[0] || null;
+
+  // `status` global : approuve seulement si tous les documents le sont,
+  // refuse des qu'un l'est. `documents` permet au client de restaurer chaque
+  // emplacement — `identity` seul ne rendait que le dernier envoi.
+  let status = 'pending';
+  if (documents.length) {
+    if (documents.some((doc) => doc.status === 'rejected')) {
+      status = 'rejected';
+    } else if (documents.every((doc) => doc.status === 'approved')) {
+      status = 'approved';
+    }
+  }
+
+  return ok(res, { message: 'Statut identite', data: { status, identity, documents } });
 });
 
 export const listAdvertisements = handle('advertisements.list', async (req, res) => {
@@ -1948,8 +2447,8 @@ export const upsertDriverVehicle = handle('driver.vehicle.upsert', async (req, r
 });
 
 export const garageDrivers = handle('garage.drivers', async (req, res) => {
-  const drivers = await prisma.user.findMany({ where: { role: 'driver', garageId: req.user.garageId, status: 'active' }, include: { garage: true } });
-  return ok(res, { message: 'Chauffeurs garage', data: { drivers: drivers.map(serializeUser) } });
+  const drivers = await prisma.user.findMany({ where: { role: 'driver', garageId: req.user.garageId, status: 'active' }, include: driverInclude });
+  return ok(res, { message: 'Chauffeurs zone', data: { drivers: drivers.map(serializeUser) } });
 });
 
 export const garageStats = handle('garage.stats', async (req, res) => {
@@ -1964,7 +2463,7 @@ export const garageStats = handle('garage.stats', async (req, res) => {
     prisma.parcel.groupBy({ by: ['status'], where: baseWhere, _count: { status: true } })
   ]);
   const parcelsByStatus = Object.fromEntries(grouped.map((row) => [row.status, row._count.status]));
-  return ok(res, { message: 'Stats garage', data: { stats: { garageId, totalParcels, activeParcels, deliveredToday, activeDrivers, revenue: revenue._sum.amount?.toString() || '0', parcelsByStatus } } });
+  return ok(res, { message: 'Stats zone', data: { stats: { garageId, totalParcels, activeParcels, deliveredToday, activeDrivers, revenue: revenue._sum.amount?.toString() || '0', parcelsByStatus } } });
 });
 
 async function globalStats() {
@@ -2027,7 +2526,7 @@ export const garageMonthlyReport = handle('garage.reportMonthly', async (req, re
 
 export const garageExport = handle('garage.export', async (req, res) => {
   const parcels = await prisma.parcel.findMany({ where: { OR: [{ departureGarageId: req.user.garageId }, { arrivalGarageId: req.user.garageId }] }, include: parcelInclude });
-  return ok(res, { message: 'Export garage', data: { data: parcels.map(serializeParcel) } });
+  return ok(res, { message: 'Export zone', data: { data: parcels.map(serializeParcel) } });
 });
 
 export const superAdminDailyReport = handle('super.reportDaily', async (req, res) => {
@@ -2051,7 +2550,7 @@ export const superAdminUsers = handle('super.users', async (req, res) => {
   const where = cleanUndefined({ role: req.query.role, status: req.query.status });
   const [total, users] = await Promise.all([
     prisma.user.count({ where }),
-    prisma.user.findMany({ where, include: { garage: true, score: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
+    prisma.user.findMany({ where, include: { ...driverInclude, score: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
   ]);
   return ok(res, { message: 'Utilisateurs', data: { users: users.map(serializeUser) }, meta: paginationMeta({ page, limit, total }) });
 });
@@ -2074,17 +2573,24 @@ export const superAdminCreateUser = handle('super.userCreate', async (req, res) 
         region: req.body.region,
         isProfileComplete: true
       },
-      include: { garage: true }
+      include: driverInclude
     });
     await tx.score.create({ data: { userId: created.id } });
+    if (created.role === 'driver') {
+      await syncDriverVehicle(tx, created, req.body);
+    }
     await audit(tx, req, { action: 'user.create', entityType: 'user', entityId: created.id, afterData: { role: created.role } });
     return created;
   });
-  return ok(res, { status: 201, message: 'Utilisateur cree', data: { user: serializeUser(user) } });
+
+  // Relecture : le vehicule vient d'etre cree dans la transaction, l'objet
+  // `user` capture avant ne le contient pas encore.
+  const created = await prisma.user.findUnique({ where: { id: user.id }, include: driverInclude });
+  return ok(res, { status: 201, message: 'Utilisateur cree', data: { user: serializeUser(created) } });
 });
 
 export const superAdminUserDetail = handle('super.userDetail', async (req, res) => {
-  const user = await prisma.user.findUnique({ where: { id: req.params.userId }, include: { garage: true, score: true } });
+  const user = await prisma.user.findUnique({ where: { id: req.params.userId }, include: { ...driverInclude, score: true } });
   if (!user) throw new NotFoundError('Utilisateur introuvable');
   const stats = {
     parcels: await prisma.parcel.count({ where: { OR: [{ senderId: user.id }, { driverId: user.id }] } }),
@@ -2098,9 +2604,15 @@ export const superAdminUpdateUser = handle('super.userUpdate', async (req, res) 
   const user = await prisma.user.update({
     where: { id: req.params.userId },
     data: cleanUndefined(Object.fromEntries(allowed.map((key) => [key, req.body[key]]))),
-    include: { garage: true }
+    include: driverInclude
   });
-  return ok(res, { message: 'Utilisateur mis a jour', data: { user: serializeUser(user) } });
+
+  if (user.role === 'driver') {
+    await syncDriverVehicle(prisma, user, req.body);
+  }
+
+  const updated = await prisma.user.findUnique({ where: { id: user.id }, include: driverInclude });
+  return ok(res, { message: 'Utilisateur mis a jour', data: { user: serializeUser(updated) } });
 });
 
 export const superAdminUpdateUserRole = handle('super.userRole', async (req, res) => {
@@ -2125,7 +2637,7 @@ export const superAdminGarages = handle('super.garages', async (req, res) => {
     prisma.garage.count({ where }),
     prisma.garage.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take: limit })
   ]);
-  return ok(res, { message: 'Garages', data: { garages: garages.map(serializeGarage) }, meta: paginationMeta({ page, limit, total }) });
+  return ok(res, { message: 'Zones', data: { garages: garages.map(serializeGarage) }, meta: paginationMeta({ page, limit, total }) });
 });
 
 export const superAdminCreateGarage = handle('super.garageCreate', async (req, res) => {
@@ -2141,7 +2653,7 @@ export const superAdminCreateGarage = handle('super.garageCreate', async (req, r
       isActive: req.body.isActive ?? true
     }
   });
-  return ok(res, { status: 201, message: 'Garage cree', data: { garage: serializeGarage(garage) } });
+  return ok(res, { status: 201, message: 'Zone creee', data: { garage: serializeGarage(garage) } });
 });
 
 export const superAdminGarageDetail = handle('super.garageDetail', async (req, res) => {
@@ -2149,8 +2661,8 @@ export const superAdminGarageDetail = handle('super.garageDetail', async (req, r
     where: { id: req.params.garageId },
     include: { users: true, vehicles: true }
   });
-  if (!garage) throw new NotFoundError('Garage introuvable');
-  return ok(res, { message: 'Detail garage', data: { garage: { ...serializeGarage(garage), drivers: garage.users.filter((user) => user.role === 'driver').map(serializeUser), vehicles: garage.vehicles, stats: { drivers: garage.users.length, vehicles: garage.vehicles.length } } } });
+  if (!garage) throw new NotFoundError('Zone introuvable');
+  return ok(res, { message: 'Detail zone', data: { garage: { ...serializeGarage(garage), drivers: garage.users.filter((user) => user.role === 'driver').map(serializeUser), vehicles: garage.vehicles, stats: { drivers: garage.users.length, vehicles: garage.vehicles.length } } } });
 });
 
 export const superAdminUpdateGarage = handle('super.garageUpdate', async (req, res) => {
@@ -2167,12 +2679,12 @@ export const superAdminUpdateGarage = handle('super.garageUpdate', async (req, r
       isActive: req.body.isActive
     })
   });
-  return ok(res, { message: 'Garage mis a jour', data: { garage: serializeGarage(garage) } });
+  return ok(res, { message: 'Zone mise a jour', data: { garage: serializeGarage(garage) } });
 });
 
 export const superAdminDeleteGarage = handle('super.garageDelete', async (req, res) => {
   const garage = await prisma.garage.update({ where: { id: req.params.garageId }, data: { deletedAt: new Date(), isActive: false } });
-  return ok(res, { message: 'Garage supprime', data: { garage: serializeGarage(garage) } });
+  return ok(res, { message: 'Zone supprimee', data: { garage: serializeGarage(garage) } });
 });
 
 export const superAdminUpdateParcel = handle('super.parcelUpdate', async (req, res) => {
@@ -2204,6 +2716,17 @@ export const getSystemConfig = handle('super.configGet', async (_req, res) => {
   const rows = await prisma.systemConfig.findMany();
   const config = Object.fromEntries(rows.map((row) => [row.key, row.value]));
   return ok(res, { message: 'Configuration', data: { config } });
+});
+
+// Les annonces (« broadcasts ») s'adressent a tous les utilisateurs, mais
+// `getSystemConfig` renvoie toute la table de configuration — cles PayDunya
+// comprises — et doit rester reserve au super-admin. On expose donc ici la
+// seule cle publique : sans cela clients et chauffeurs recevaient un 403 et
+// la banniere d'annonce n'apparaissait jamais.
+export const getPublicBroadcasts = handle('config.broadcasts', async (_req, res) => {
+  const row = await prisma.systemConfig.findUnique({ where: { key: 'broadcasts' } });
+  const broadcasts = Array.isArray(row?.value) ? row.value : [];
+  return ok(res, { message: 'Annonces', data: { broadcasts } });
 });
 
 export const updateSystemConfig = handle('super.configUpdate', async (req, res) => {

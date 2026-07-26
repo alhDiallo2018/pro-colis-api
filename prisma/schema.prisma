@@ -12,7 +12,52 @@ enum UserRole {
   driver
   admin
   super_admin
+  // Compte support partagé historique : traité comme co-équivalent de
+  // super_admin par les gardes de routes /super-admin/*. Conservé (0 compte
+  // l'utilise) car ~40 gardes le référencent ; les deux rôles ci-dessous le
+  // remplacent fonctionnellement avec un périmètre restreint.
   support
+  support_technique
+  support_commercial
+}
+
+enum TicketChannel {
+  in_app
+  phone
+  email
+}
+
+enum TicketPriority {
+  low
+  normal
+  high
+  critical
+}
+
+enum TicketStatus {
+  open
+  pending
+  in_progress
+  resolved
+}
+
+enum IncidentSeverity {
+  sev1
+  sev2
+  sev3
+}
+
+enum LeadKind {
+  garage
+  business_client
+  driver_fleet
+}
+
+enum LeadStage {
+  contacted
+  qualified
+  negotiation
+  signed
 }
 
 enum UserStatus {
@@ -75,6 +120,16 @@ enum PaymentStatus {
   completed
   failed
   refunded
+}
+
+enum PaymentChannel {
+  cash
+  platform
+}
+
+enum CashCollectionPoint {
+  sender_pickup
+  receiver_delivery
 }
 
 enum NotificationPriority {
@@ -146,105 +201,111 @@ enum ZoneType {
 }
 
 model User {
-  id                   String                 @id @default(uuid()) @db.Uuid
-  email                String?                @unique
-  phone                String                 @unique
-  fullName             String                 @map("full_name")
-  passwordHash         String?                @map("password_hash")
-  pinHash              String?                @map("pin_hash")
-  role                 UserRole
-  status               UserStatus             @default(active)
-  profilePhoto         String?                @map("profile_photo")
-  address              String?
-  city                 String?
-  region               String?
-  gender               String?
-  garageId             String?                @map("garage_id") @db.Uuid
-  driverStatus         DriverStatus?          @map("driver_status")
-  rating               Decimal                @default(0) @db.Decimal(3, 2)
-  totalDeliveries      Int                    @default(0) @map("total_deliveries")
-  completedDeliveries  Int                    @default(0) @map("completed_deliveries")
-  cancelledDeliveries  Int                    @default(0) @map("cancelled_deliveries")
-  isEmailVerified      Boolean                @default(false) @map("is_email_verified")
-  isPhoneVerified      Boolean                @default(false) @map("is_phone_verified")
+  id                      String                 @id @default(uuid()) @db.Uuid
+  email                   String?                @unique
+  phone                   String                 @unique
+  fullName                String                 @map("full_name")
+  passwordHash            String?                @map("password_hash")
+  pinHash                 String?                @map("pin_hash")
+  role                    UserRole
+  status                  UserStatus             @default(active)
+  profilePhoto            String?                @map("profile_photo")
+  address                 String?
+  city                    String?
+  region                  String?
+  gender                  String?
+  garageId                String?                @map("garage_id") @db.Uuid
+  driverStatus            DriverStatus?          @map("driver_status")
+  rating                  Decimal                @default(0) @db.Decimal(3, 2)
+  totalDeliveries         Int                    @default(0) @map("total_deliveries")
+  completedDeliveries     Int                    @default(0) @map("completed_deliveries")
+  cancelledDeliveries     Int                    @default(0) @map("cancelled_deliveries")
+  isEmailVerified         Boolean                @default(false) @map("is_email_verified")
+  isPhoneVerified         Boolean                @default(false) @map("is_phone_verified")
   // Vérification d'identité (KYC) validée par un admin — conditionne certaines
   // activités chauffeur (enchérir, publier une annonce) si l'option est activée.
-  isVerified           Boolean                @default(false) @map("is_verified")
-  isProfileComplete    Boolean                @default(false) @map("is_profile_complete")
+  isVerified              Boolean                @default(false) @map("is_verified")
+  isProfileComplete       Boolean                @default(false) @map("is_profile_complete")
   // Préférences de notification par type d'événement / canal (JSON libre).
-  notificationPreferences Json?               @map("notification_preferences")
-  lastLogin            DateTime?              @map("last_login") @db.Timestamptz
-  lastActiveAt         DateTime?              @map("last_active_at") @db.Timestamptz
-  deletedAt            DateTime?              @map("deleted_at") @db.Timestamptz
-  createdAt            DateTime               @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt            DateTime               @updatedAt @map("updated_at") @db.Timestamptz
-  garage               Garage?                @relation(fields: [garageId], references: [id], onDelete: SetNull)
-  vehicles             Vehicle[]              @relation("DriverVehicles")
-  sentParcels          Parcel[]               @relation("ParcelSender")
-  drivenParcels        Parcel[]               @relation("ParcelDriver")
-  createdParcels       Parcel[]               @relation("ParcelCreator")
-  cancelledParcels     Parcel[]               @relation("ParcelCanceller")
-  bids                 Bid[]
-  parcelEvents         ParcelEvent[]
-  parcelMedia          ParcelMedia[]
-  payments             Payment[]              @relation("PaymentUser")
-  validatedPayments    Payment[]              @relation("PaymentValidator")
-  score                Score?
-  scoreTransactions    ScoreTransaction[]
-  notifiedTransactions ScoreTransaction[]  @relation("ScorePerformer")
-  notifications        Notification[]          @relation("NotificationRecipient")
-  sentNotifications    Notification[]          @relation("NotificationSender")
-  otpCodes             OtpCode[]
-  refreshTokens        RefreshToken[]
-  advertisements       Advertisement[]
-  advertisementOffers  AdvertisementOffer[]
-  driverLocations      DriverLocation[]
-  ratingsGiven         Rating[]                @relation("RatingAuthor")
-  ratingsReceived      Rating[]                @relation("RatingDriver")
-  supportMessages      SupportMessage[]
-  identityVerifications IdentityVerification[] @relation("IdentityOwner")
-  reviewedIdentities   IdentityVerification[]  @relation("IdentityReviewer")
-  favoriteGarages      FavoriteGarage[]
-  addresses            Address[]
-  sentMessages         Message[]               @relation("MessageSender")
-  receivedMessages     Message[]               @relation("MessageReceiver")
-  handledSupportMessages Message[]             @relation("MessageHandledBy")
-  auditLogs            AuditLog[]              @relation("AuditActor")
-  systemConfigs        SystemConfig[]
-  webhooks             Webhook[]
-  backups              Backup[]
-  wallet               Wallet?
-  walletTransactions   WalletTransaction[]
-  withdrawals          Withdrawal[]
-  driverZones          ZoneDriver[]
-  deviceTokens         DeviceToken[]
-  expensesCreated      Expense[]              @relation("ExpenseCreatedBy")
-  assistances          Assistance[]           @relation("AssistanceUser")
-  assistancesHandled   Assistance[]           @relation("AssistanceHandledBy")
+  notificationPreferences Json?                  @map("notification_preferences")
+  lastLogin               DateTime?              @map("last_login") @db.Timestamptz
+  lastActiveAt            DateTime?              @map("last_active_at") @db.Timestamptz
+  deletedAt               DateTime?              @map("deleted_at") @db.Timestamptz
+  createdAt               DateTime               @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt               DateTime               @updatedAt @map("updated_at") @db.Timestamptz
+  garage                  Garage?                @relation(fields: [garageId], references: [id], onDelete: SetNull)
+  vehicles                Vehicle[]              @relation("DriverVehicles")
+  sentParcels             Parcel[]               @relation("ParcelSender")
+  drivenParcels           Parcel[]               @relation("ParcelDriver")
+  createdParcels          Parcel[]               @relation("ParcelCreator")
+  cancelledParcels        Parcel[]               @relation("ParcelCanceller")
+  bids                    Bid[]
+  parcelEvents            ParcelEvent[]
+  parcelMedia             ParcelMedia[]
+  payments                Payment[]              @relation("PaymentUser")
+  validatedPayments       Payment[]              @relation("PaymentValidator")
+  score                   Score?
+  scoreTransactions       ScoreTransaction[]
+  notifiedTransactions    ScoreTransaction[]     @relation("ScorePerformer")
+  notifications           Notification[]         @relation("NotificationRecipient")
+  sentNotifications       Notification[]         @relation("NotificationSender")
+  otpCodes                OtpCode[]
+  refreshTokens           RefreshToken[]
+  advertisements          Advertisement[]
+  advertisementOffers     AdvertisementOffer[]
+  driverLocations         DriverLocation[]
+  ratingsGiven            Rating[]               @relation("RatingAuthor")
+  ratingsReceived         Rating[]               @relation("RatingDriver")
+  supportMessages         SupportMessage[]
+  identityVerifications   IdentityVerification[] @relation("IdentityOwner")
+  reviewedIdentities      IdentityVerification[] @relation("IdentityReviewer")
+  favoriteGarages         FavoriteGarage[]
+  addresses               Address[]
+  sentMessages            Message[]              @relation("MessageSender")
+  receivedMessages        Message[]              @relation("MessageReceiver")
+  handledSupportMessages  Message[]              @relation("MessageHandledBy")
+  auditLogs               AuditLog[]             @relation("AuditActor")
+  systemConfigs           SystemConfig[]
+  webhooks                Webhook[]
+  backups                 Backup[]
+  wallet                  Wallet?
+  walletTransactions      WalletTransaction[]
+  withdrawals             Withdrawal[]
+  driverZones             ZoneDriver[]
+  deviceTokens            DeviceToken[]
+  expensesCreated         Expense[]              @relation("ExpenseCreatedBy")
+  assistances             Assistance[]           @relation("AssistanceUser")
+  assistancesHandled      Assistance[]           @relation("AssistanceHandledBy")
+  ticketsRequested        SupportTicket[]        @relation("TicketRequester")
+  ticketsAssigned         SupportTicket[]        @relation("TicketAssignee")
+  incidentsCreated        PlatformIncident[]     @relation("IncidentCreatedBy")
+  commercialLeads         CommercialLead[]       @relation("LeadOwner")
+  commercialObjectives    CommercialObjective[]  @relation("ObjectiveOwner")
 
   @@map("users")
 }
 
 model Garage {
-  id                 String           @id @default(uuid()) @db.Uuid
-  name               String
-  city               String
-  region             String
-  address            String?
-  phone              String?
-  latitude           Decimal?         @db.Decimal(10, 7)
-  longitude          Decimal?         @db.Decimal(10, 7)
-  isActive           Boolean          @default(true) @map("is_active")
-  deletedAt          DateTime?        @map("deleted_at") @db.Timestamptz
-  createdAt          DateTime         @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt          DateTime         @updatedAt @map("updated_at") @db.Timestamptz
-  users              User[]
-  vehicles           Vehicle[]
-  departureParcels   Parcel[]         @relation("DepartureGarage")
-  arrivalParcels     Parcel[]         @relation("ArrivalGarage")
-  departingAds       Advertisement[]  @relation("AdvertisementDepartureGarage")
-  arrivingAds        Advertisement[]  @relation("AdvertisementArrivalGarage")
-  favoriteBy         FavoriteGarage[]
+  id               String           @id @default(uuid()) @db.Uuid
+  name             String
+  country          String?
+  city             String
+  region           String
+  address          String?
+  phone            String?
+  latitude         Decimal?         @db.Decimal(10, 7)
+  longitude        Decimal?         @db.Decimal(10, 7)
+  isActive         Boolean          @default(true) @map("is_active")
+  deletedAt        DateTime?        @map("deleted_at") @db.Timestamptz
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  users            User[]
+  vehicles         Vehicle[]
+  departureParcels Parcel[]         @relation("DepartureGarage")
+  arrivalParcels   Parcel[]         @relation("ArrivalGarage")
+  departingAds     Advertisement[]  @relation("AdvertisementDepartureGarage")
+  arrivingAds      Advertisement[]  @relation("AdvertisementArrivalGarage")
+  favoriteBy       FavoriteGarage[]
 
   @@index([isActive])
   @@map("garages")
@@ -269,60 +330,65 @@ model Vehicle {
 }
 
 model Parcel {
-  id                    String             @id @default(uuid()) @db.Uuid
-  trackingNumber        String             @unique @map("tracking_number")
-  senderId              String?            @map("sender_id") @db.Uuid
-  senderName            String             @map("sender_name")
-  senderPhone           String             @map("sender_phone")
-  senderEmail           String?            @map("sender_email")
-  receiverName          String             @map("receiver_name")
-  receiverPhone         String             @map("receiver_phone")
-  receiverEmail         String?            @map("receiver_email")
-  receiverAddress       String?            @map("receiver_address")
+  id                    String               @id @default(uuid()) @db.Uuid
+  trackingNumber        String               @unique @map("tracking_number")
+  senderId              String?              @map("sender_id") @db.Uuid
+  senderName            String               @map("sender_name")
+  senderPhone           String               @map("sender_phone")
+  senderEmail           String?              @map("sender_email")
+  receiverName          String               @map("receiver_name")
+  receiverPhone         String               @map("receiver_phone")
+  receiverEmail         String?              @map("receiver_email")
+  receiverAddress       String?              @map("receiver_address")
   description           String
-  weight                Decimal            @db.Decimal(10, 2)
-  length                Decimal?           @db.Decimal(10, 2)
-  width                 Decimal?           @db.Decimal(10, 2)
-  height                Decimal?           @db.Decimal(10, 2)
-  type                  ParcelType         @default(package)
-  status                ParcelStatus       @default(pending)
-  departureGarageId     String             @map("departure_garage_id") @db.Uuid
-  arrivalGarageId       String?            @map("arrival_garage_id") @db.Uuid
-  driverId              String?            @map("driver_id") @db.Uuid
-  price                 Decimal?           @db.Decimal(12, 2)
-  proposedPrice         Decimal?           @map("proposed_price") @db.Decimal(12, 2)
-  negotiatedPrice       Decimal?           @map("negotiated_price") @db.Decimal(12, 2)
-  deliveryFees          Decimal?           @map("delivery_fees") @db.Decimal(12, 2)
-  totalAmount           Decimal?           @map("total_amount") @db.Decimal(12, 2)
-  isInsured             Boolean            @default(false) @map("is_insured")
-  insuranceAmount       Decimal?           @map("insurance_amount") @db.Decimal(12, 2)
-  isUrgent              Boolean            @default(false) @map("is_urgent")
-  urgentFee             Decimal?           @map("urgent_fee") @db.Decimal(12, 2)
-  isFreeForBidding      Boolean            @default(false) @map("is_free_for_bidding")
-  selectedBidId         String?            @map("selected_bid_id") @db.Uuid
-  paymentMethod         PaymentMethod?     @map("payment_method")
-  paymentPhoneNumber    String?            @map("payment_phone_number")
-  paymentStatus         String?            @map("payment_status")
-  signatureUrl          String?            @map("signature_url")
+  weight                Decimal              @db.Decimal(10, 2)
+  length                Decimal?             @db.Decimal(10, 2)
+  width                 Decimal?             @db.Decimal(10, 2)
+  height                Decimal?             @db.Decimal(10, 2)
+  type                  ParcelType           @default(package)
+  status                ParcelStatus         @default(pending)
+  departureGarageId     String               @map("departure_garage_id") @db.Uuid
+  arrivalGarageId       String?              @map("arrival_garage_id") @db.Uuid
+  driverId              String?              @map("driver_id") @db.Uuid
+  price                 Decimal?             @db.Decimal(12, 2)
+  proposedPrice         Decimal?             @map("proposed_price") @db.Decimal(12, 2)
+  negotiatedPrice       Decimal?             @map("negotiated_price") @db.Decimal(12, 2)
+  deliveryFees          Decimal?             @map("delivery_fees") @db.Decimal(12, 2)
+  totalAmount           Decimal?             @map("total_amount") @db.Decimal(12, 2)
+  isInsured             Boolean              @default(false) @map("is_insured")
+  insuranceAmount       Decimal?             @map("insurance_amount") @db.Decimal(12, 2)
+  isUrgent              Boolean              @default(false) @map("is_urgent")
+  urgentFee             Decimal?             @map("urgent_fee") @db.Decimal(12, 2)
+  isFreeForBidding      Boolean              @default(false) @map("is_free_for_bidding")
+  selectedBidId         String?              @map("selected_bid_id") @db.Uuid
+  paymentMethod         PaymentMethod?       @map("payment_method")
+  paymentChannel        PaymentChannel?      @map("payment_channel")
+  acceptedPaymentChannels PaymentChannel[]   @default([]) @map("accepted_payment_channels")
+  cashCollectionPoint   CashCollectionPoint? @map("cash_collection_point")
+  cashCollectedAmount   Decimal?             @map("cash_collected_amount") @db.Decimal(12, 2)
+  cashCollectedAt       DateTime?             @map("cash_collected_at") @db.Timestamptz
+  paymentPhoneNumber    String?              @map("payment_phone_number")
+  paymentStatus         String?              @map("payment_status")
+  signatureUrl          String?              @map("signature_url")
   notes                 String?
-  pickupDate            DateTime?          @map("pickup_date") @db.Timestamptz
-  deliveryDate          DateTime?          @map("delivery_date") @db.Timestamptz
-  estimatedDeliveryDate DateTime?          @map("estimated_delivery_date") @db.Timestamptz
-  createdBy             String?            @map("created_by") @db.Uuid
-  cancelledBy           String?            @map("cancelled_by") @db.Uuid
-  cancellationReason    String?            @map("cancellation_reason")
-  cancelledAt           DateTime?          @map("cancelled_at") @db.Timestamptz
-  deletedAt             DateTime?          @map("deleted_at") @db.Timestamptz
-  createdAt             DateTime           @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt             DateTime           @updatedAt @map("updated_at") @db.Timestamptz
-  sender                User?              @relation("ParcelSender", fields: [senderId], references: [id], onDelete: SetNull)
-  driver                User?              @relation("ParcelDriver", fields: [driverId], references: [id], onDelete: SetNull)
-  creator               User?              @relation("ParcelCreator", fields: [createdBy], references: [id], onDelete: SetNull)
-  canceller             User?              @relation("ParcelCanceller", fields: [cancelledBy], references: [id], onDelete: SetNull)
-  departureGarage       Garage             @relation("DepartureGarage", fields: [departureGarageId], references: [id])
-  arrivalGarage         Garage?            @relation("ArrivalGarage", fields: [arrivalGarageId], references: [id])
-  selectedBid           Bid?               @relation("SelectedBid", fields: [selectedBidId], references: [id], onDelete: SetNull)
-  bids                  Bid[]              @relation("ParcelBids")
+  pickupDate            DateTime?            @map("pickup_date") @db.Timestamptz
+  deliveryDate          DateTime?            @map("delivery_date") @db.Timestamptz
+  estimatedDeliveryDate DateTime?            @map("estimated_delivery_date") @db.Timestamptz
+  createdBy             String?              @map("created_by") @db.Uuid
+  cancelledBy           String?              @map("cancelled_by") @db.Uuid
+  cancellationReason    String?              @map("cancellation_reason")
+  cancelledAt           DateTime?            @map("cancelled_at") @db.Timestamptz
+  deletedAt             DateTime?            @map("deleted_at") @db.Timestamptz
+  createdAt             DateTime             @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt             DateTime             @updatedAt @map("updated_at") @db.Timestamptz
+  sender                User?                @relation("ParcelSender", fields: [senderId], references: [id], onDelete: SetNull)
+  driver                User?                @relation("ParcelDriver", fields: [driverId], references: [id], onDelete: SetNull)
+  creator               User?                @relation("ParcelCreator", fields: [createdBy], references: [id], onDelete: SetNull)
+  canceller             User?                @relation("ParcelCanceller", fields: [cancelledBy], references: [id], onDelete: SetNull)
+  departureGarage       Garage               @relation("DepartureGarage", fields: [departureGarageId], references: [id])
+  arrivalGarage         Garage?              @relation("ArrivalGarage", fields: [arrivalGarageId], references: [id])
+  selectedBid           Bid?                 @relation("SelectedBid", fields: [selectedBidId], references: [id], onDelete: SetNull)
+  bids                  Bid[]                @relation("ParcelBids")
   events                ParcelEvent[]
   media                 ParcelMedia[]
   payments              Payment[]
@@ -464,67 +530,67 @@ model ScoreTransaction {
 }
 
 model Wallet {
-  userId          String               @id @map("user_id") @db.Uuid
-  balance         Decimal              @default(0) @db.Decimal(12, 2)
-  pendingBalance  Decimal              @default(0) @map("pending_balance") @db.Decimal(12, 2)
-  totalDeposited  Decimal              @default(0) @map("total_deposited") @db.Decimal(12, 2)
-  totalSpent      Decimal              @default(0) @map("total_spent") @db.Decimal(12, 2)
-  totalRefunded   Decimal              @default(0) @map("total_refunded") @db.Decimal(12, 2)
-  totalWithdrawn   Decimal             @default(0) @map("total_withdrawn") @db.Decimal(12, 2)
-  totalCommissionsPaid Decimal        @default(0) @map("total_commissions_paid") @db.Decimal(12, 2)
-  status          WalletStatus         @default(active)
-  lastDepositAt   DateTime?            @map("last_deposit_at") @db.Timestamptz
-  lastActivityAt  DateTime?            @map("last_activity_at") @db.Timestamptz
-  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt       DateTime             @updatedAt @map("updated_at") @db.Timestamptz
-  user            User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
-  transactions    WalletTransaction[]
-  withdrawals     Withdrawal[]
+  userId               String              @id @map("user_id") @db.Uuid
+  balance              Decimal             @default(0) @db.Decimal(12, 2)
+  pendingBalance       Decimal             @default(0) @map("pending_balance") @db.Decimal(12, 2)
+  totalDeposited       Decimal             @default(0) @map("total_deposited") @db.Decimal(12, 2)
+  totalSpent           Decimal             @default(0) @map("total_spent") @db.Decimal(12, 2)
+  totalRefunded        Decimal             @default(0) @map("total_refunded") @db.Decimal(12, 2)
+  totalWithdrawn       Decimal             @default(0) @map("total_withdrawn") @db.Decimal(12, 2)
+  totalCommissionsPaid Decimal             @default(0) @map("total_commissions_paid") @db.Decimal(12, 2)
+  status               WalletStatus        @default(active)
+  lastDepositAt        DateTime?           @map("last_deposit_at") @db.Timestamptz
+  lastActivityAt       DateTime?           @map("last_activity_at") @db.Timestamptz
+  createdAt            DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime            @updatedAt @map("updated_at") @db.Timestamptz
+  user                 User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions         WalletTransaction[]
+  withdrawals          Withdrawal[]
 
   @@map("wallets")
 }
 
 model WalletTransaction {
-  id           String                @id @default(uuid()) @db.Uuid
-  walletUserId String                @map("wallet_user_id") @db.Uuid
-  type         WalletTransactionType
-  amount       Decimal               @db.Decimal(12, 2)
-  balanceBefore Decimal              @map("balance_before") @db.Decimal(12, 2)
-  balanceAfter  Decimal              @map("balance_after") @db.Decimal(12, 2)
-  parcelId     String?               @map("parcel_id") @db.Uuid
-  description  String?
-  origin       String?
-  status       String                @default("completed")
-  performedBy  String?               @map("performed_by") @db.Uuid
-  createdAt    DateTime              @default(now()) @map("created_at") @db.Timestamptz
-  wallet       Wallet                @relation(fields: [walletUserId], references: [userId], onDelete: Cascade)
-  parcel       Parcel?               @relation(fields: [parcelId], references: [id], onDelete: SetNull)
-  admin        User?                 @relation(fields: [performedBy], references: [id], onDelete: SetNull)
+  id            String                @id @default(uuid()) @db.Uuid
+  walletUserId  String                @map("wallet_user_id") @db.Uuid
+  type          WalletTransactionType
+  amount        Decimal               @db.Decimal(12, 2)
+  balanceBefore Decimal               @map("balance_before") @db.Decimal(12, 2)
+  balanceAfter  Decimal               @map("balance_after") @db.Decimal(12, 2)
+  parcelId      String?               @map("parcel_id") @db.Uuid
+  description   String?
+  origin        String?
+  status        String                @default("completed")
+  performedBy   String?               @map("performed_by") @db.Uuid
+  createdAt     DateTime              @default(now()) @map("created_at") @db.Timestamptz
+  wallet        Wallet                @relation(fields: [walletUserId], references: [userId], onDelete: Cascade)
+  parcel        Parcel?               @relation(fields: [parcelId], references: [id], onDelete: SetNull)
+  admin         User?                 @relation(fields: [performedBy], references: [id], onDelete: SetNull)
 
   @@index([walletUserId, createdAt])
   @@map("wallet_transactions")
 }
 
 model Withdrawal {
-  id                String           @id @default(uuid()) @db.Uuid
-  walletUserId      String           @map("wallet_user_id") @db.Uuid
-  amount            Decimal          @db.Decimal(12, 2)
-  method            String           @default("wave")
-  phone             String?
-  status            WithdrawalStatus @default(pending)
-  reference         String?          @unique
-  failureReason     String?          @map("failure_reason")
-  disburseToken     String?          @unique @map("disburse_token")
-  transactionId     String?          @map("transaction_id")
-  providerRef       String?          @map("provider_ref")
-  requestedAt       DateTime         @default(now()) @map("requested_at") @db.Timestamptz
-  processedBy       String?          @map("processed_by") @db.Uuid
-  processedAt       DateTime?        @map("processed_at") @db.Timestamptz
-  completedAt       DateTime?        @map("completed_at") @db.Timestamptz
-  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt         DateTime         @updatedAt @map("updated_at") @db.Timestamptz
-  wallet            Wallet           @relation(fields: [walletUserId], references: [userId], onDelete: Cascade)
-  processor         User?            @relation(fields: [processedBy], references: [id], onDelete: SetNull)
+  id            String           @id @default(uuid()) @db.Uuid
+  walletUserId  String           @map("wallet_user_id") @db.Uuid
+  amount        Decimal          @db.Decimal(12, 2)
+  method        String           @default("wave")
+  phone         String?
+  status        WithdrawalStatus @default(pending)
+  reference     String?          @unique
+  failureReason String?          @map("failure_reason")
+  disburseToken String?          @unique @map("disburse_token")
+  transactionId String?          @map("transaction_id")
+  providerRef   String?          @map("provider_ref")
+  requestedAt   DateTime         @default(now()) @map("requested_at") @db.Timestamptz
+  processedBy   String?          @map("processed_by") @db.Uuid
+  processedAt   DateTime?        @map("processed_at") @db.Timestamptz
+  completedAt   DateTime?        @map("completed_at") @db.Timestamptz
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  wallet        Wallet           @relation(fields: [walletUserId], references: [userId], onDelete: Cascade)
+  processor     User?            @relation(fields: [processedBy], references: [id], onDelete: SetNull)
 
   @@index([walletUserId, createdAt])
   @@index([status])
@@ -532,15 +598,15 @@ model Withdrawal {
 }
 
 model CommissionConfig {
-  id             String              @id @default(uuid()) @db.Uuid
-  profile        CommissionProfileType @default(local)
-  percentage     Decimal             @default(5) @db.Decimal(5, 2)
-  minAmount      Decimal             @default(100) @map("min_amount") @db.Decimal(12, 2)
-  maxAmount      Decimal             @default(500) @map("max_amount") @db.Decimal(12, 2)
-  isActive       Boolean             @default(true) @map("is_active")
-  effectiveFrom  DateTime            @map("effective_from") @db.Timestamptz
-  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt      DateTime            @updatedAt @map("updated_at") @db.Timestamptz
+  id            String                @id @default(uuid()) @db.Uuid
+  profile       CommissionProfileType @default(local)
+  percentage    Decimal               @default(5) @db.Decimal(5, 2)
+  minAmount     Decimal               @default(100) @map("min_amount") @db.Decimal(12, 2)
+  maxAmount     Decimal               @default(500) @map("max_amount") @db.Decimal(12, 2)
+  isActive      Boolean               @default(true) @map("is_active")
+  effectiveFrom DateTime              @map("effective_from") @db.Timestamptz
+  createdAt     DateTime              @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime              @updatedAt @map("updated_at") @db.Timestamptz
 
   @@map("commission_configs")
 }
@@ -622,20 +688,20 @@ model Advertisement {
 }
 
 model AdvertisementOffer {
-  id              String    @id @default(uuid()) @db.Uuid
-  advertisementId String    @map("advertisement_id") @db.Uuid
-  clientId        String    @map("client_id") @db.Uuid
-  parcelId        String?   @map("parcel_id") @db.Uuid
-  price           Decimal   @db.Decimal(12, 2)
+  id              String        @id @default(uuid()) @db.Uuid
+  advertisementId String        @map("advertisement_id") @db.Uuid
+  clientId        String        @map("client_id") @db.Uuid
+  parcelId        String?       @map("parcel_id") @db.Uuid
+  price           Decimal       @db.Decimal(12, 2)
   message         String?
-  status          BidStatus @default(pending)
-  responseMessage String?   @map("response_message")
-  respondedAt     DateTime? @map("responded_at") @db.Timestamptz
-  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  status          BidStatus     @default(pending)
+  responseMessage String?       @map("response_message")
+  respondedAt     DateTime?     @map("responded_at") @db.Timestamptz
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz
   advertisement   Advertisement @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
-  client          User      @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  parcel          Parcel?   @relation(fields: [parcelId], references: [id], onDelete: SetNull)
+  client          User          @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  parcel          Parcel?       @relation(fields: [parcelId], references: [id], onDelete: SetNull)
 
   @@map("advertisement_offers")
 }
@@ -682,6 +748,94 @@ model SupportMessage {
   user      User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@map("support_messages")
+}
+
+/// Ticket traité par le support technique.
+model SupportTicket {
+  id                String         @id @default(uuid()) @db.Uuid
+  reference         String         @unique
+  subject           String
+  body              String?
+  requesterId       String?        @map("requester_id") @db.Uuid
+  assigneeId        String?        @map("assignee_id") @db.Uuid
+  channel           TicketChannel  @default(in_app)
+  priority          TicketPriority @default(normal)
+  status            TicketStatus   @default(open)
+  /// Échéance de première réponse. C'est elle qui pilote l'alerte SLA du
+  /// dashboard : une durée calculée côté client dériverait selon l'horloge du
+  /// téléphone.
+  slaDueAt          DateTime?      @map("sla_due_at") @db.Timestamptz
+  firstResponseAt   DateTime?      @map("first_response_at") @db.Timestamptz
+  resolvedAt        DateTime?      @map("resolved_at") @db.Timestamptz
+  satisfactionScore Int?           @map("satisfaction_score")
+  category          String?
+  createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz
+  requester         User?          @relation("TicketRequester", fields: [requesterId], references: [id], onDelete: SetNull)
+  assignee          User?          @relation("TicketAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([assigneeId])
+  @@index([slaDueAt])
+  @@map("support_tickets")
+}
+
+/// Incident plateforme suivi par le support technique.
+model PlatformIncident {
+  id            String           @id @default(uuid()) @db.Uuid
+  title         String
+  scope         String
+  severity      IncidentSeverity
+  mitigated     Boolean          @default(false)
+  impactedUsers Int              @default(0) @map("impacted_users")
+  startedAt     DateTime         @default(now()) @map("started_at") @db.Timestamptz
+  resolvedAt    DateTime?        @map("resolved_at") @db.Timestamptz
+  createdById   String?          @map("created_by") @db.Uuid
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+  createdBy     User?            @relation("IncidentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([resolvedAt])
+  @@map("platform_incidents")
+}
+
+/// Opportunité du pipeline commercial.
+model CommercialLead {
+  id             String    @id @default(uuid()) @db.Uuid
+  name           String
+  city           String?
+  kind           LeadKind  @default(business_client)
+  stage          LeadStage @default(contacted)
+  monthlyValue   Decimal   @default(0) @map("monthly_value") @db.Decimal(12, 2)
+  contactName    String?   @map("contact_name")
+  contactPhone   String?   @map("contact_phone")
+  nextFollowUpAt DateTime? @map("next_follow_up_at") @db.Date
+  ownerId        String?   @map("owner_id") @db.Uuid
+  signedAt       DateTime? @map("signed_at") @db.Timestamptz
+  notes          String?
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  owner          User?     @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  @@index([ownerId])
+  @@index([nextFollowUpAt])
+  @@map("commercial_leads")
+}
+
+/// Objectif commercial mensuel d'un agent.
+model CommercialObjective {
+  id           String   @id @default(uuid()) @db.Uuid
+  ownerId      String   @map("owner_id") @db.Uuid
+  /// Premier jour du mois concerné.
+  period       DateTime @db.Date
+  targetAmount Decimal  @map("target_amount") @db.Decimal(12, 2)
+  territory    String?
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  owner        User     @relation("ObjectiveOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@unique([ownerId, period])
+  @@map("commercial_objectives")
 }
 
 model IdentityVerification {
@@ -731,22 +885,22 @@ model Address {
 }
 
 model Message {
-  id         String    @id @default(uuid()) @db.Uuid
-  senderId   String    @map("sender_id") @db.Uuid
-  receiverId String    @map("receiver_id") @db.Uuid
-  parcelId   String?   @map("parcel_id") @db.Uuid
-  body       String    @default("")
-  audioUrl   String?   @map("audio_url")
-  photoUrl   String?   @map("photo_url")
-  videoUrl   String?   @map("video_url")
-  isRead     Boolean   @default(false) @map("is_read")
-  readAt     DateTime? @map("read_at") @db.Timestamptz
-  handledById String?  @map("handled_by") @db.Uuid
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  sender     User      @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
-  receiver   User      @relation("MessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
-  handledBy  User?     @relation("MessageHandledBy", fields: [handledById], references: [id], onDelete: SetNull)
-  parcel     Parcel?   @relation(fields: [parcelId], references: [id], onDelete: SetNull)
+  id          String    @id @default(uuid()) @db.Uuid
+  senderId    String    @map("sender_id") @db.Uuid
+  receiverId  String    @map("receiver_id") @db.Uuid
+  parcelId    String?   @map("parcel_id") @db.Uuid
+  body        String    @default("")
+  audioUrl    String?   @map("audio_url")
+  photoUrl    String?   @map("photo_url")
+  videoUrl    String?   @map("video_url")
+  isRead      Boolean   @default(false) @map("is_read")
+  readAt      DateTime? @map("read_at") @db.Timestamptz
+  handledById String?   @map("handled_by") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  sender      User      @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver    User      @relation("MessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+  handledBy   User?     @relation("MessageHandledBy", fields: [handledById], references: [id], onDelete: SetNull)
+  parcel      Parcel?   @relation(fields: [parcelId], references: [id], onDelete: SetNull)
 
   @@map("messages")
 }

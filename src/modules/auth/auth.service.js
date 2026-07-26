@@ -9,7 +9,18 @@ import {
   signRefreshToken,
   verifyRefreshToken
 } from '../../utils/tokens.js';
-import { serializeUser } from '../../utils/user-serializer.js';
+import { serializeUser } from '../../utils/mobile-serializers.js';
+
+// Relations a charger des qu'un utilisateur est renvoye au client : sans
+// elles, `garageName` et les champs vehicule sont absents de la reponse.
+const USER_INCLUDE = {
+  garage: true,
+  vehicles: {
+    where: { deletedAt: null },
+    orderBy: { createdAt: 'desc' },
+    take: 1
+  }
+};
 
 function addDays(date, days) {
   const nextDate = new Date(date);
@@ -63,7 +74,8 @@ export async function registerUser(payload) {
         garageId: payload.garageId,
         driverStatus: payload.role === 'driver' ? 'offline' : null,
         isProfileComplete: Boolean(payload.fullName && payload.phone)
-      }
+      },
+      include: USER_INCLUDE
     });
 
     await tx.score.create({ data: { userId: createdUser.id } });
@@ -103,7 +115,8 @@ export async function loginWithPin({ identifier, pin }) {
 
   const updatedUser = await prisma.user.update({
     where: { id: user.id },
-    data: { lastLogin: new Date(), lastActiveAt: new Date() }
+    data: { lastLogin: new Date(), lastActiveAt: new Date() },
+    include: USER_INCLUDE
   });
 
   const tokens = await createTokenPair(updatedUser);
@@ -112,7 +125,10 @@ export async function loginWithPin({ identifier, pin }) {
 
 export async function refreshAccessToken(refreshToken) {
   const payload = verifyRefreshToken(refreshToken);
-  const user = await prisma.user.findUnique({ where: { id: payload.sub } });
+  const user = await prisma.user.findUnique({
+    where: { id: payload.sub },
+    include: USER_INCLUDE
+  });
 
   if (!user || user.status !== 'active') {
     throw new UnauthorizedError('Session invalide');

@@ -100,7 +100,7 @@ async function seedGarages() {
   const dakar = await prisma.garage.upsert({
     where: { id: ids.garageDakar },
     update: {
-      name: 'Garage Dakar Test',
+      name: 'Zone Dakar Test',
       city: 'Dakar',
       region: 'Dakar',
       address: 'Route de Rufisque',
@@ -111,7 +111,7 @@ async function seedGarages() {
     },
     create: {
       id: ids.garageDakar,
-      name: 'Garage Dakar Test',
+      name: 'Zone Dakar Test',
       city: 'Dakar',
       region: 'Dakar',
       address: 'Route de Rufisque',
@@ -125,7 +125,7 @@ async function seedGarages() {
   const thies = await prisma.garage.upsert({
     where: { id: ids.garageThies },
     update: {
-      name: 'Garage Thies Test',
+      name: 'Zone Thies Test',
       city: 'Thies',
       region: 'Thies',
       address: 'Avenue Caen',
@@ -136,7 +136,7 @@ async function seedGarages() {
     },
     create: {
       id: ids.garageThies,
-      name: 'Garage Thies Test',
+      name: 'Zone Thies Test',
       city: 'Thies',
       region: 'Thies',
       address: 'Avenue Caen',

@@ -114,6 +114,94 @@ function serializeZone(zone, extra = {}) {
   };
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function serializeGarageMirror(garage) {
+  if (!garage) return null;
+  return {
+    id: garage.id,
+    name: garage.name,
+    country: garage.country ?? null,
+    city: garage.city ?? null,
+    region: garage.region ?? null,
+    address: garage.address ?? null,
+    phone: garage.phone ?? null,
+    latitude: garage.latitude != null ? number(garage.latitude) : null,
+    longitude: garage.longitude != null ? number(garage.longitude) : null,
+    isActive: garage.isActive
+  };
+}
+
+/** Champs `garages` derives d'une zone (city et region sont NOT NULL en base). */
+function garageFieldsFromZone(zone) {
+  const name = String(zone.displayName || zone.name || zone.city || 'Zone').trim();
+  const city = String(zone.city || zone.name || name).trim();
+  const region = String(zone.region || zone.city || zone.country || city).trim();
+  return {
+    name,
+    country: zone.country ?? null,
+    city,
+    region,
+    latitude: zone.latitude != null ? String(zone.latitude) : null,
+    longitude: zone.longitude != null ? String(zone.longitude) : null
+  };
+}
+
+/** Le garage miroir est-il visible publiquement ? (zone approuvee et active) */
+function mirrorIsActive(zone) {
+  return zone.status === 'approved' && zone.isActive !== false;
+}
+
+/**
+ * Garantit qu'une zone possede son garage miroir et renvoie ce garage.
+ *
+ * Les colis et les annonces referencent `garages.id` (FK), pas `zones.id` : sans
+ * ce miroir, une zone ajoutee a la volee est inutilisable comme depart/arrivee.
+ * Le lien est memorise dans `zone.metadata.garageId` et l'operation est
+ * idempotente (relecture du lien, puis reutilisation d'un garage homonyme).
+ */
+async function ensureZoneGarage(tx, zone) {
+  const metadata = zone.metadata && typeof zone.metadata === 'object' ? zone.metadata : {};
+  const linkedId =
+    (typeof metadata.garageId === 'string' && metadata.garageId) ||
+    (typeof metadata.migratedFromGarageId === 'string' && metadata.migratedFromGarageId) ||
+    (typeof zone.placeId === 'string' && zone.placeId.startsWith('garage:')
+      ? zone.placeId.slice('garage:'.length)
+      : null);
+
+  if (linkedId && UUID_RE.test(linkedId)) {
+    const linked = await tx.garage.findFirst({ where: { id: linkedId, deletedAt: null } });
+    if (linked) return { garage: linked, created: false };
+  }
+
+  const fields = garageFieldsFromZone(zone);
+
+  // Une zone-garage homonyme (meme nom, meme ville) existe deja : on s'y rattache
+  // au lieu de creer un doublon dans les selecteurs de trajet.
+  const twin = await tx.garage.findFirst({
+    where: {
+      deletedAt: null,
+      name: { equals: fields.name, mode: 'insensitive' },
+      city: { equals: fields.city, mode: 'insensitive' }
+    }
+  });
+
+  const garage =
+    twin ??
+    (await tx.garage.create({
+      data: { ...fields, isActive: mirrorIsActive(zone) }
+    }));
+
+  if (metadata.garageId !== garage.id) {
+    await tx.zone.update({
+      where: { id: zone.id },
+      data: { metadata: { ...metadata, garageId: garage.id } }
+    });
+  }
+
+  return { garage, created: !twin };
+}
+
 /** Distance en kilometres entre deux points GPS (formule de haversine). */
 function haversineKm(lat1, lon1, lat2, lon2) {
   const toRad = (deg) => (deg * Math.PI) / 180;
@@ -220,10 +308,15 @@ export const detectZones = handle('zones.detect', async (req, res) => {
 });
 
 /**
- * Résout un lieu Google Places en zone, en la créant à la volée si besoin.
- * Idempotent : keyé par placeId (contrainte unique) puis par proximité.
- * Une zone créée automatiquement est en statut "pending" (à valider par un admin)
- * et n'est donc pas encore proposée publiquement.
+ * Résout un lieu Google Places (ou une position GPS) en zone, en la créant à la
+ * volée si besoin. Idempotent : keyé par placeId (contrainte unique) puis par
+ * proximité. Une zone créée automatiquement est en statut "pending" (à valider
+ * par un admin) et n'est donc pas encore proposée publiquement.
+ *
+ * La réponse porte TOUJOURS le garage miroir (`garage` / `garageId`) : c'est cet
+ * identifiant que les fronts doivent envoyer comme zone de départ / d'arrivée,
+ * car `parcels` et `advertisements` référencent `garages.id`.
+ *
  * Body : { placeId?, name, displayName?, latitude, longitude, country?, region?, city? }
  */
 export const resolveZone = handle('zones.resolve', async (req, res) => {
@@ -245,9 +338,16 @@ export const resolveZone = handle('zones.resolve', async (req, res) => {
       include: { _count: { select: { driverZones: true } }, parent: { select: { id: true, name: true } } }
     });
     if (byPlace) {
+      const { garage } = await prisma.$transaction((tx) => ensureZoneGarage(tx, byPlace));
       return ok(res, {
         message: 'Zone existante',
-        data: { data: serializeZone(byPlace), created: false, matchedBy: 'placeId' }
+        data: {
+          data: serializeZone(byPlace),
+          garage: serializeGarageMirror(garage),
+          garageId: garage.id,
+          created: false,
+          matchedBy: 'placeId'
+        }
       });
     }
   }
@@ -268,16 +368,23 @@ export const resolveZone = handle('zones.resolve', async (req, res) => {
     if (d < nearestAnyDist) { nearestAny = z; nearestAnyDist = d; }
   }
   if (nearestContainer) {
+    const { garage } = await prisma.$transaction((tx) => ensureZoneGarage(tx, nearestContainer));
     return ok(res, {
       message: 'Zone existante (proximité)',
-      data: { data: serializeZone(nearestContainer, { distanceKm: Math.round(nearestContainerDist * 100) / 100 }), created: false, matchedBy: 'proximity' }
+      data: {
+        data: serializeZone(nearestContainer, { distanceKm: Math.round(nearestContainerDist * 100) / 100 }),
+        garage: serializeGarageMirror(garage),
+        garageId: garage.id,
+        created: false,
+        matchedBy: 'proximity'
+      }
     });
   }
 
   // 3) Création à la volée en attente de validation. Rattachement best-effort au
   // plus proche parent approuvé (≤ 150 km) pour amorcer la hiérarchie.
   const parentId = nearestAny && nearestAnyDist <= 150 ? nearestAny.id : undefined;
-  const created = await prisma.$transaction(async (tx) => {
+  const { zone: created, garage } = await prisma.$transaction(async (tx) => {
     const zone = await tx.zone.create({
       data: cleanUndefined({
         name: name || displayName || city || 'Zone',
@@ -298,19 +405,31 @@ export const resolveZone = handle('zones.resolve', async (req, res) => {
       }),
       include: { _count: { select: { driverZones: true } }, parent: { select: { id: true, name: true } } }
     });
+    // Sans miroir, la zone tout juste creee est inutilisable comme depart /
+    // arrivee : colis et annonces referencent `garages.id`, pas `zones.id`.
+    const mirror = await ensureZoneGarage(tx, zone);
     await audit(tx, req, {
       action: 'zone.autocreate',
       entityType: 'zone',
       entityId: zone.id,
-      afterData: { name: zone.name, placeId: zone.placeId, status: 'pending', source: 'places' }
+      afterData: { name: zone.name, placeId: zone.placeId, status: 'pending', source: 'places', garageId: mirror.garage.id }
     });
-    return zone;
+    // `ensureZoneGarage` a memorise le lien apres coup : on le reporte sur
+    // l'objet renvoye pour que la reponse porte deja `metadata.garageId`.
+    return { zone: { ...zone, metadata: { ...zone.metadata, garageId: mirror.garage.id } }, garage: mirror.garage };
   });
 
   return ok(res, {
     status: 201,
     message: 'Zone créée (en attente de validation)',
-    data: { data: serializeZone(created), created: true, pending: true }
+    data: {
+      data: serializeZone(created),
+      garage: serializeGarageMirror(garage),
+      garageId: garage.id,
+      created: true,
+      pending: true,
+      matchedBy: 'created'
+    }
   });
 });
 
@@ -406,7 +525,7 @@ export const setZoneStatus = handle('zones.setStatus', async (req, res) => {
   const existing = await prisma.zone.findUnique({ where: { id: req.params.zoneId } });
   if (!existing) throw new NotFoundError('Zone introuvable');
 
-  const zone = await prisma.$transaction(async (tx) => {
+  const { zone, garage } = await prisma.$transaction(async (tx) => {
     const updated = await tx.zone.update({
       where: { id: existing.id },
       data: cleanUndefined({
@@ -416,17 +535,27 @@ export const setZoneStatus = handle('zones.setStatus', async (req, res) => {
       }),
       include: { _count: { select: { driverZones: true } }, parent: { select: { id: true, name: true } } }
     });
+    // Le garage miroir porte la visibilite publique : sans cette synchro, une
+    // zone approuvee resterait absente des selecteurs de trajet.
+    const { garage } = await ensureZoneGarage(tx, updated);
+    const visible = mirrorIsActive(updated);
+    if (garage.isActive !== visible) {
+      await tx.garage.update({ where: { id: garage.id }, data: { isActive: visible } });
+    }
     await audit(tx, req, {
       action: 'zone.setStatus',
       entityType: 'zone',
       entityId: existing.id,
       beforeData: { status: existing.status },
-      afterData: { status }
+      afterData: { status, garageId: garage.id, garageActive: visible }
     });
-    return updated;
+    return { zone: updated, garage: { ...garage, isActive: visible } };
   });
 
-  return ok(res, { message: 'Statut de la zone mis à jour', data: { data: serializeZone(zone) } });
+  return ok(res, {
+    message: 'Statut de la zone mis à jour',
+    data: { data: serializeZone(zone), garage: serializeGarageMirror(garage), garageId: garage.id }
+  });
 });
 
 export const updateZone = handle('zones.update', async (req, res) => {
