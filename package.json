@@ -9,6 +9,7 @@
     "start": "node src/server.js",
     "test": "NODE_ENV=test DATABASE_URL=\"postgresql://procolis:procolis@localhost:15432/procolis_test?schema=public\" node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
     "seed": "node prisma/seed.js",
+    "seed:super-admin": "node prisma/seed-super-admin.js",
     "seed:zones-sn": "node prisma/seed-zones-senegal.js",
     "seed:support": "node prisma/seed-support.js",
     "prisma:generate": "prisma generate",
