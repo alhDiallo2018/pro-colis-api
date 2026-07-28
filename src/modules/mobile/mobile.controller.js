@@ -92,7 +92,15 @@ const parcelInclude = {
   departureGarage: true,
   arrivalGarage: true,
   driver: { include: { garage: true } },
-  bids: { include: { driver: true }, orderBy: { createdAt: 'desc' } },
+  bids: { 
+    include: { 
+      driver: true,
+      negotiationMessages: {
+        orderBy: { createdAt: 'asc' }
+      }
+    }, 
+    orderBy: { createdAt: 'desc' } 
+  },
   events: { orderBy: { createdAt: 'asc' } },
   media: { orderBy: { createdAt: 'asc' } }
 };
@@ -145,11 +153,11 @@ async function notifyAdmins(tx, type, title, body, data = {}) {
   if (isBrevoConfigured()) {
     for (const admin of admins) {
       if (admin.email) {
-        sendNotificationEmail({ email: admin.email, subject: title, message: body }).catch(() => {});
+        sendNotificationEmail({ email: admin.email, subject: title, message: body }).catch(() => { });
       }
       if (admin.phone) {
         const smsContent = body.length > 300 ? `[Admin] ${title}: ${body.substring(0, 300)}...` : `[Admin] ${title}: ${body}`;
-        sendNotificationSms({ phone: admin.phone, message: smsContent, tag: type }).catch(() => {});
+        sendNotificationSms({ phone: admin.phone, message: smsContent, tag: type }).catch(() => { });
       }
     }
   }
@@ -216,6 +224,38 @@ async function findAccessibleParcel(user, parcelId) {
   return parcel;
 }
 
+// ============================================================
+// ✅ NOUVELLE FONCTION : Récupère un colis pour un chauffeur
+// avec accès aux colis en statut 'free' où il a fait une offre
+// ============================================================
+async function findAccessibleParcelForDriver(user, parcelId) {
+  const parcel = await prisma.parcel.findFirst({
+    where: {
+      id: parcelId,
+      deletedAt: null
+    },
+    include: parcelInclude
+  });
+
+  if (!parcel) throw new NotFoundError('Colis introuvable');
+
+  // ✅ Vérifier si le chauffeur a accès à ce colis
+  const isAssigned = parcel.driverId === user.id;
+  const hasBid = parcel.bids?.some(bid => bid.driverId === user.id);
+  const isFree = parcel.status === 'free';
+
+  // ✅ ACCÈS AUTORISÉ SI :
+  // 1. Le chauffeur est assigné au colis
+  // 2. Le chauffeur a fait une offre sur le colis
+  // 3. Le colis est en statut "free" (libre pour tous)
+  if (isAssigned || hasBid || isFree) {
+    return parcel;
+  }
+
+  // ❌ ACCÈS REFUSÉ
+  throw new NotFoundError('Colis introuvable');
+}
+
 async function audit(tx, req, { action, entityType, entityId, beforeData, afterData }) {
   await tx.auditLog.create({
     data: {
@@ -247,11 +287,11 @@ async function notify(tx, { userId, parcelId, bidId, senderId, senderName = 'PRO
 
   if (isBrevoConfigured() && user) {
     if (user.email) {
-      sendNotificationEmail({ email: user.email, subject: title, message: body }).catch(() => {});
+      sendNotificationEmail({ email: user.email, subject: title, message: body }).catch(() => { });
     }
     if (user.phone) {
       const smsContent = body.length > 300 ? `${title}: ${body.substring(0, 300)}...` : `${title}: ${body}`;
-      sendNotificationSms({ phone: user.phone, message: smsContent, tag: type }).catch(() => {});
+      sendNotificationSms({ phone: user.phone, message: smsContent, tag: type }).catch(() => { });
     }
   }
 
@@ -399,6 +439,10 @@ async function scoreSnapshot(userId) {
   return { score, transactions };
 }
 
+// ============================================================
+// PROFIL
+// ============================================================
+
 export const updateProfile = handle('profile.update', async (req, res) => {
   const allowed = ['fullName', 'email', 'phone', 'address', 'city', 'region', 'gender', 'driverStatus', 'garageId', 'profilePhoto'];
   const data = cleanUndefined(Object.fromEntries(allowed.map((key) => [key, req.body[key]])));
@@ -506,6 +550,10 @@ export const userStats = handle('users.stats', async (req, res) => {
   });
 });
 
+// ============================================================
+// PARCELS
+// ============================================================
+
 function buildParcelData(user, body) {
   const isDriver = user.role === 'driver';
   const isFree = Boolean(body.isFreeForBidding);
@@ -527,8 +575,6 @@ function buildParcelData(user, body) {
     width: decimal(body.width),
     height: decimal(body.height),
     type: body.type || 'package',
-    // A client picking a driver only pre-assigns them: the parcel stays "pending"
-    // until the driver confirms. Drivers creating their own parcel are confirmed.
     status: body.status || (isDriver ? 'confirmed' : isFree ? 'free' : 'pending'),
     departureGarageId: body.departureGarageId || user.garageId,
     arrivalGarageId: body.arrivalGarageId,
@@ -588,9 +634,6 @@ export const createParcel = handle('parcel.create', async (req, res) => {
 
 export const clientParcels = handle('client.parcels', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  // Le schéma ne lie pas encore le destinataire à un User : le numéro saisi à
-  // la création est donc l'unique critère fiable pour « colis reçus ». Sans
-  // filtre, on renvoie les deux côtés afin de préserver la vue agrégée.
   const ownership = req.query.filter === 'received'
     ? { receiverPhone: req.user.phone }
     : req.query.filter === 'sent'
@@ -647,11 +690,15 @@ export const getParcelDetail = handle('parcel.detail', async (req, res) => {
   return ok(res, { message: 'Detail colis', data: { parcel: serializeParcel(parcel) } });
 });
 
+export const getDriverParcelDetail = handle('driver.parcel.detail', async (req, res) => {
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
+  return ok(res, { message: 'Detail colis', data: { parcel: serializeParcel(parcel) } });
+});
+
 export const cancelParcel = handle('parcel.cancel', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'cancelled', { reason: req.body.reason || 'Annulation' });
 
-  // Si un chauffeur etait assigne, on lui credite son point d'engagement.
   if (parcel.driverId) {
     await prisma.$transaction(async (tx) => {
       const commitmentFee = await getCommitmentFee(tx);
@@ -700,11 +747,7 @@ export const bulkAssignDriver = handle('parcel.bulkAssign', async (req, res) => 
   return ok(res, { message: 'Colis assignes', data: { assigned, failed } });
 });
 
-// --- Delivery OTP (proof of receipt) ---
-// The code is stored on the generic OtpCode table keyed by parcel id.
-// When Brevo is configured, the code is sent via SMS to the recipient's phone.
-// Otherwise, the sender/recipient reads it from their parcel page and
-// hands it to the driver, who must enter it to confirm delivery.
+// --- Delivery OTP ---
 function generateDeliveryCode() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
@@ -724,13 +767,13 @@ export const clientDeliveryCode = handle('parcel.deliveryCode', async (req, res)
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
   const { code, phone } = await getOrCreateDeliveryCode(parcel.id, parcel.receiverPhone);
   if (isBrevoConfigured() && phone) {
-    sendOtpSms({ phone, code, purpose: 'livraison' }).catch(() => {});
+    sendOtpSms({ phone, code, purpose: 'livraison' }).catch(() => { });
   }
   return ok(res, { message: 'Code de livraison', data: { code } });
 });
 
 export const driverConfirm = handle('driver.confirm', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'confirmed', {
     ...req.body,
     description: 'Prise en charge confirmee par le chauffeur'
@@ -739,81 +782,147 @@ export const driverConfirm = handle('driver.confirm', async (req, res) => {
 });
 
 export const driverPickup = handle('driver.pickup', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'picked_up', req.body);
   return ok(res, { message: 'Colis ramasse', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
 export const driverTransit = handle('driver.transit', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'in_transit', req.body);
   return ok(res, { message: 'Colis en transit', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
 export const driverArrived = handle('driver.arrived', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'arrived', req.body);
   return ok(res, { message: 'Colis arrive a la zone', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
 export const driverOutForDelivery = handle('driver.outForDelivery', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'out_for_delivery', req.body);
   const { code, phone } = await getOrCreateDeliveryCode(parcel.id, parcel.receiverPhone);
   if (isBrevoConfigured() && phone) {
-    sendOtpSms({ phone, code, purpose: 'livraison' }).catch(() => {});
+    sendOtpSms({ phone, code, purpose: 'livraison' }).catch(() => { });
   }
   return ok(res, { message: 'Colis en livraison finale', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
 export const driverDeliver = handle('driver.deliver', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
 
-  // Verify the recipient's delivery code (proof of receipt) before completing.
-  const otpRow = await prisma.otpCode.findFirst({ where: { type: `delivery:${parcel.id}`, isUsed: false } });
-  const submitted = String(req.body.otp ?? '').trim();
+  const {
+    otp,
+    deliveryPoints = null,
+    signature = null,
+    proofImage = null,
+    recipientNote = null,
+    location = null,
+    locationLat = null,
+    locationLng = null
+  } = req.body;
+
+  // Vérifier le code OTP
+  const otpRow = await prisma.otpCode.findFirst({
+    where: { type: `delivery:${parcel.id}`, isUsed: false }
+  });
+  const submitted = String(otp || '').trim();
   if (!otpRow || !submitted || submitted !== otpRow.codeHash) {
-    if (otpRow) await prisma.otpCode.update({ where: { id: otpRow.id }, data: { attempts: { increment: 1 } } });
-    throw new ValidationError([{ path: 'otp', message: 'Code de livraison incorrect' }], 'Code de livraison incorrect');
+    if (otpRow) {
+      await prisma.otpCode.update({
+        where: { id: otpRow.id },
+        data: { attempts: { increment: 1 } }
+      });
+    }
+    throw new ValidationError(
+      [{ path: 'otp', message: 'Code de livraison incorrect' }],
+      'Code de livraison incorrect'
+    );
   }
-  await prisma.otpCode.update({ where: { id: otpRow.id }, data: { isUsed: true } });
+  await prisma.otpCode.update({
+    where: { id: otpRow.id },
+    data: { isUsed: true }
+  });
 
-  const recipientNote = req.body.recipientNote;
+  // Mettre à jour le statut
   const result = await changeParcelStatus(req, parcel, 'delivered', {
-    ...req.body,
-    description: recipientNote ? `Livraison confirmee (code OTP) — ${recipientNote}` : 'Livraison confirmee par code OTP'
+    signature,
+    proofImage,
+    location,
+    locationLat,
+    locationLng,
+    notes: recipientNote,
+    description: recipientNote
+      ? `Livraison confirmée (code OTP) — ${recipientNote}`
+      : 'Livraison confirmée par code OTP'
   });
 
   const parcelPrice = Number(parcel.price || parcel.totalAmount || 0);
   const isPaid = parcel.paymentStatus === 'completed';
-
   let commission = 0;
   let driverEarning = 0;
+
   if (isPaid && parcelPrice > 0) {
     commission = await calculateCommission(parcelPrice);
     driverEarning = Math.max(0, parcelPrice - commission);
   }
 
-  await prisma.$transaction(async (tx) => {
-    const deliveryPoints = await getDeliveryPoints(tx);
+  let points = 0;
 
-    // Points (toujours attribués)
+  await prisma.$transaction(async (tx) => {
+    points = await getDeliveryPoints(tx);
+
     await tx.score.upsert({
       where: { userId: req.user.id },
-      update: { points: { increment: deliveryPoints }, totalEarned: { increment: deliveryPoints }, lastUpdated: new Date() },
-      create: { userId: req.user.id, points: deliveryPoints, totalEarned: deliveryPoints }
-    });
-    await tx.scoreTransaction.create({
-      data: { userId: req.user.id, amount: deliveryPoints, type: 'delivery_completed', source: 'system', parcelId: parcel.id, description: 'Points chauffeur pour livraison terminee' }
+      update: {
+        points: { increment: points },
+        totalEarned: { increment: points },
+        lastUpdated: new Date()
+      },
+      create: {
+        userId: req.user.id,
+        points: points,
+        totalEarned: points
+      }
     });
 
-    // Portefeuille (uniquement si payé)
+    await tx.scoreTransaction.create({
+      data: {
+        userId: req.user.id,
+        amount: points,
+        type: 'delivery_completed',
+        source: 'system',
+        parcelId: parcel.id,
+        description: `Points chauffeur pour livraison terminée (${points} pts)`
+      }
+    });
+
+    if (deliveryPoints) {
+      await tx.parcel.update({
+        where: { id: parcel.id },
+        data: { deliveryPoints: deliveryPoints }
+      });
+    }
+
     if (isPaid && driverEarning > 0) {
       const wallet = await tx.wallet.upsert({
         where: { userId: req.user.id },
-        update: { balance: { increment: driverEarning }, totalDeposited: { increment: driverEarning }, lastActivityAt: new Date(), lastDepositAt: new Date() },
-        create: { userId: req.user.id, balance: driverEarning, totalDeposited: driverEarning, lastDepositAt: new Date(), lastActivityAt: new Date() }
+        update: {
+          balance: { increment: driverEarning },
+          totalDeposited: { increment: driverEarning },
+          lastActivityAt: new Date(),
+          lastDepositAt: new Date()
+        },
+        create: {
+          userId: req.user.id,
+          balance: driverEarning,
+          totalDeposited: driverEarning,
+          lastDepositAt: new Date(),
+          lastActivityAt: new Date()
+        }
       });
+
       await tx.walletTransaction.create({
         data: {
           walletUserId: req.user.id,
@@ -829,10 +938,9 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
       });
     }
 
-    // Notifications
     const notifBody = isPaid
-      ? `+${deliveryPoints} pts · +${driverEarning} FCFA (colis ${parcel.trackingNumber}). Commission: ${commission} FCFA.`
-      : `+${deliveryPoints} pts (colis ${parcel.trackingNumber}). Paiement en attente — le gain sera crédité après confirmation.`;
+      ? `+${points} pts · +${driverEarning} FCFA (colis ${parcel.trackingNumber}). Commission: ${commission} FCFA.`
+      : `+${points} pts (colis ${parcel.trackingNumber}). Paiement en attente — le gain sera crédité après confirmation.`;
 
     await tx.notification.create({
       data: {
@@ -840,7 +948,13 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
         type: 'delivery_completed',
         title: 'Livraison terminée',
         body: notifBody,
-        data: { parcelId: parcel.id, points: deliveryPoints, earning: driverEarning, commission, paid: isPaid }
+        data: {
+          parcelId: parcel.id,
+          points: points,
+          earning: driverEarning,
+          commission: commission,
+          paid: isPaid
+        }
       }
     });
 
@@ -856,7 +970,6 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
       });
     }
 
-    // Notifier les admins
     if (isPaid) {
       await notifyAdmins(tx, 'delivery_completed',
         `Livraison + paiement : ${parcel.trackingNumber}`,
@@ -873,10 +986,19 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
   });
 
   return ok(res, {
-    message: 'Livraison confirmee',
-    data: { parcel: serializeParcel(result.parcel), score: { credited: deliveryPoints }, wallet: isPaid ? { earning: driverEarning, commission } : { pending: true } }
+    message: 'Livraison confirmée',
+    data: {
+      parcel: serializeParcel(result.parcel),
+      score: { credited: points },
+      wallet: isPaid ? { earning: driverEarning, commission } : { pending: true },
+      deliveryPoints: deliveryPoints
+    }
   });
 });
+
+// ============================================================
+// PUBLIC
+// ============================================================
 
 export const freeParcels = handle('public.freeParcels', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
@@ -940,6 +1062,10 @@ export const estimateParcel = handle('parcel.estimate', async (req, res) => {
   const total = baseFee + weight * pricePerKg + urgentFee + insuranceFee;
   return ok(res, { message: 'Estimation prix', data: { estimate: { amount: total, currency: 'XOF', baseFee, pricePerKg, urgentFee, insuranceFee } } });
 });
+
+// ============================================================
+// BIDS - Offres
+// ============================================================
 
 export const createBid = handle('bid.create', async (req, res) => {
   await assertDriverVerified(req);
@@ -1045,24 +1171,16 @@ export const clientBidsReceived = handle('bid.clientReceived', async (req, res) 
   const where = { parcel: { senderId: req.user.id } };
   const [total, bids] = await Promise.all([
     prisma.bid.count({ where }),
-    prisma.bid.findMany({ where, include: { driver: true, parcel: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
+    prisma.bid.findMany({ where, include: { driver: true, parcel: true, negotiationMessages: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
   ]);
   const data = bids.map((b) => ({
     ...serializeBid(b),
     parcel: b.parcel
       ? { id: b.parcel.id, trackingNumber: b.parcel.trackingNumber, status: b.parcel.status, receiverName: b.parcel.receiverName }
-      : null
+      : null,
+    negotiationHistory: b.negotiationMessages || []
   }));
   return ok(res, { message: 'Offres recues', data: { bids: data }, meta: paginationMeta({ page, limit, total }) });
-});
-
-export const negotiateBid = handle('bid.negotiate', async (req, res) => {
-  const bid = await prisma.bid.update({
-    where: { id: req.params.bidId },
-    data: { responseMessage: req.body.message, price: decimal(req.body.price, '0') },
-    include: { driver: true }
-  });
-  return ok(res, { message: 'Contre-proposition envoyee', data: { bid: serializeBid(bid) } });
 });
 
 export const driverBidsSent = handle('bid.driverSent', async (req, res) => {
@@ -1070,10 +1188,424 @@ export const driverBidsSent = handle('bid.driverSent', async (req, res) => {
   const where = { driverId: req.user.id };
   const [total, bids] = await Promise.all([
     prisma.bid.count({ where }),
-    prisma.bid.findMany({ where, include: { driver: true, parcel: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
+    prisma.bid.findMany({ where, include: { driver: true, parcel: true, negotiationMessages: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
   ]);
   return ok(res, { message: 'Offres envoyees', data: { bids: bids.map(serializeBid) }, meta: paginationMeta({ page, limit, total }) });
 });
+
+// ============================================================
+// NEGOCIATION - Contre-offres
+// ============================================================
+
+/**
+ * Récupère les détails de négociation d'une offre
+ * GET /client/bids/:bidId/negotiation
+ */
+export const getBidNegotiation = handle('bid.negotiation.get', async (req, res) => {
+  const { bidId } = req.params;
+
+  const bid = await prisma.bid.findFirst({
+    where: {
+      id: bidId,
+      OR: [
+        { parcel: { senderId: req.user.id } },
+        { driverId: req.user.id }
+      ]
+    },
+    include: {
+      driver: {
+        select: {
+          id: true,
+          fullName: true,
+          profilePhoto: true,
+          phone: true,
+          rating: true
+        }
+      },
+      parcel: {
+        select: {
+          id: true,
+          trackingNumber: true,
+          status: true,
+          departureCity: true,
+          arrivalCity: true,
+          price: true,
+          proposedPrice: true,
+          description: true,
+          weight: true,
+          senderId: true,
+          senderName: true
+        }
+      },
+      negotiationMessages: {
+        include: {
+          fromUser: {
+            select: {
+              id: true,
+              fullName: true,
+              profilePhoto: true
+            }
+          }
+        },
+        orderBy: { createdAt: 'asc' }
+      }
+    }
+  });
+
+  if (!bid) {
+    throw new NotFoundError('Offre introuvable ou non autorisée');
+  }
+
+  const isClient = req.user.role === 'client';
+
+  return ok(res, {
+    message: 'Détails de la négociation',
+    data: {
+      bid: {
+        id: bid.id,
+        price: Number(bid.price),
+        message: bid.message,
+        status: bid.status,
+        createdAt: bid.createdAt,
+        updatedAt: bid.updatedAt,
+        driver: {
+          id: bid.driver.id,
+          fullName: bid.driver.fullName,
+          profilePhoto: bid.driver.profilePhoto,
+          phone: bid.driver.phone,
+          rating: bid.driver.rating
+        },
+        parcel: {
+          id: bid.parcel.id,
+          trackingNumber: bid.parcel.trackingNumber,
+          status: bid.parcel.status,
+          departureCity: bid.parcel.departureCity,
+          arrivalCity: bid.parcel.arrivalCity,
+          price: Number(bid.parcel.price),
+          proposedPrice: Number(bid.parcel.proposedPrice),
+          description: bid.parcel.description,
+          weight: Number(bid.parcel.weight),
+          senderName: bid.parcel.senderName
+        },
+        negotiationHistory: bid.negotiationMessages.map(msg => ({
+          id: msg.id,
+          fromUserId: msg.fromUserId,
+          fromUserRole: msg.fromUserRole,
+          price: Number(msg.price),
+          message: msg.message,
+          createdAt: msg.createdAt,
+          sender: msg.fromUser ? {
+            id: msg.fromUser.id,
+            fullName: msg.fromUser.fullName,
+            profilePhoto: msg.fromUser.profilePhoto
+          } : null
+        })),
+        canNegotiate: bid.status === 'pending' || bid.status === 'countered'
+      }
+    }
+  });
+});
+
+/**
+ * Client: Envoyer une contre-offre
+ * POST /client/bids/:bidId/counter
+ */
+export const clientCounterBid = handle('bid.counter', async (req, res) => {
+  const { bidId } = req.params;
+  const { price, message } = req.body;
+
+  if (!price || Number(price) <= 0) {
+    throw new ValidationError([{ path: 'price', message: 'Un prix valide est requis' }]);
+  }
+
+  const result = await prisma.$transaction(async (tx) => {
+    const bid = await tx.bid.findFirst({
+      where: {
+        id: bidId,
+        parcel: { senderId: req.user.id }
+      },
+      include: { parcel: true, driver: true }
+    });
+
+    if (!bid) {
+      throw new NotFoundError('Offre introuvable ou non autorisée');
+    }
+
+    if (bid.status !== 'pending' && bid.status !== 'countered') {
+      throw new ConflictError('Cette offre n\'est plus négociable');
+    }
+
+    const updatedBid = await tx.bid.update({
+      where: { id: bidId },
+      data: {
+        price: decimal(price, '0'),
+        responseMessage: message || `Contre-offre à ${price} FCFA`,
+        status: 'countered',
+        respondedAt: new Date()
+      },
+      include: { driver: true, parcel: true }
+    });
+
+    await tx.negotiationMessage.create({
+      data: {
+        bidId: bidId,
+        fromUserId: req.user.id,
+        fromUserRole: 'client',
+        price: decimal(price, '0'),
+        message: message || `Contre-offre à ${price} FCFA`
+      }
+    });
+
+    await notify(tx, {
+      userId: bid.driverId,
+      parcelId: bid.parcelId,
+      bidId: bidId,
+      senderId: req.user.id,
+      senderName: req.user.fullName,
+      type: 'bid_countered',
+      title: 'Contre-offre reçue',
+      body: `${req.user.fullName} propose ${price} FCFA pour votre offre.`,
+      data: { bidId, price, parcelId: bid.parcelId },
+      priority: 'high'
+    });
+
+    return updatedBid;
+  });
+
+  return ok(res, {
+    message: 'Contre-offre envoyée',
+    data: {
+      bid: {
+        id: result.id,
+        price: Number(result.price),
+        status: result.status,
+        message: result.responseMessage,
+        updatedAt: result.updatedAt
+      }
+    }
+  });
+});
+
+/**
+ * Driver: Répondre à une contre-offre
+ * POST /driver/bids/:bidId/respond-counter
+ */
+export const driverRespondCounter = handle('bid.respondCounter', async (req, res) => {
+  const { bidId } = req.params;
+  const { accept, price, message } = req.body;
+
+  const result = await prisma.$transaction(async (tx) => {
+    const bid = await tx.bid.findFirst({
+      where: {
+        id: bidId,
+        driverId: req.user.id
+      },
+      include: { parcel: true, driver: true }
+    });
+
+    if (!bid) {
+      throw new NotFoundError('Offre introuvable ou non autorisée');
+    }
+
+    if (bid.status !== 'countered') {
+      throw new ConflictError('Cette offre n\'est plus négociable');
+    }
+
+    let updatedBid;
+
+    if (accept) {
+      updatedBid = await tx.bid.update({
+        where: { id: bidId },
+        data: {
+          status: 'accepted',
+          responseMessage: message || 'Contre-offre acceptée',
+          respondedAt: new Date()
+        },
+        include: { driver: true, parcel: true }
+      });
+
+      await tx.parcel.update({
+        where: { id: bid.parcelId },
+        data: {
+          status: 'confirmed',
+          driverId: req.user.id,
+          selectedBidId: bidId,
+          negotiatedPrice: bid.price,
+          totalAmount: bid.price
+        }
+      });
+
+      await tx.bid.updateMany({
+        where: {
+          parcelId: bid.parcelId,
+          id: { not: bidId }
+        },
+        data: {
+          status: 'rejected',
+          respondedAt: new Date()
+        }
+      });
+
+      await notify(tx, {
+        userId: bid.parcel.senderId,
+        parcelId: bid.parcelId,
+        bidId: bidId,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'bid_accepted',
+        title: 'Offre acceptée',
+        body: `${req.user.fullName} a accepté votre contre-offre de ${bid.price} FCFA.`,
+        data: { bidId, price: Number(bid.price), parcelId: bid.parcelId },
+        priority: 'high'
+      });
+
+    } else if (price) {
+      updatedBid = await tx.bid.update({
+        where: { id: bidId },
+        data: {
+          price: decimal(price, '0'),
+          responseMessage: message || `Contre-offre à ${price} FCFA`,
+          status: 'countered',
+          respondedAt: new Date()
+        },
+        include: { driver: true, parcel: true }
+      });
+
+      await tx.negotiationMessage.create({
+        data: {
+          bidId: bidId,
+          fromUserId: req.user.id,
+          fromUserRole: 'driver',
+          price: decimal(price, '0'),
+          message: message || `Contre-offre à ${price} FCFA`
+        }
+      });
+
+      await notify(tx, {
+        userId: bid.parcel.senderId,
+        parcelId: bid.parcelId,
+        bidId: bidId,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'bid_countered',
+        title: 'Nouvelle proposition',
+        body: `${req.user.fullName} propose ${price} FCFA.`,
+        data: { bidId, price, parcelId: bid.parcelId },
+        priority: 'high'
+      });
+    } else {
+      throw new ValidationError([{ path: 'price', message: 'Un prix est requis pour la contre-offre' }]);
+    }
+
+    return updatedBid;
+  });
+
+  return ok(res, {
+    message: accept ? 'Offre acceptée' : 'Contre-offre envoyée',
+    data: {
+      bid: {
+        id: result.id,
+        price: Number(result.price),
+        status: result.status,
+        message: result.responseMessage,
+        updatedAt: result.updatedAt
+      }
+    }
+  });
+});
+
+/**
+ * Client: Accepter une offre (après négociation)
+ * POST /client/bids/:bidId/accept
+ */
+export const clientAcceptBid = handle('bid.clientAccept', async (req, res) => {
+  const { bidId } = req.params;
+
+  const result = await prisma.$transaction(async (tx) => {
+    const bid = await tx.bid.findFirst({
+      where: {
+        id: bidId,
+        parcel: { senderId: req.user.id }
+      },
+      include: { parcel: true, driver: true }
+    });
+
+    if (!bid) {
+      throw new NotFoundError('Offre introuvable ou non autorisée');
+    }
+
+    if (bid.status === 'accepted') {
+      throw new ConflictError('Cette offre est déjà acceptée');
+    }
+
+    if (bid.status === 'rejected') {
+      throw new ConflictError('Cette offre a été rejetée');
+    }
+
+    const updatedBid = await tx.bid.update({
+      where: { id: bidId },
+      data: {
+        status: 'accepted',
+        respondedAt: new Date()
+      },
+      include: { driver: true, parcel: true }
+    });
+
+    await tx.parcel.update({
+      where: { id: bid.parcelId },
+      data: {
+        status: 'confirmed',
+        driverId: bid.driverId,
+        selectedBidId: bidId,
+        negotiatedPrice: bid.price,
+        totalAmount: bid.price
+      }
+    });
+
+    await tx.bid.updateMany({
+      where: {
+        parcelId: bid.parcelId,
+        id: { not: bidId }
+      },
+      data: {
+        status: 'rejected',
+        respondedAt: new Date()
+      }
+    });
+
+    await notify(tx, {
+      userId: bid.driverId,
+      parcelId: bid.parcelId,
+      bidId: bidId,
+      senderId: req.user.id,
+      senderName: req.user.fullName,
+      type: 'bid_accepted',
+      title: 'Offre acceptée',
+      body: `Votre offre de ${bid.price} FCFA a été acceptée.`,
+      data: { bidId, price: Number(bid.price), parcelId: bid.parcelId },
+      priority: 'high'
+    });
+
+    return updatedBid;
+  });
+
+  return ok(res, {
+    message: 'Offre acceptée',
+    data: {
+      bid: {
+        id: result.id,
+        price: Number(result.price),
+        status: result.status,
+        parcelId: result.parcelId,
+        driverId: result.driverId
+      }
+    }
+  });
+});
+
+// ============================================================
+// NEGOCIATION - Fin
+// ============================================================
 
 export const initiatePayment = handle('payment.initiate', async (req, res) => {
   const payment = await prisma.payment.create({
@@ -1104,8 +1636,6 @@ export const confirmPayment = handle('payment.confirm', async (req, res) => {
     }
     await audit(tx, req, { action: 'payment.confirm', entityType: 'payment', entityId: updated.id, afterData: { status: 'completed' } });
 
-    // P1 : notifier le payeur. Le crédit chauffeur reste géré par les flux de
-    // paiement réels (confirmCashPayment + IPN PayDunya) pour éviter un double crédit.
     if (updated.userId) {
       await notify(tx, {
         userId: updated.userId,
@@ -1133,8 +1663,12 @@ export const paymentHistory = handle('payment.history', async (req, res) => {
   return ok(res, { message: 'Historique paiements', data: { payments: payments.map(serializePayment) }, meta: paginationMeta({ page, limit, total }) });
 });
 
+// ============================================================
+// CASH COLLECTION - Encaissements espèces
+// ============================================================
+
 export const declareCashCollection = handle('payment.declareCash', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   const amount = Number(req.body.amount);
   const collectionPoint = req.body.collectionPoint || parcel.cashCollectionPoint;
 
@@ -1142,22 +1676,20 @@ export const declareCashCollection = handle('payment.declareCash', async (req, r
     throw new ValidationError([{ path: 'amount', message: 'Le montant encaissé doit être supérieur à zéro' }]);
   }
   if (!['sender_pickup', 'receiver_delivery'].includes(collectionPoint)) {
-    throw new ValidationError([{ path: 'collectionPoint', message: 'Point d’encaissement invalide' }]);
+    throw new ValidationError([{ path: 'collectionPoint', message: 'Point d\'encaissement invalide' }]);
   }
 
   const resolvedChannel = parcel.paymentChannel || (parcel.paymentMethod === 'cash' ? 'cash' : null);
   if (resolvedChannel !== 'cash') {
-    throw new ValidationError([{ path: 'parcelId', message: 'Ce colis n’est pas réglé en espèces' }]);
+    throw new ValidationError([{ path: 'parcelId', message: 'Ce colis n\'est pas réglé en espèces' }]);
   }
 
-  // Une déclaration n'est possible qu'après le jalon où l'argent est remis au
-  // chauffeur. Le contrôle serveur empêche un appel direct prématuré.
   const pickedUpStatuses = ['picked_up', 'in_transit', 'arrived', 'out_for_delivery', 'delivered'];
   const milestoneReached = collectionPoint === 'sender_pickup'
     ? Boolean(parcel.pickupDate) || pickedUpStatuses.includes(parcel.status)
     : parcel.status === 'delivered';
   if (!milestoneReached) {
-    throw new ValidationError([{ path: 'parcelId', message: 'Le jalon d’encaissement de ce colis n’est pas encore atteint' }]);
+    throw new ValidationError([{ path: 'parcelId', message: 'Le jalon d\'encaissement de ce colis n\'est pas encore atteint' }]);
   }
 
   const current = await prisma.payment.findFirst({
@@ -1168,8 +1700,6 @@ export const declareCashCollection = handle('payment.declareCash', async (req, r
   if (current?.status === 'completed') {
     throw new ConflictError('Cet encaissement a déjà été validé');
   }
-  // L'appel est idempotent tant que la déclaration est en cours : un double
-  // tap ou une reprise réseau ne crée pas deux lignes à réconcilier.
   if (current) {
     return ok(res, { message: 'Encaissement déjà déclaré', data: { payment: serializePayment(current) } });
   }
@@ -1290,8 +1820,6 @@ export const validateCashDeclaration = handle('payment.validateCashDeclaration',
       throw new ConflictError('Cette déclaration a déjà été traitée');
     }
 
-    // La condition sur le statut rend la validation atomique : deux admins ne
-    // peuvent pas confirmer simultanément la même déclaration.
     const claimed = await tx.payment.updateMany({
       where: { id: payment.id, status: 'processing' },
       data: {
@@ -1301,7 +1829,7 @@ export const validateCashDeclaration = handle('payment.validateCashDeclaration',
         completedAt: new Date()
       }
     });
-    if (claimed.count !== 1) throw new ConflictError('Cette déclaration vient d’être traitée');
+    if (claimed.count !== 1) throw new ConflictError('Cette déclaration vient d\'être traitée');
 
     if (payment.parcelId) {
       await tx.parcel.update({
@@ -1415,10 +1943,10 @@ export const setParcelPaymentChannel = handle('parcel.setPaymentChannel', async 
     throw new ValidationError([{ path: 'paymentChannel', message: 'Canal de paiement invalide' }]);
   }
   if (channel === 'cash' && !['sender_pickup', 'receiver_delivery'].includes(collectionPoint)) {
-    throw new ValidationError([{ path: 'cashCollectionPoint', message: 'Point d’encaissement obligatoire pour un paiement espèces' }]);
+    throw new ValidationError([{ path: 'cashCollectionPoint', message: 'Point d\'encaissement obligatoire pour un paiement espèces' }]);
   }
   if (parcel.paymentStatus === 'completed') {
-    throw new ConflictError('Le canal d’un colis déjà payé ne peut plus être modifié');
+    throw new ConflictError('Le canal d\'un colis déjà payé ne peut plus être modifié');
   }
 
   const updated = await prisma.$transaction(async (tx) => {
@@ -1570,6 +2098,10 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
   return ok(res, { message: 'Paiement especes confirme', data: { driverCredited: isDelivered && !!parcel.driverId } });
 });
 
+// ============================================================
+// SCORE - Points
+// ============================================================
+
 export const getScore = handle('score.get', async (req, res) => {
   const { score, transactions } = await scoreSnapshot(req.user.id);
   return ok(res, { message: 'Score utilisateur', data: { score, history: transactions.map(serializeScoreTransaction) } });
@@ -1662,8 +2194,6 @@ export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
     return withdrawal;
   });
 
-  // Retrait libre-service : déboursement PayDunya immédiat (API PUSH) quand configuré.
-  // Sans clés PayDunya, le retrait reste en attente de traitement admin.
   const disbursed = await attemptDisbursement(result.id, req.log);
   const final = disbursed ?? result;
 
@@ -1894,6 +2424,10 @@ export const scoreStats = handle('score.stats', async (req, res) => {
   return ok(res, { message: 'Stats score', data: { stats: { totalUsers, transactions, sums: totalPoints._sum } } });
 });
 
+// ============================================================
+// ADDRESSES - Adresses
+// ============================================================
+
 export const listAddresses = handle('addresses.list', async (req, res) => {
   const addresses = await prisma.address.findMany({ where: { userId: req.user.id }, orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }] });
   return ok(res, { message: 'Adresses', data: { addresses } });
@@ -1930,6 +2464,10 @@ export const setDefaultAddress = handle('addresses.default', async (req, res) =>
   return ok(res, { message: 'Adresse par defaut mise a jour' });
 });
 
+// ============================================================
+// FAVORITES - Favoris
+// ============================================================
+
 export const addFavoriteGarage = handle('favorites.addGarage', async (req, res) => {
   await prisma.favoriteGarage.upsert({
     where: { userId_garageId: { userId: req.user.id, garageId: req.params.garageId } },
@@ -1948,6 +2486,10 @@ export const favoriteGarages = handle('favorites.garages', async (req, res) => {
   const favorites = await prisma.favoriteGarage.findMany({ where: { userId: req.user.id }, include: { garage: true } });
   return ok(res, { message: 'Zones favorites', data: { garages: favorites.map((favorite) => serializeGarage(favorite.garage)) } });
 });
+
+// ============================================================
+// MESSAGES - Messages
+// ============================================================
 
 function serializeMessage(m) {
   if (!m) return null;
@@ -1982,8 +2524,6 @@ export const sendMessage = handle('messages.send', async (req, res) => {
     }
   });
 
-  // P1 : notifier le destinataire (in-app seulement — pas d'email/SMS par message
-  // pour éviter le spam). Une notif ratée ne doit pas casser l'envoi du message.
   try {
     const sender = await prisma.user.findUnique({ where: { id: req.user.id }, select: { fullName: true } });
     const preview = message.photoUrl
@@ -2055,6 +2595,10 @@ export const readMessage = handle('messages.read', async (req, res) => {
   return ok(res, { message: 'Message lu' });
 });
 
+// ============================================================
+// SUPPORT - Support
+// ============================================================
+
 export const createSupportMessage = handle('support.create', async (req, res) => {
   const supportMessage = await prisma.supportMessage.create({
     data: { userId: req.user.id, subject: req.body.subject, message: req.body.message, metadata: req.body.metadata || {} }
@@ -2067,6 +2611,10 @@ export const listSupportMessages = handle('support.list', async (req, res) => {
   const supportMessages = await prisma.supportMessage.findMany({ where, orderBy: { createdAt: 'desc' } });
   return ok(res, { message: 'Messages support', data: { supportMessages } });
 });
+
+// ============================================================
+// RATINGS - Notes
+// ============================================================
 
 export const createRating = handle('ratings.create', async (req, res) => {
   const driverId = req.body.driverId;
@@ -2104,9 +2652,17 @@ export const driverRatings = handle('ratings.driver', async (req, res) => {
   return ok(res, { message: 'Notes chauffeur', data: { ratings }, meta: paginationMeta({ page, limit, total }) });
 });
 
+// ============================================================
+// COUPONS - Coupons
+// ============================================================
+
 export const availableCoupons = handle('coupons.available', async (_req, res) => {
   return ok(res, { message: 'Coupons disponibles', data: { coupons: [] } });
 });
+
+// ============================================================
+// SEARCH - Recherche
+// ============================================================
 
 export const searchParcels = handle('search.parcels', async (req, res) => {
   const where = {
@@ -2114,12 +2670,12 @@ export const searchParcels = handle('search.parcels', async (req, res) => {
     ...(req.query.status ? { status: req.query.status } : {}),
     ...(req.query.q
       ? {
-          OR: [
-            { trackingNumber: { contains: req.query.q, mode: 'insensitive' } },
-            { receiverName: { contains: req.query.q, mode: 'insensitive' } },
-            { senderName: { contains: req.query.q, mode: 'insensitive' } }
-          ]
-        }
+        OR: [
+          { trackingNumber: { contains: req.query.q, mode: 'insensitive' } },
+          { receiverName: { contains: req.query.q, mode: 'insensitive' } },
+          { senderName: { contains: req.query.q, mode: 'insensitive' } }
+        ]
+      }
       : {})
   };
   if (req.user.role === 'client') where.senderId = req.user.id;
@@ -2148,12 +2704,20 @@ export const garagePublicDrivers = handle('drivers.garage', async (req, res) => 
   return ok(res, { message: 'Chauffeurs zone', data: { drivers: drivers.map(serializeUser) } });
 });
 
+// ============================================================
+// DRIVER LOCATION - Localisation chauffeur
+// ============================================================
+
 export const saveDriverLocation = handle('driver.location', async (req, res) => {
   const location = await prisma.driverLocation.create({
     data: { driverId: req.user.id, parcelId: req.body.parcelId, latitude: decimal(req.body.latitude, '0'), longitude: decimal(req.body.longitude, '0'), accuracy: decimal(req.body.accuracy) }
   });
   return ok(res, { status: 201, message: 'Position enregistree', data: { location } });
 });
+
+// ============================================================
+// IDENTITY - Vérification d'identité
+// ============================================================
 
 export const createIdentityVerification = handle('identity.verify', async (req, res) => {
   const identity = await prisma.identityVerification.create({ data: { userId: req.user.id, documentType: req.body.documentType } });
@@ -2171,11 +2735,6 @@ export const identityUpload = handle('identity.upload', async (req, res) => {
 
   let identity;
 
-  // Les photos de vehicule forment une galerie : chaque envoi ajoute une
-  // entree. Les documents officiels, eux, sont uniques par type et portent
-  // leurs deux faces sur la meme ligne — les regrouper par (userId,
-  // documentType) evite que le recto et le verso atterrissent dans deux
-  // enregistrements distincts, ce qui rendait le verso irrecuperable.
   if (documentType === 'vehicle_photo') {
     identity = await prisma.identityVerification.create({
       data: { userId: req.user.id, documentType, [side]: url }
@@ -2189,7 +2748,6 @@ export const identityUpload = handle('identity.upload', async (req, res) => {
     identity = existing
       ? await prisma.identityVerification.update({
         where: { id: existing.id },
-        // Un document renvoye repart en attente de validation.
         data: { [side]: url, status: 'pending', rejectionReason: null }
       })
       : await prisma.identityVerification.create({
@@ -2208,9 +2766,6 @@ export const identityStatus = handle('identity.status', async (req, res) => {
 
   const identity = documents[0] || null;
 
-  // `status` global : approuve seulement si tous les documents le sont,
-  // refuse des qu'un l'est. `documents` permet au client de restaurer chaque
-  // emplacement — `identity` seul ne rendait que le dernier envoi.
   let status = 'pending';
   if (documents.length) {
     if (documents.some((doc) => doc.status === 'rejected')) {
@@ -2222,6 +2777,10 @@ export const identityStatus = handle('identity.status', async (req, res) => {
 
   return ok(res, { message: 'Statut identite', data: { status, identity, documents } });
 });
+
+// ============================================================
+// ADVERTISEMENTS - Annonces
+// ============================================================
 
 export const listAdvertisements = handle('advertisements.list', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
@@ -2385,6 +2944,10 @@ export const advertisementStats = handle('advertisements.stats', async (req, res
   return ok(res, { message: 'Stats annonces', data: { stats: { total, open, closed } } });
 });
 
+// ============================================================
+// VEHICLES - Véhicules
+// ============================================================
+
 export const createVehicle = handle('vehicles.create', async (req, res) => {
   const garageId = req.user.role === 'admin' ? req.user.garageId : req.body.garageId;
   const vehicle = await prisma.vehicle.create({
@@ -2410,7 +2973,6 @@ export const deleteVehicle = handle('vehicles.delete', async (req, res) => {
 });
 
 export const getDriverVehicle = handle('driver.vehicle.get', async (req, res) => {
-  // A driver owns at most one active vehicle (the one they drive).
   const vehicle = await prisma.vehicle.findFirst({
     where: { driverId: req.user.id, deletedAt: null },
     orderBy: { createdAt: 'desc' }
@@ -2428,7 +2990,6 @@ export const upsertDriverVehicle = handle('driver.vehicle.upsert', async (req, r
   if (type.length < 1) errors.push({ path: 'body.type', message: 'Type de vehicule requis' });
   if (errors.length) throw new ValidationError(errors);
 
-  // A driver may not belong to a garage: garageId is optional on vehicles.
   const data = { plateNumber, model, type, capacity: Number(req.body.capacity || 0), garageId: req.user.garageId || null, driverId: req.user.id };
   const existing = await prisma.vehicle.findFirst({ where: { driverId: req.user.id, deletedAt: null } });
 
@@ -2438,13 +2999,16 @@ export const upsertDriverVehicle = handle('driver.vehicle.upsert', async (req, r
       : await prisma.vehicle.create({ data });
     return ok(res, { status: existing ? 200 : 201, message: 'Vehicule enregistre', data: { vehicle } });
   } catch (error) {
-    // Unique constraint on plate_number -> another vehicle already uses it.
     if (error && error.code === 'P2002') {
       throw new ConflictError('Cette plaque est deja enregistree');
     }
     throw error;
   }
 });
+
+// ============================================================
+// GARAGE - Zone
+// ============================================================
 
 export const garageDrivers = handle('garage.drivers', async (req, res) => {
   const drivers = await prisma.user.findMany({ where: { role: 'driver', garageId: req.user.garageId, status: 'active' }, include: driverInclude });
@@ -2465,6 +3029,10 @@ export const garageStats = handle('garage.stats', async (req, res) => {
   const parcelsByStatus = Object.fromEntries(grouped.map((row) => [row.status, row._count.status]));
   return ok(res, { message: 'Stats zone', data: { stats: { garageId, totalParcels, activeParcels, deliveredToday, activeDrivers, revenue: revenue._sum.amount?.toString() || '0', parcelsByStatus } } });
 });
+
+// ============================================================
+// STATS - Statistiques globales
+// ============================================================
 
 async function globalStats() {
   const startOfDay = new Date(new Date().toDateString());
@@ -2516,6 +3084,10 @@ export const driverStats = handle('driver.stats', async (req, res) => {
   return ok(res, { message: 'Stats chauffeur', data: { stats: { assignedParcels, activeParcels, completedDeliveries, rating: Number(req.user.rating || 0), scoreBalance: score?.points || 0, pendingBids, openAdvertisements } } });
 });
 
+// ============================================================
+// REPORTS - Rapports
+// ============================================================
+
 export const garageDailyReport = handle('garage.reportDaily', async (req, res) => {
   return ok(res, { message: 'Rapport journalier', data: { report: { date: req.query.date, stats: await globalStats() } } });
 });
@@ -2544,6 +3116,10 @@ export const superAdminExport = handle('super.export', async (req, res) => {
     : (await prisma.parcel.findMany({ include: parcelInclude })).map(serializeParcel);
   return ok(res, { message: 'Export', data: { data } });
 });
+
+// ============================================================
+// SUPER ADMIN - Utilisateurs
+// ============================================================
 
 export const superAdminUsers = handle('super.users', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
@@ -2583,8 +3159,6 @@ export const superAdminCreateUser = handle('super.userCreate', async (req, res) 
     return created;
   });
 
-  // Relecture : le vehicule vient d'etre cree dans la transaction, l'objet
-  // `user` capture avant ne le contient pas encore.
   const created = await prisma.user.findUnique({ where: { id: user.id }, include: driverInclude });
   return ok(res, { status: 201, message: 'Utilisateur cree', data: { user: serializeUser(created) } });
 });
@@ -2629,6 +3203,61 @@ export const superAdminDeleteUser = handle('super.userDelete', async (req, res) 
   const user = await prisma.user.update({ where: { id: req.params.userId }, data: { status: 'deleted', deletedAt: new Date() }, include: { garage: true } });
   return ok(res, { message: 'Utilisateur supprime', data: { user: serializeUser(user) } });
 });
+
+export const superAdminResetUserPin = handle('super.userResetPin', async (req, res) => {
+  const { userId } = req.params;
+
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user || user.status === 'deleted') throw new NotFoundError('Utilisateur introuvable');
+
+  const pin = String(Math.floor(100000 + Math.random() * 900000));
+  const pinHash = await bcrypt.hash(pin, 12);
+
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({ where: { id: userId }, data: { pinHash } });
+
+    await tx.notification.create({
+      data: {
+        userId,
+        type: 'pin_reset',
+        title: 'Code PIN reinitialise',
+        body: 'Votre code PIN a ete reinitialise par un administrateur. Utilisez le nouveau code qui vous a ete communique pour vous connecter.',
+        data: { resetBy: req.user.id },
+        priority: 'high'
+      }
+    });
+
+    await audit(tx, req, {
+      action: 'user.resetPin',
+      entityType: 'user',
+      entityId: userId,
+      afterData: { resetBy: req.user.id }
+    });
+  });
+
+  if (isBrevoConfigured()) {
+    if (user.phone) {
+      sendNotificationSms({
+        phone: user.phone,
+        message: `[PRO COLIS] Votre code PIN a ete reinitialise. Nouveau code : ${pin}. Ne le partagez avec personne.`,
+        tag: 'pin_reset'
+      }).catch(() => { });
+    }
+    if (user.email) {
+      sendNotificationEmail({
+        email: user.email,
+        subject: '[PRO COLIS] Votre code PIN a ete reinitialise',
+        message: `Votre code PIN a ete reinitialise par un administrateur. Nouveau code : ${pin}. Ne le partagez avec personne.`
+      }).catch(() => { });
+    }
+  }
+
+  return ok(res, { message: 'PIN reinitialise', data: { pin, newPin: pin } });
+});
+
+// ============================================================
+// SUPER ADMIN - Garages
+// ============================================================
 
 export const superAdminGarages = handle('super.garages', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
@@ -2687,6 +3316,10 @@ export const superAdminDeleteGarage = handle('super.garageDelete', async (req, r
   return ok(res, { message: 'Zone supprimee', data: { garage: serializeGarage(garage) } });
 });
 
+// ============================================================
+// SUPER ADMIN - Parcels
+// ============================================================
+
 export const superAdminUpdateParcel = handle('super.parcelUpdate', async (req, res) => {
   const allowed = ['receiverAddress', 'receiverName', 'receiverPhone', 'notes', 'price', 'totalAmount', 'driverId', 'arrivalGarageId', 'departureGarageId'];
   const parcel = await prisma.parcel.update({
@@ -2696,6 +3329,10 @@ export const superAdminUpdateParcel = handle('super.parcelUpdate', async (req, r
   });
   return ok(res, { message: 'Colis mis a jour', data: { parcel: serializeParcel(parcel) } });
 });
+
+// ============================================================
+// AUDIT LOGS - Journaux d'audit
+// ============================================================
 
 export const auditLogs = handle('super.auditLogs', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
@@ -2712,17 +3349,16 @@ export const auditLogs = handle('super.auditLogs', async (req, res) => {
   return ok(res, { message: 'Audit logs', data: { auditLogs: auditLogsRows.map(serializeAuditLog) }, meta: paginationMeta({ page, limit, total }) });
 });
 
+// ============================================================
+// SYSTEM CONFIG - Configuration système
+// ============================================================
+
 export const getSystemConfig = handle('super.configGet', async (_req, res) => {
   const rows = await prisma.systemConfig.findMany();
   const config = Object.fromEntries(rows.map((row) => [row.key, row.value]));
   return ok(res, { message: 'Configuration', data: { config } });
 });
 
-// Les annonces (« broadcasts ») s'adressent a tous les utilisateurs, mais
-// `getSystemConfig` renvoie toute la table de configuration — cles PayDunya
-// comprises — et doit rester reserve au super-admin. On expose donc ici la
-// seule cle publique : sans cela clients et chauffeurs recevaient un 403 et
-// la banniere d'annonce n'apparaissait jamais.
 export const getPublicBroadcasts = handle('config.broadcasts', async (_req, res) => {
   const row = await prisma.systemConfig.findUnique({ where: { key: 'broadcasts' } });
   const broadcasts = Array.isArray(row?.value) ? row.value : [];
@@ -2744,6 +3380,10 @@ export const updateSystemConfig = handle('super.configUpdate', async (req, res) 
   return ok(res, { message: 'Configuration mise a jour' });
 });
 
+// ============================================================
+// BACKUP - Sauvegardes
+// ============================================================
+
 export const createBackup = handle('super.backupCreate', async (req, res) => {
   const backup = await prisma.backup.create({ data: { status: 'completed', requestedBy: req.user.id, fileUrl: `local://${Date.now()}-${req.body.storage || 'local'}`, completedAt: new Date() } });
   return ok(res, { status: 201, message: 'Backup cree', data: { backup } });
@@ -2759,6 +3399,10 @@ export const restoreBackup = handle('super.restore', async (req, res) => {
   return ok(res, { message: 'Restauration lancee', data: { restore: { status: 'running', backupId: req.body.backupId } } });
 });
 
+// ============================================================
+// WEBHOOKS - Webhooks
+// ============================================================
+
 export const listWebhooks = handle('webhooks.list', async (_req, res) => {
   const webhooks = await prisma.webhook.findMany({ orderBy: { createdAt: 'desc' } });
   return ok(res, { message: 'Webhooks', data: { webhooks } });
@@ -2773,6 +3417,10 @@ export const deleteWebhook = handle('webhooks.delete', async (req, res) => {
   await prisma.webhook.delete({ where: { id: req.params.webhookId } });
   return ok(res, { message: 'Webhook supprime' });
 });
+
+// ============================================================
+// SYSTEM HEALTH - Santé du système
+// ============================================================
 
 export const systemHealth = handle('system.health', async (_req, res) => {
   try {
@@ -2796,67 +3444,9 @@ export const systemHealth = handle('system.health', async (_req, res) => {
   }
 });
 
-
-// ------------------------------------------------------------------
-// Super Admin – Reinitialisation du PIN d'un utilisateur
-// ------------------------------------------------------------------
-
-export const superAdminResetUserPin = handle('super.userResetPin', async (req, res) => {
-  const { userId } = req.params;
-
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user || user.status === 'deleted') throw new NotFoundError('Utilisateur introuvable');
-
-  // PIN aleatoire a 6 chiffres, hashe comme a l'inscription (bcrypt, cout 12).
-  const pin = String(Math.floor(100000 + Math.random() * 900000));
-  const pinHash = await bcrypt.hash(pin, 12);
-
-  await prisma.$transaction(async (tx) => {
-    await tx.user.update({ where: { id: userId }, data: { pinHash } });
-
-    await tx.notification.create({
-      data: {
-        userId,
-        type: 'pin_reset',
-        title: 'Code PIN reinitialise',
-        body: 'Votre code PIN a ete reinitialise par un administrateur. Utilisez le nouveau code qui vous a ete communique pour vous connecter.',
-        data: { resetBy: req.user.id },
-        priority: 'high'
-      }
-    });
-
-    await audit(tx, req, {
-      action: 'user.resetPin',
-      entityType: 'user',
-      entityId: userId,
-      afterData: { resetBy: req.user.id }
-    });
-  });
-
-  if (isBrevoConfigured()) {
-    if (user.phone) {
-      sendNotificationSms({
-        phone: user.phone,
-        message: `[PRO COLIS] Votre code PIN a ete reinitialise. Nouveau code : ${pin}. Ne le partagez avec personne.`,
-        tag: 'pin_reset'
-      }).catch(() => {});
-    }
-    if (user.email) {
-      sendNotificationEmail({
-        email: user.email,
-        subject: '[PRO COLIS] Votre code PIN a ete reinitialise',
-        message: `Votre code PIN a ete reinitialise par un administrateur. Nouveau code : ${pin}. Ne le partagez avec personne.`
-      }).catch(() => {});
-    }
-  }
-
-  // Le PIN en clair est renvoye une seule fois pour affichage a l'administrateur.
-  return ok(res, { message: 'PIN reinitialise', data: { pin, newPin: pin } });
-});
-
-// ------------------------------------------------------------------
-// Commissions cote chauffeur
-// ------------------------------------------------------------------
+// ============================================================
+// COMMISSIONS - Commissions
+// ============================================================
 
 async function activeCommissionConfig(profile = 'local') {
   const configs = await prisma.commissionConfig.findMany({ where: { isActive: true } });
@@ -2897,7 +3487,7 @@ export const estimateCommission = handle('commission.estimate', async (req, res)
 });
 
 export const driverParcelCommission = handle('driver.parcelCommission', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   const amount = Number(parcel.price || parcel.totalAmount || 0);
   const cfg = await activeCommissionConfig('local');
   const breakdown = amount > 0
@@ -2910,8 +3500,8 @@ export const driverParcelCommission = handle('driver.parcelCommission', async (r
   const paidWithPoints = alreadyPaid
     ? null
     : await prisma.scoreTransaction.findFirst({
-        where: { parcelId: parcel.id, userId: req.user.id, type: 'commission_deduction' }
-      });
+      where: { parcelId: parcel.id, userId: req.user.id, type: 'commission_deduction' }
+    });
 
   return ok(res, {
     message: 'Commission du colis',
@@ -2928,7 +3518,7 @@ export const driverParcelCommission = handle('driver.parcelCommission', async (r
 });
 
 export const driverPayCommission = handle('driver.payCommission', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   const source = req.body.source || 'auto';
   if (!['auto', 'wallet', 'score'].includes(source)) {
     throw new ValidationError([{ path: 'body.source', message: 'Source invalide (wallet, score ou auto)' }]);
@@ -3018,7 +3608,6 @@ export const driverPayCommission = handle('driver.payCommission', async (req, re
       });
       walletDebited = commission;
     } else {
-      // source === 'score' : la commission est convertie en points.
       const cfaPerPoint = await getCfaPerPoint(tx);
       const pointsNeeded = Math.ceil(commission / cfaPerPoint);
       const score = await tx.score.upsert({
@@ -3096,20 +3685,15 @@ export const driverPayCommission = handle('driver.payCommission', async (req, re
     }
   });
 });
+
 // ============================================================
-// ADMIN SUPPORT FUNCTIONS - Version corrigée (Prisma)
+// ADMIN SUPPORT FUNCTIONS - Support admin
 // ============================================================
 
-/**
- * Admin: Récupérer toutes les conversations de support
- * GET /messages/admin/support/conversations
- */
 export const adminSupportConversations = async (req, res) => {
   try {
     console.log('📨 adminSupportConversations - Début');
 
-    // Récupérer les messages de support (parcel_id IS NULL)
-    // où au moins un participant est admin/super_admin/support
     const supportMessages = await prisma.message.findMany({
       where: {
         parcelId: null,
@@ -3122,8 +3706,8 @@ export const adminSupportConversations = async (req, res) => {
         sender: {
           select: {
             id: true,
-            fullName: true,      // ✅ Prisma utilise fullName (camelCase)
-            profilePhoto: true,   // ✅ Prisma utilise profilePhoto
+            fullName: true,
+            profilePhoto: true,
             role: true,
             email: true,
             phone: true
@@ -3132,8 +3716,8 @@ export const adminSupportConversations = async (req, res) => {
         receiver: {
           select: {
             id: true,
-            fullName: true,      // ✅ Prisma utilise fullName
-            profilePhoto: true,   // ✅ Prisma utilise profilePhoto
+            fullName: true,
+            profilePhoto: true,
             role: true,
             email: true,
             phone: true
@@ -3148,7 +3732,6 @@ export const adminSupportConversations = async (req, res) => {
 
     console.log(`📨 ${supportMessages.length} messages de support trouvés`);
 
-    // Grouper par utilisateur (non-support)
     const conversationMap = new Map();
 
     for (const msg of supportMessages) {
@@ -3199,11 +3782,9 @@ export const adminSupportConversations = async (req, res) => {
         }
       }
 
-      // Traçabilité : agent réel ayant répondu (sur les messages du support).
       if (isSupportSender && msg.handledBy) {
         const entry = conversationMap.get(user.id);
         const agent = { id: msg.handledBy.id, fullName: msg.handledBy.fullName };
-        // Messages triés desc → le premier vu est le plus récent.
         if (!entry.lastAgent) entry.lastAgent = agent;
         if (!entry.agents.some((a) => a.id === agent.id)) entry.agents.push(agent);
       }
@@ -3232,10 +3813,6 @@ export const adminSupportConversations = async (req, res) => {
   }
 };
 
-/**
- * Admin: Récupérer une conversation spécifique
- * GET /messages/admin/support/conversations/:supportUserId/:userId
- */
 export const adminSupportThread = async (req, res) => {
   try {
     const { supportUserId, userId } = req.params;
@@ -3257,7 +3834,6 @@ export const adminSupportThread = async (req, res) => {
       });
     }
 
-    // Vérifier que le support existe
     const support = await prisma.user.findUnique({
       where: { id: supportUserId },
       select: {
@@ -3292,7 +3868,6 @@ export const adminSupportThread = async (req, res) => {
       });
     }
 
-    // Vérifier que l'utilisateur existe
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -3319,7 +3894,6 @@ export const adminSupportThread = async (req, res) => {
     console.log('✅ Support trouvé:', support.fullName);
     console.log('✅ Utilisateur trouvé:', user.fullName);
 
-    // Récupérer les messages entre les deux utilisateurs
     const messages = await prisma.message.findMany({
       where: {
         parcelId: null,
@@ -3362,7 +3936,6 @@ export const adminSupportThread = async (req, res) => {
 
     console.log('📨 Messages trouvés:', messages.length);
 
-    // Marquer les messages non lus comme lus
     if (messages.length > 0) {
       await prisma.message.updateMany({
         where: {
@@ -3446,10 +4019,6 @@ export const adminSupportThread = async (req, res) => {
   }
 };
 
-/**
- * Admin: Répondre en tant que support
- * POST /messages/admin/support/reply
- */
 export const adminSupportReply = async (req, res) => {
   try {
     const { supportUserId, receiverId, body, audioUrl, photoUrl, videoUrl } = req.body;
@@ -3473,7 +4042,6 @@ export const adminSupportReply = async (req, res) => {
       });
     }
 
-    // Vérifier que le support existe
     const support = await prisma.user.findUnique({
       where: { id: supportUserId },
       select: { id: true, fullName: true, role: true }
@@ -3501,7 +4069,6 @@ export const adminSupportReply = async (req, res) => {
       });
     }
 
-    // Vérifier que le destinataire existe
     const receiver = await prisma.user.findUnique({
       where: { id: receiverId },
       select: { id: true, fullName: true, phone: true, email: true }
@@ -3518,10 +4085,6 @@ export const adminSupportReply = async (req, res) => {
       });
     }
 
-    // Créer le message
-    // On attribue le message au compte support partagé (identité vue par le
-    // client : "Support Commercial/Technique"), MAIS on enregistre l'agent réel
-    // qui a répondu (req.user) dans handledById, pour la traçabilité interne.
     const message = await prisma.message.create({
       data: {
         senderId: supportUserId,
@@ -3551,7 +4114,6 @@ export const adminSupportReply = async (req, res) => {
 
     console.log('✅ Message créé:', message.id);
 
-    // Créer une notification
     await prisma.notification.create({
       data: {
         userId: receiverId,
@@ -3586,3 +4148,62 @@ export const adminSupportReply = async (req, res) => {
     });
   }
 };
+
+// ============================================================
+// Récupérer le colis depuis une annonce
+// GET /advertisements/:advertisementId/parcel
+// ============================================================
+
+export const getParcelFromAdvertisement = handle('advertisements.getParcel', async (req, res) => {
+  const { advertisementId } = req.params;
+
+  const advertisement = await prisma.advertisement.findUnique({
+    where: { id: advertisementId },
+    include: {
+      offers: {
+        include: {
+          parcel: {
+            include: parcelInclude
+          }
+        }
+      }
+    }
+  });
+
+  if (!advertisement) {
+    throw new NotFoundError('Annonce introuvable');
+  }
+
+  if (req.user.role === 'driver' && advertisement.driverId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas autorisé à voir cette annonce');
+  }
+
+  const acceptedOffer = advertisement.offers.find(o => o.status === 'accepted');
+  const targetOffer = acceptedOffer || advertisement.offers[0];
+
+  if (!targetOffer || !targetOffer.parcel) {
+    throw new NotFoundError('Aucun colis associé à cette annonce');
+  }
+
+  const parcel = targetOffer.parcel;
+  if (req.user.role === 'client' && parcel.senderId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas autorisé à voir ce colis');
+  }
+  if (req.user.role === 'driver' && parcel.driverId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas autorisé à voir ce colis');
+  }
+
+  return ok(res, {
+    message: 'Colis récupéré',
+    data: { parcel: serializeParcel(parcel) }
+  });
+});
+
+export const negotiateBid = handle('bid.negotiate', async (req, res) => {
+  const bid = await prisma.bid.update({
+    where: { id: req.params.bidId },
+    data: { responseMessage: req.body.message, price: decimal(req.body.price, '0') },
+    include: { driver: true }
+  });
+  return ok(res, { message: 'Contre-proposition envoyee', data: { bid: serializeBid(bid) } });
+});

@@ -1,11 +1,11 @@
 import { Router } from 'express';
 import { authenticate, optionalAuthenticate } from '../../middlewares/auth.middleware.js';
 import { requireRoles } from '../../middlewares/rbac.middleware.js';
-import * as adminFinanceController from '../admin-finance.controller.js';
-import * as adminReputationController from '../admin-reputation.controller.js';
 import * as adminAssistanceController from '../admin-assistance.controller.js';
 import * as adminExpenseController from '../admin-expense.controller.js';
+import * as adminFinanceController from '../admin-finance.controller.js';
 import * as adminIdentityController from '../admin-identity.controller.js';
+import * as adminReputationController from '../admin-reputation.controller.js';
 import * as paydunyaController from '../paydunya.controller.js';
 import * as mobileController from './mobile.controller.js';
 
@@ -28,11 +28,53 @@ mobileRouter.get('/client/bids/stats', authenticate, requireRoles('client'), mob
 mobileRouter.get('/client/bids/received', authenticate, requireRoles('client'), mobileController.clientBidsReceived);
 mobileRouter.post('/client/bids/:bidId/negotiate', authenticate, requireRoles('client'), mobileController.negotiateBid);
 
+// ============================================================
+// NÉGOCIATION - Routes pour les contre-offres
+// ============================================================
+
+// Client: Récupérer les détails de négociation d'une offre
+mobileRouter.get(
+  '/client/bids/:bidId/negotiation',
+  authenticate,
+  requireRoles('client'),
+  mobileController.getBidNegotiation
+);
+
+// Client: Envoyer une contre-offre
+mobileRouter.post(
+  '/client/bids/:bidId/counter',
+  authenticate,
+  requireRoles('client'),
+  mobileController.clientCounterBid
+);
+
+// Client: Accepter une offre (après négociation)
+mobileRouter.post(
+  '/client/bids/:bidId/accept',
+  authenticate,
+  requireRoles('client'),
+  mobileController.clientAcceptBid
+);
+
+// Driver: Répondre à une contre-offre
+mobileRouter.post(
+  '/driver/bids/:bidId/respond-counter',
+  authenticate,
+  requireRoles('driver'),
+  mobileController.driverRespondCounter
+);
+
+// ============================================================
+// FIN NÉGOCIATION
+// ============================================================
+
 mobileRouter.put('/driver/profile', authenticate, requireRoles('driver'), mobileController.updateProfile);
 mobileRouter.get('/driver/stats', authenticate, requireRoles('driver'), mobileController.driverStats);
 mobileRouter.get('/driver/parcels', authenticate, requireRoles('driver'), mobileController.driverParcels);
 mobileRouter.post('/driver/parcels/create', authenticate, requireRoles('driver'), mobileController.createParcel);
-mobileRouter.get('/driver/parcels/:parcelId', authenticate, requireRoles('driver'), mobileController.getParcelDetail);
+// ✅ CORRECTION : Cette route permet maintenant aux chauffeurs d'accéder aux colis en statut 'free'
+// où ils ont fait une offre, même si le colis ne leur est pas encore assigné.
+mobileRouter.get('/driver/parcels/:parcelId', authenticate, requireRoles('driver'), mobileController.getDriverParcelDetail);
 mobileRouter.put('/driver/parcels/:parcelId/confirm', authenticate, requireRoles('driver'), mobileController.driverConfirm);
 mobileRouter.put('/driver/parcels/:parcelId/pickup', authenticate, requireRoles('driver'), mobileController.driverPickup);
 mobileRouter.put('/driver/parcels/:parcelId/transit', authenticate, requireRoles('driver'), mobileController.driverTransit);
@@ -40,6 +82,7 @@ mobileRouter.put('/driver/parcels/:parcelId/arrived', authenticate, requireRoles
 mobileRouter.put('/driver/parcels/:parcelId/out-for-delivery', authenticate, requireRoles('driver'), mobileController.driverOutForDelivery);
 mobileRouter.put('/driver/parcels/:parcelId/deliver', authenticate, requireRoles('driver'), mobileController.driverDeliver);
 mobileRouter.post('/driver/parcels/:parcelId/declare-cash', authenticate, requireRoles('driver'), mobileController.declareCashCollection);
+mobileRouter.get('/driver/parcels/:parcelId/delivery-code', authenticate, requireRoles('driver'), mobileController.clientDeliveryCode);
 mobileRouter.get('/driver/cash-declarations', authenticate, requireRoles('driver'), mobileController.driverCashDeclarations);
 mobileRouter.post('/driver/bids', authenticate, requireRoles('driver'), mobileController.createBid);
 mobileRouter.get('/driver/bids/sent', authenticate, requireRoles('driver'), mobileController.driverBidsSent);
@@ -233,6 +276,17 @@ mobileRouter.get('/advertisements/:advertisementId/offers', authenticate, mobile
 mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/accept', authenticate, mobileController.acceptAdvertisementOffer);
 mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/reject', authenticate, mobileController.rejectAdvertisementOffer);
 mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/negotiate', authenticate, mobileController.negotiateAdvertisementOffer);
+
+// Route pour récupérer le colis depuis une annonce
+// GET /advertisements/:advertisementId/parcel
+// Cette route fonctionne pour tous les rôles (client, driver, admin, super_admin)
+// car mobileController.getParcelFromAdvertisement utilise getParcelById()
+// qui adapte l'endpoint selon le rôle de l'utilisateur connecté.
+mobileRouter.get(
+    '/advertisements/:advertisementId/parcel',
+    authenticate,
+    mobileController.getParcelFromAdvertisement
+);
 
 mobileRouter.get('/webhooks', authenticate, requireRoles('super_admin', 'support'), mobileController.listWebhooks);
 mobileRouter.post('/webhooks', authenticate, requireRoles('super_admin', 'support'), mobileController.createWebhook);

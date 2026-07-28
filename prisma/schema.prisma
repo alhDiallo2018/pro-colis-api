@@ -96,6 +96,7 @@ enum BidStatus {
   pending
   accepted
   rejected
+  countered  // ✅ Ajout du statut pour les contre-offres
 }
 
 enum MediaType {
@@ -281,6 +282,7 @@ model User {
   incidentsCreated        PlatformIncident[]     @relation("IncidentCreatedBy")
   commercialLeads         CommercialLead[]       @relation("LeadOwner")
   commercialObjectives    CommercialObjective[]  @relation("ObjectiveOwner")
+  negotiationMessages     NegotiationMessage[]   @relation("NegotiationSender") // ✅ Ajout
 
   @@map("users")
 }
@@ -425,11 +427,31 @@ model Bid {
   driver          User           @relation(fields: [driverId], references: [id], onDelete: Cascade)
   selectedParcels Parcel[]       @relation("SelectedBid")
   notifications   Notification[]
+  negotiationMessages NegotiationMessage[] // ✅ Ajout de la relation
 
   @@unique([parcelId, driverId])
   @@index([parcelId])
   @@index([driverId])
   @@map("bids")
+}
+
+// ✅ NOUVEAU MODÈLE : Historique des négociations
+model NegotiationMessage {
+  id            String   @id @default(uuid()) @db.Uuid
+  bidId         String   @map("bid_id") @db.Uuid
+  fromUserId    String   @map("from_user_id") @db.Uuid
+  fromUserRole  String   @map("from_user_role") // 'client' | 'driver'
+  price         Decimal  @db.Decimal(12, 2)
+  message       String?
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  
+  bid           Bid      @relation(fields: [bidId], references: [id], onDelete: Cascade)
+  fromUser      User     @relation("NegotiationSender", fields: [fromUserId], references: [id], onDelete: Cascade)
+
+  @@index([bidId])
+  @@index([fromUserId])
+  @@index([createdAt])
+  @@map("negotiation_messages")
 }
 
 model ParcelEvent {
