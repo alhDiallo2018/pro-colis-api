@@ -14,6 +14,7 @@ import {
   serializeParcel,
   serializeParcelEvent,
   serializePayment,
+  serializeDriverWalletTransaction,
   serializeScoreTransaction,
   serializeUser
 } from '../../utils/mobile-serializers.js';
@@ -215,9 +216,37 @@ function parcelAccessWhere(user, parcelId) {
   return { id: parcelId, senderId: '__none__' };
 }
 
+/**
+ * Étend uniquement la lecture client aux colis dont son téléphone est celui
+ * du destinataire. Les mutations continuent d'utiliser `parcelAccessWhere`,
+ * afin qu'un destinataire ne puisse ni annuler ni modifier l'envoi.
+ */
+function parcelReadAccessWhere(user, parcelId) {
+  if (user.role !== 'client') return parcelAccessWhere(user, parcelId);
+
+  const ownership = [{ senderId: user.id }];
+  // Ne jamais ajouter un téléphone vide : Prisma pourrait réduire un filtre
+  // `undefined` à un objet vide dans le OR et élargir involontairement l'accès.
+  if (user.phone) ownership.push({ receiverPhone: user.phone });
+
+  return {
+    id: parcelId,
+    OR: ownership
+  };
+}
+
 async function findAccessibleParcel(user, parcelId) {
   const parcel = await prisma.parcel.findFirst({
     where: { ...parcelAccessWhere(user, parcelId), deletedAt: null },
+    include: parcelInclude
+  });
+  if (!parcel) throw new NotFoundError('Colis introuvable');
+  return parcel;
+}
+
+async function findReadableParcel(user, parcelId) {
+  const parcel = await prisma.parcel.findFirst({
+    where: { ...parcelReadAccessWhere(user, parcelId), deletedAt: null },
     include: parcelInclude
   });
   if (!parcel) throw new NotFoundError('Colis introuvable');
@@ -686,7 +715,7 @@ export const superAdminParcels = handle('super.parcels', async (req, res) => {
 });
 
 export const getParcelDetail = handle('parcel.detail', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const parcel = await findReadableParcel(req.user, req.params.parcelId);
   return ok(res, { message: 'Detail colis', data: { parcel: serializeParcel(parcel) } });
 });
 
@@ -1030,7 +1059,7 @@ export const publicParcelBids = handle('public.parcelBids', async (req, res) => 
 });
 
 export const parcelTimeline = handle('parcel.timeline', async (req, res) => {
-  await findAccessibleParcel(req.user, req.params.parcelId);
+  await findReadableParcel(req.user, req.params.parcelId);
   const events = await prisma.parcelEvent.findMany({ where: { parcelId: req.params.parcelId }, orderBy: { createdAt: 'asc' } });
   return ok(res, { message: 'Timeline colis', data: { events: events.map(serializeParcelEvent) } });
 });
@@ -1171,14 +1200,23 @@ export const clientBidsReceived = handle('bid.clientReceived', async (req, res) 
   const where = { parcel: { senderId: req.user.id } };
   const [total, bids] = await Promise.all([
     prisma.bid.count({ where }),
-    prisma.bid.findMany({ where, include: { driver: true, parcel: true, negotiationMessages: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
+    prisma.bid.findMany({
+      where,
+      include: {
+        driver: true,
+        parcel: true,
+        negotiationMessages: { orderBy: { createdAt: 'asc' } }
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    })
   ]);
   const data = bids.map((b) => ({
     ...serializeBid(b),
     parcel: b.parcel
       ? { id: b.parcel.id, trackingNumber: b.parcel.trackingNumber, status: b.parcel.status, receiverName: b.parcel.receiverName }
-      : null,
-    negotiationHistory: b.negotiationMessages || []
+      : null
   }));
   return ok(res, { message: 'Offres recues', data: { bids: data }, meta: paginationMeta({ page, limit, total }) });
 });
@@ -1188,7 +1226,17 @@ export const driverBidsSent = handle('bid.driverSent', async (req, res) => {
   const where = { driverId: req.user.id };
   const [total, bids] = await Promise.all([
     prisma.bid.count({ where }),
-    prisma.bid.findMany({ where, include: { driver: true, parcel: true, negotiationMessages: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
+    prisma.bid.findMany({
+      where,
+      include: {
+        driver: true,
+        parcel: true,
+        negotiationMessages: { orderBy: { createdAt: 'asc' } }
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    })
   ]);
   return ok(res, { message: 'Offres envoyees', data: { bids: bids.map(serializeBid) }, meta: paginationMeta({ page, limit, total }) });
 });
@@ -1392,7 +1440,15 @@ export const clientCounterBid = handle('bid.counter', async (req, res) => {
  */
 export const driverRespondCounter = handle('bid.respondCounter', async (req, res) => {
   const { bidId } = req.params;
-  const { accept, price, message } = req.body;
+  const { action, price, message } = req.body;
+
+  // Les premiers builds envoyaient { action: "accept" | "counter" } alors
+  // que la nouvelle API attendait { accept: boolean }. Normaliser ici garde
+  // les deux plateformes compatibles pendant leur mise a jour.
+  if (action !== undefined && !['accept', 'counter'].includes(action)) {
+    throw new ValidationError([{ path: 'action', message: 'Action invalide (accept ou counter)' }]);
+  }
+  const accept = req.body.accept === true || action === 'accept';
 
   const result = await prisma.$transaction(async (tx) => {
     const bid = await tx.bid.findFirst({
@@ -2113,26 +2169,59 @@ export const getScoreBalance = handle('score.balance', async (req, res) => {
 });
 
 export const getDriverWallet = handle('driver.wallet', async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+
   const wallet = await prisma.wallet.upsert({
     where: { userId: req.user.id },
     update: {},
     create: { userId: req.user.id }
   });
+
+  // Charger l'historique separement garde l'upsert simple et permet une vraie
+  // pagination sans renvoyer un portefeuille volumineux au mobile.
+  const where = { walletUserId: req.user.id };
+  const [total, transactionRows] = await Promise.all([
+    prisma.walletTransaction.count({ where }),
+    prisma.walletTransaction.findMany({
+      where,
+      include: {
+        parcel: { select: { trackingNumber: true } }
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    })
+  ]);
+  const transactions = transactionRows.map(serializeDriverWalletTransaction);
+  const serializedWallet = {
+    id: wallet.userId,
+    userId: wallet.userId,
+    balance: number(wallet.balance),
+    pendingBalance: number(wallet.pendingBalance),
+    totalDeposited: number(wallet.totalDeposited),
+    totalConsumed: number(wallet.totalSpent),
+    totalSpent: number(wallet.totalSpent),
+    totalRefunded: number(wallet.totalRefunded),
+    totalWithdrawn: number(wallet.totalWithdrawn),
+    totalCommissionsPaid: number(wallet.totalCommissionsPaid),
+    isActive: wallet.status === 'active',
+    status: wallet.status,
+    lastDepositAt: wallet.lastDepositAt,
+    lastActivityAt: wallet.lastActivityAt,
+    createdAt: wallet.createdAt,
+    updatedAt: wallet.updatedAt,
+    transactions
+  };
+
   return ok(res, {
     message: 'Portefeuille',
     data: {
-      wallet: {
-        balance: number(wallet.balance),
-        pendingBalance: number(wallet.pendingBalance),
-        totalDeposited: number(wallet.totalDeposited),
-        totalSpent: number(wallet.totalSpent),
-        totalWithdrawn: number(wallet.totalWithdrawn),
-        totalCommissionsPaid: number(wallet.totalCommissionsPaid),
-        status: wallet.status,
-        lastDepositAt: wallet.lastDepositAt,
-        lastActivityAt: wallet.lastActivityAt
-      }
-    }
+      wallet: serializedWallet,
+      // Champ a plat conserve pour ApiService.getWallet, tandis que la copie
+      // imbriquee permet aux autres consommateurs d'utiliser wallet seul.
+      transactions
+    },
+    meta: paginationMeta({ page, limit, total })
   });
 });
 
@@ -2558,6 +2647,8 @@ export const messageThread = handle('messages.thread', async (req, res) => {
   const peerId = req.query.peerId;
   const parcelId = req.query.parcelId || null;
   if (!peerId) throw new ValidationError([{ path: 'peerId', message: 'peerId requis' }]);
+  res.setHeader('Cache-Control', 'private, no-store');
+
   const where = {
     OR: [
       { senderId: req.user.id, receiverId: peerId },
@@ -2569,25 +2660,71 @@ export const messageThread = handle('messages.thread', async (req, res) => {
   } else {
     where.parcelId = parcelId;
   }
-  const messages = await prisma.message.findMany({
-    where,
-    orderBy: { createdAt: 'asc' }
-  });
-  await prisma.message.updateMany({
-    where: { receiverId: req.user.id, senderId: peerId, parcelId: parcelId === null ? null : parcelId, isRead: false },
-    data: { isRead: true, readAt: new Date() }
-  });
+
+  // Marquer puis relire dans une transaction garantit que le web et le
+  // mobile recoivent immédiatement le même état de lecture.
+  const [, messages] = await prisma.$transaction([
+    prisma.message.updateMany({
+      where: {
+        receiverId: req.user.id,
+        senderId: peerId,
+        parcelId: parcelId === null ? null : parcelId,
+        isRead: false
+      },
+      data: { isRead: true, readAt: new Date() }
+    }),
+    prisma.message.findMany({
+      where,
+      orderBy: { createdAt: 'asc' }
+    })
+  ]);
+
   return ok(res, { message: 'Conversation', data: { messages: messages.map(serializeMessage) } });
 });
 
 export const conversations = handle('messages.conversations', async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+
   const messages = await prisma.message.findMany({
     where: { OR: [{ senderId: req.user.id }, { receiverId: req.user.id }] },
-    include: { sender: true, receiver: true, parcel: { include: { media: true, departureGarage: true, arrivalGarage: true } } },
+    include: {
+      sender: { select: { id: true, fullName: true, profilePhoto: true, role: true } },
+      receiver: { select: { id: true, fullName: true, profilePhoto: true, role: true } },
+      parcel: { select: { id: true, trackingNumber: true } }
+    },
     orderBy: { createdAt: 'desc' },
-    take: 100
+    take: 500
   });
-  return ok(res, { message: 'Conversations', data: { conversations: messages } });
+
+  // Un seul contrat agrege alimente desormais les listes web et mobile.
+  // La cle pair + colis evite de melanger deux negociations avec la meme
+  // personne, tandis que unreadCount ne compte jamais les messages emis.
+  const conversationMap = new Map();
+  for (const message of messages) {
+    const isIncoming = message.receiverId === req.user.id;
+    const otherUser = isIncoming ? message.sender : message.receiver;
+    const key = `${otherUser.id}::${message.parcelId || '_'}`;
+    const existing = conversationMap.get(key);
+
+    if (existing) {
+      if (isIncoming && !message.isRead) existing.unreadCount += 1;
+      continue;
+    }
+
+    conversationMap.set(key, {
+      ...serializeMessage(message),
+      // Un message emis n'est jamais "non lu" pour son auteur dans la liste.
+      isRead: isIncoming ? message.isRead : true,
+      unreadCount: isIncoming && !message.isRead ? 1 : 0,
+      trackingNumber: message.parcel?.trackingNumber || null,
+      otherUser
+    });
+  }
+
+  return ok(res, {
+    message: 'Conversations',
+    data: { conversations: Array.from(conversationMap.values()) }
+  });
 });
 
 export const readMessage = handle('messages.read', async (req, res) => {
@@ -2883,25 +3020,203 @@ export const advertisementOffers = handle('advertisements.offers', async (req, r
 });
 
 export const acceptAdvertisementOffer = handle('advertisements.offerAccept', async (req, res) => {
-  const offer = await prisma.$transaction(async (tx) => {
-    const updated = await tx.advertisementOffer.update({
-      where: { id: req.params.offerId },
-      data: { status: 'accepted', responseMessage: req.body.responseMessage, respondedAt: new Date() },
-      include: { client: true, advertisement: true }
+  const result = await prisma.$transaction(async (tx) => {
+    const advertisement = await tx.advertisement.findUnique({
+      where: { id: req.params.advertisementId },
+      select: { id: true, driverId: true, status: true }
     });
+    if (!advertisement) throw new NotFoundError('Annonce introuvable');
+
+    // Seul le chauffeur proprietaire de l'annonce (ou un super admin) peut
+    // engager le colis. Le controle est fait dans la transaction pour eviter
+    // qu'une modification concurrente contourne l'autorisation.
+    if (req.user.role !== 'super_admin' && advertisement.driverId !== req.user.id) {
+      throw new ForbiddenError('Vous ne pouvez accepter que les offres de vos propres annonces');
+    }
+
+    const currentOffer = await tx.advertisementOffer.findFirst({
+      where: {
+        id: req.params.offerId,
+        advertisementId: advertisement.id
+      },
+      include: {
+        client: true,
+        parcel: { include: parcelInclude }
+      }
+    });
+    if (!currentOffer) {
+      throw new NotFoundError('Offre introuvable pour cette annonce');
+    }
+    if (!currentOffer.parcel) {
+      throw new ValidationError(
+        [{ path: 'offer.parcelId', message: 'Un colis doit etre associe a l\'offre avant son acceptation' }],
+        'Offre sans colis'
+      );
+    }
+
+    const parcel = currentOffer.parcel;
+    if (parcel.senderId !== currentOffer.clientId) {
+      throw new ForbiddenError('Le colis associe n\'appartient pas au client ayant emis l\'offre');
+    }
+    if (currentOffer.status === 'rejected') {
+      throw new ConflictError('Cette offre a deja ete refusee');
+    }
+    if (advertisement.status !== 'open' && currentOffer.status !== 'accepted') {
+      throw new ConflictError('Cette annonce n\'accepte plus de nouvelles offres');
+    }
+    if (parcel.driverId && parcel.driverId !== advertisement.driverId) {
+      throw new ConflictError('Ce colis est deja assigne a un autre chauffeur');
+    }
+    const competingAcceptance = await tx.advertisementOffer.findFirst({
+      where: {
+        parcelId: parcel.id,
+        id: { not: currentOffer.id },
+        status: 'accepted'
+      },
+      select: { id: true }
+    });
+    if (competingAcceptance) {
+      throw new ConflictError('Une autre offre est deja acceptee pour ce colis');
+    }
+
+    // Un retry apres succes doit rester idempotent : il renvoie l'etat courant
+    // sans dupliquer evenement, notification ou audit.
+    const alreadyApplied =
+      currentOffer.status === 'accepted' &&
+      parcel.driverId === advertisement.driverId &&
+      !['pending', 'free'].includes(parcel.status);
+    if (alreadyApplied) {
+      return { offer: currentOffer, parcel, event: null };
+    }
+
+    // Une acceptation initiale ou la reparation d'une ancienne acceptation
+    // partielle ne peut partir que d'un colis encore disponible. Cela empeche
+    // une offre tardive de faire regresser un colis deja collecte ou en route.
+    if (!['pending', 'free'].includes(parcel.status)) {
+      throw new ConflictError('Le statut actuel du colis ne permet plus cette acceptation');
+    }
+
+    const respondedAt = new Date();
+    // La condition est reevaluee par PostgreSQL au moment de l'UPDATE. Deux
+    // chauffeurs concurrents ne peuvent donc pas tous deux revendiquer le meme
+    // colis apres avoir lu simultanement son ancien etat disponible.
+    const parcelClaim = await tx.parcel.updateMany({
+      where: {
+        id: parcel.id,
+        senderId: currentOffer.clientId,
+        status: { in: ['pending', 'free'] },
+        OR: [
+          { driverId: null },
+          { driverId: advertisement.driverId }
+        ]
+      },
+      data: {
+        driverId: advertisement.driverId,
+        status: 'confirmed',
+        negotiatedPrice: currentOffer.price,
+        totalAmount: currentOffer.price,
+        isFreeForBidding: false
+      }
+    });
+    if (parcelClaim.count !== 1) {
+      throw new ConflictError('Ce colis vient d\'etre assigne ou son statut a change');
+    }
+
+    const updatedParcel = await tx.parcel.findUnique({
+      where: { id: parcel.id },
+      include: parcelInclude
+    });
+
+    const event = await tx.parcelEvent.create({
+      data: {
+        parcelId: parcel.id,
+        status: 'confirmed',
+        description: 'Offre de trajet acceptee et chauffeur assigne',
+        userId: req.user.id,
+        userName: req.user.fullName,
+        userRole: req.user.role,
+        metadata: {
+          advertisementId: advertisement.id,
+          offerId: currentOffer.id,
+          negotiatedPrice: Number(currentOffer.price)
+        }
+      }
+    });
+
+    const updatedOffer = await tx.advertisementOffer.update({
+      where: { id: currentOffer.id },
+      data: {
+        status: 'accepted',
+        responseMessage: req.body.responseMessage,
+        respondedAt
+      },
+      include: {
+        client: true,
+        advertisement: true,
+        parcel: { include: parcelInclude }
+      }
+    });
+
+    // Un colis ne peut pas rester negociable sur plusieurs trajets une fois
+    // qu'un chauffeur est assigne.
+    await tx.advertisementOffer.updateMany({
+      where: {
+        parcelId: parcel.id,
+        id: { not: currentOffer.id },
+        status: { in: ['pending', 'countered'] }
+      },
+      data: {
+        status: 'rejected',
+        responseMessage: 'Une autre offre a ete acceptee pour ce colis',
+        respondedAt
+      }
+    });
+
+    await audit(tx, req, {
+      action: 'advertisement.offer.accept',
+      entityType: 'advertisement_offer',
+      entityId: updatedOffer.id,
+      beforeData: {
+        offerStatus: currentOffer.status,
+        parcelStatus: parcel.status,
+        parcelDriverId: parcel.driverId
+      },
+      afterData: {
+        offerStatus: 'accepted',
+        parcelStatus: 'confirmed',
+        parcelDriverId: advertisement.driverId,
+        negotiatedPrice: Number(currentOffer.price)
+      }
+    });
+
     await notify(tx, {
-      userId: updated.clientId,
+      userId: updatedOffer.clientId,
       senderId: req.user.id,
       senderName: req.user.fullName,
       type: 'ad_offer_accepted',
       title: 'Offre acceptee',
-      body: `Votre offre pour l'annonce a ete acceptee.`,
-      data: { advertisementId: updated.advertisementId, offerId: updated.id },
+      body: `Votre offre de ${Number(updatedOffer.price)} FCFA pour le colis ${updatedParcel.trackingNumber} a ete acceptee.`,
+      data: {
+        advertisementId: updatedOffer.advertisementId,
+        offerId: updatedOffer.id,
+        parcelId: updatedParcel.id,
+        driverId: advertisement.driverId,
+        price: Number(updatedOffer.price)
+      },
       priority: 'high'
     });
-    return updated;
+
+    return { offer: updatedOffer, parcel: updatedParcel, event };
   });
-  return ok(res, { message: 'Offre traitee', data: { offer: serializeAdvertisementOffer(offer) } });
+
+  return ok(res, {
+    message: 'Offre acceptee et colis assigne au chauffeur',
+    data: {
+      offer: serializeAdvertisementOffer(result.offer),
+      parcel: serializeParcel(result.parcel),
+      event: serializeParcelEvent(result.event)
+    }
+  });
 });
 
 export const rejectAdvertisementOffer = handle('advertisements.offerReject', async (req, res) => {
@@ -4197,13 +4512,4 @@ export const getParcelFromAdvertisement = handle('advertisements.getParcel', asy
     message: 'Colis récupéré',
     data: { parcel: serializeParcel(parcel) }
   });
-});
-
-export const negotiateBid = handle('bid.negotiate', async (req, res) => {
-  const bid = await prisma.bid.update({
-    where: { id: req.params.bidId },
-    data: { responseMessage: req.body.message, price: decimal(req.body.price, '0') },
-    include: { driver: true }
-  });
-  return ok(res, { message: 'Contre-proposition envoyee', data: { bid: serializeBid(bid) } });
 });

@@ -26,7 +26,10 @@ mobileRouter.post('/client/parcels/:parcelId/bids/:bidId/accept', authenticate, 
 mobileRouter.post('/client/parcels/:parcelId/bids/:bidId/reject', authenticate, requireRoles('client'), mobileController.rejectBid);
 mobileRouter.get('/client/bids/stats', authenticate, requireRoles('client'), mobileController.clientBidStats);
 mobileRouter.get('/client/bids/received', authenticate, requireRoles('client'), mobileController.clientBidsReceived);
-mobileRouter.post('/client/bids/:bidId/negotiate', authenticate, requireRoles('client'), mobileController.negotiateBid);
+// Compatibilite avec les versions deja publiees des deux clients : l'ancienne
+// URL /negotiate execute desormais exactement le meme traitement transactionnel
+// que la route canonique /counter.
+mobileRouter.post('/client/bids/:bidId/negotiate', authenticate, requireRoles('client'), mobileController.clientCounterBid);
 
 // ============================================================
 // NÉGOCIATION - Routes pour les contre-offres
@@ -37,6 +40,14 @@ mobileRouter.get(
   '/client/bids/:bidId/negotiation',
   authenticate,
   requireRoles('client'),
+  mobileController.getBidNegotiation
+);
+
+// Route partagee par le web et le mobile. Le controleur verifie que
+// l'utilisateur est bien le client ou le chauffeur rattache a l'offre.
+mobileRouter.get(
+  '/bids/:bidId/negotiation',
+  authenticate,
   mobileController.getBidNegotiation
 );
 
@@ -59,6 +70,14 @@ mobileRouter.post(
 // Driver: Répondre à une contre-offre
 mobileRouter.post(
   '/driver/bids/:bidId/respond-counter',
+  authenticate,
+  requireRoles('driver'),
+  mobileController.driverRespondCounter
+);
+
+// Alias temporaire pour les builds web/mobile qui utilisaient encore /respond.
+mobileRouter.post(
+  '/driver/bids/:bidId/respond',
   authenticate,
   requireRoles('driver'),
   mobileController.driverRespondCounter
@@ -273,7 +292,12 @@ mobileRouter.delete('/advertisements/:advertisementId', authenticate, mobileCont
 mobileRouter.post('/advertisements/:advertisementId/close', authenticate, mobileController.closeAdvertisement);
 mobileRouter.post('/advertisements/:advertisementId/offers', authenticate, requireRoles('client'), mobileController.createAdvertisementOffer);
 mobileRouter.get('/advertisements/:advertisementId/offers', authenticate, mobileController.advertisementOffers);
-mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/accept', authenticate, mobileController.acceptAdvertisementOffer);
+mobileRouter.post(
+  '/advertisements/:advertisementId/offers/:offerId/accept',
+  authenticate,
+  requireRoles('driver', 'super_admin'),
+  mobileController.acceptAdvertisementOffer
+);
 mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/reject', authenticate, mobileController.rejectAdvertisementOffer);
 mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/negotiate', authenticate, mobileController.negotiateAdvertisementOffer);
 

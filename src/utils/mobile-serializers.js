@@ -78,6 +78,21 @@ export function serializeUser(user) {
 
 export function serializeBid(bid) {
   if (!bid) return null;
+
+  // L'historique est optionnel car toutes les requetes Prisma ne chargent pas
+  // cette relation. Lorsqu'il est present, on fournit le meme contrat ordonne
+  // aux clients web et mobile.
+  const negotiationHistory = Array.isArray(bid.negotiationMessages)
+    ? bid.negotiationMessages.map((entry) => ({
+        id: entry.id,
+        fromUserId: entry.fromUserId,
+        fromUserRole: entry.fromUserRole,
+        price: decimalToString(entry.price),
+        message: entry.message,
+        createdAt: dateToIso(entry.createdAt)
+      }))
+    : undefined;
+
   return {
     id: bid.id,
     parcelId: bid.parcelId,
@@ -91,7 +106,8 @@ export function serializeBid(bid) {
     audioUrl: bid.audioUrl,
     respondedAt: dateToIso(bid.respondedAt),
     createdAt: dateToIso(bid.createdAt),
-    updatedAt: dateToIso(bid.updatedAt)
+    updatedAt: dateToIso(bid.updatedAt),
+    ...(negotiationHistory ? { negotiationHistory } : {})
   };
 }
 
@@ -112,6 +128,48 @@ export function serializeParcelEvent(event) {
     metadata: event.metadata,
     timestamp: dateToIso(event.createdAt),
     createdAt: dateToIso(event.createdAt)
+  };
+}
+
+/**
+ * Normalise un mouvement pour le contrat Flutter. Les montants sont stockes
+ * positifs en base, y compris pour certains debits ; le signe est donc derive
+ * du solde avant/apres, avec le type comme repli pour les retraits deja geles.
+ */
+export function serializeDriverWalletTransaction(transaction) {
+  if (!transaction) return null;
+
+  const rawAmount = Math.abs(Number(transaction.amount));
+  const balanceBefore = Number(transaction.balanceBefore);
+  const balanceAfter = Number(transaction.balanceAfter);
+  const balanceDelta = balanceAfter - balanceBefore;
+  const debitTypes = new Set(['commission', 'penalty', 'withdrawal']);
+  const signedAmount = balanceDelta < 0 || (balanceDelta === 0 && debitTypes.has(transaction.type))
+    ? -rawAmount
+    : rawAmount;
+
+  return {
+    id: transaction.id,
+    userId: transaction.walletUserId,
+    walletId: transaction.walletUserId,
+    amount: signedAmount,
+    rawAmount,
+    type: transaction.type,
+    parcelId: transaction.parcelId,
+    trackingNumber: transaction.parcel?.trackingNumber || null,
+    description: transaction.description || '',
+    origin: transaction.origin,
+    status: transaction.status,
+    balanceBefore,
+    balanceAfter,
+    performedBy: transaction.performedBy,
+    metadata: {
+      origin: transaction.origin,
+      status: transaction.status,
+      balanceBefore,
+      balanceAfter
+    },
+    createdAt: dateToIso(transaction.createdAt)
   };
 }
 
