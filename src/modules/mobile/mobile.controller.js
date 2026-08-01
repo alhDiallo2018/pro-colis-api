@@ -10,15 +10,16 @@ import {
   serializeAdvertisementOffer,
   serializeAuditLog,
   serializeBid,
+  serializeDriverWalletTransaction,
   serializeGarage,
   serializeParcel,
   serializeParcelEvent,
   serializePayment,
-  serializeDriverWalletTransaction,
   serializeScoreTransaction,
   serializeUser
 } from '../../utils/mobile-serializers.js';
 import { getPagination, paginationMeta } from '../../utils/pagination.js';
+import { phoneSearchVariants } from '../../utils/phone-normalizer.js';
 import { generateTrackingNumber } from '../../utils/tracking-number.js';
 import { attemptDisbursement, toClientWithdrawalStatus } from '../../utils/withdrawal-flow.js';
 
@@ -661,23 +662,70 @@ export const createParcel = handle('parcel.create', async (req, res) => {
   return ok(res, { status: 201, message: 'Colis cree', data: { parcel: serializeParcel(result) } });
 });
 
+// ============================================================
+// ✅ CLIENT PARCELS - CORRIGÉ avec normalisation téléphone/email
+// ============================================================
 export const clientParcels = handle('client.parcels', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const ownership = req.query.filter === 'received'
-    ? { receiverPhone: req.user.phone }
-    : req.query.filter === 'sent'
-      ? { senderId: req.user.id }
-      : { OR: [{ senderId: req.user.id }, { receiverPhone: req.user.phone }] };
+
+  let ownership;
+
+  if (req.query.filter === 'received') {
+    // ✅ CORRECTION : Pour les colis reçus, on cherche par téléphone/email
+    // Sans exclure ceux que l'utilisateur a envoyés (car il peut être à la fois
+    // expéditeur et destinataire)
+    const phoneVariants = req.user.phone ? phoneSearchVariants(req.user.phone) : [];
+    const emailVariants = req.user.email 
+      ? [req.user.email.toLowerCase(), req.user.email.toUpperCase()]
+      : [];
+
+    ownership = {
+      OR: [
+        ...(phoneVariants.length > 0 ? [{ receiverPhone: { in: phoneVariants } }] : []),
+        ...(emailVariants.length > 0 ? [{ receiverEmail: { in: emailVariants } }] : [])
+      ]
+    };
+    // ✅ On ne filtre PAS sur senderId - un colis peut avoir le même expéditeur ET destinataire
+  } else if (req.query.filter === 'sent') {
+    ownership = { senderId: req.user.id };
+  } else {
+    // Tous les colis : envoyés OU reçus
+    const phoneVariants = req.user.phone ? phoneSearchVariants(req.user.phone) : [];
+    const emailVariants = req.user.email 
+      ? [req.user.email.toLowerCase(), req.user.email.toUpperCase()]
+      : [];
+
+    ownership = {
+      OR: [
+        { senderId: req.user.id },
+        ...(phoneVariants.length > 0 ? [{ receiverPhone: { in: phoneVariants } }] : []),
+        ...(emailVariants.length > 0 ? [{ receiverEmail: { in: emailVariants } }] : [])
+      ]
+    };
+  }
+
   const where = cleanUndefined({
     ...ownership,
     status: req.query.status,
     deletedAt: null
   });
+
   const [total, parcels] = await Promise.all([
     prisma.parcel.count({ where }),
-    prisma.parcel.findMany({ where, include: parcelInclude, orderBy: { createdAt: 'desc' }, skip, take: limit })
+    prisma.parcel.findMany({ 
+      where, 
+      include: parcelInclude, 
+      orderBy: { createdAt: 'desc' }, 
+      skip, 
+      take: limit 
+    })
   ]);
-  return ok(res, { message: 'Colis client', data: { parcels: parcels.map(serializeParcel) }, meta: paginationMeta({ page, limit, total }) });
+
+  return ok(res, { 
+    message: 'Colis client', 
+    data: { parcels: parcels.map(serializeParcel) }, 
+    meta: paginationMeta({ page, limit, total }) 
+  });
 });
 
 export const driverParcels = handle('driver.parcels', async (req, res) => {
