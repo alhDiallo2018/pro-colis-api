@@ -8,3 +8,4 @@ uploads/*
 !uploads/.gitkeep
 npm-debug.log*
 .DS_Store
+*.json
