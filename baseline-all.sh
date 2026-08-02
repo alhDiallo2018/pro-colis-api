@@ -1,0 +1,6 @@
+#!/bin/bash
+for migration in 20260628124003_init 20260628180000_vehicle_garage_optional 20260628210000_message_audio 20260710000000_add_wallet_and_commission 20260710224714_add_withdrawal_type 20260718000000_add_withdrawal_and_wallet_score 20260720090000_withdrawal_disburse_fields 20260720100000_zones 20260723120000_message_photo_video 20260723140000_assistances_expenses 20260723160000_message_handled_by 20260724090000_zone_moderation 20260724110000_user_is_verified 20260724130000_user_notification_prefs 20260726090000_zone_user_add 20260726150000_support_roles 20260726190000_cash_payment_domain 20260729090000_add_countered_bid_status; do
+  echo "Baslining: $migration"
+  docker compose exec -T api npx prisma migrate resolve --applied "$migration"
+done
+echo "✅ Toutes les migrations sont baselinées !"
