@@ -73,7 +73,7 @@ const envSchema = z.object({
   FIREBASE_SERVICE_ACCOUNT_PATH: z.string().optional(),
   FIREBASE_SERVICE_ACCOUNT_JSON: z.string().optional(),
   BREVO_API_KEY: z.string().optional(),
-  BREVO_SENDER_EMAIL: z.string().email().optional(),
+  BREVO_SENDER_EMAIL: z.string().optional(),
   BREVO_SENDER_NAME: z.string().optional(),
   BREVO_SMS_SENDER: z.string().optional()
 }).superRefine((value, context) => {
