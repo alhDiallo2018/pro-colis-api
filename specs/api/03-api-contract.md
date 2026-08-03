@@ -239,6 +239,10 @@ Payload creation colis :
 | DELETE | `/super-admin/garages/:garageId` | super_admin | Supprimer garage. |
 | GET | `/super-admin/system/health` | super_admin | Sante systeme. |
 | GET | `/super-admin/audit-logs` | super_admin | Audit logs. |
+| GET | `/super-admin/observability/summary` | super_admin | Resume des erreurs et disponibilite. |
+| GET | `/super-admin/observability/logs` | super_admin | Recherche paginee des journaux techniques. |
+| GET | `/super-admin/observability/services` | super_admin | Etat des services de production. |
+| GET | `/super-admin/observability/export` | super_admin | Export CSV ou JSONL audite, limite a 24 heures. |
 | GET | `/super-admin/config` | super_admin | Configuration. |
 | PUT | `/super-admin/config` | super_admin | Modifier configuration. |
 | POST | `/super-admin/backup` | super_admin | Demarrer backup. |
@@ -272,4 +276,3 @@ Payload creation colis :
 | POST | `/webhooks` | super_admin | Enregistrer webhook. |
 | GET | `/webhooks` | super_admin | Lister webhooks. |
 | DELETE | `/webhooks/:webhookId` | super_admin | Supprimer webhook. |
-

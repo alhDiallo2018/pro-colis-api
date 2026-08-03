@@ -212,10 +212,18 @@ export function serializeParcel(parcel) {
     status: parcel.status,
     departureGarageId: parcel.departureGarageId,
     departureGarageName: parcel.departureGarage?.name,
-    departureCity: parcel.departureGarage?.city,
     arrivalGarageId: parcel.arrivalGarageId,
     arrivalGarageName: parcel.arrivalGarage?.name,
-    arrivalCity: parcel.arrivalGarage?.city,
+    // Référentiel zones, désormais celui du mobile. Les champs garage restent
+    // exposés pour les écrans qui n'ont pas migré.
+    departureZoneId: parcel.departureZoneId,
+    departureZoneName: parcel.departureZone?.name,
+    arrivalZoneId: parcel.arrivalZoneId,
+    arrivalZoneName: parcel.arrivalZone?.name,
+    // La ville vient de la zone quand elle existe, du garage sinon : les colis
+    // antérieurs à la migration n'ont pas tous de zone rattachée.
+    departureCity: parcel.departureZone?.city ?? parcel.departureGarage?.city,
+    arrivalCity: parcel.arrivalZone?.city ?? parcel.arrivalGarage?.city,
     driverId: parcel.driverId,
     driverName: parcel.driver?.fullName,
     driverPhone: parcel.driver?.phone,
@@ -325,6 +333,8 @@ export function serializeAdvertisement(advertisement) {
     driver: serializeUser(advertisement.driver),
     departureGarageId: advertisement.departureGarageId,
     arrivalGarageId: advertisement.arrivalGarageId,
+    departureZoneId: advertisement.departureZoneId,
+    arrivalZoneId: advertisement.arrivalZoneId,
     departureCity: advertisement.departureCity,
     arrivalCity: advertisement.arrivalCity,
     departureAt: dateToIso(advertisement.departureAt),

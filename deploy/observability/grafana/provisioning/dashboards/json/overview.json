@@ -1,0 +1,36 @@
+{
+  "annotations": { "list": [] },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "procolis-prometheus" },
+      "fieldConfig": { "defaults": { "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto", "wideLayout": true },
+      "targets": [{ "editorMode": "code", "expr": "procolis_service_up", "legendFormat": "{{service}}", "range": true, "refId": "A" }],
+      "title": "Disponibilite des services",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "procolis-loki" },
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 6 },
+      "id": 2,
+      "options": { "dedupStrategy": "none", "enableInfiniteScrolling": false, "enableLogDetails": true, "prettifyLogMessage": true, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true },
+      "targets": [{ "direction": "backward", "editorMode": "code", "expr": "{environment=\"production\",severity=~\"error|critical|alert|emergency\"}", "queryType": "range", "refId": "A" }],
+      "title": "Erreurs recentes",
+      "type": "logs"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": ["procolis", "production"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "PRO COLIS — Observabilite",
+  "uid": "procolis-observability",
+  "version": 1
+}

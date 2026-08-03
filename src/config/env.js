@@ -14,6 +14,11 @@ const envSchema = z.object({
   UPLOAD_LOCAL_DIR: z.string().default('uploads'),
   PUBLIC_BASE_URL: z.string().url().default('http://localhost:8080'),
   LOG_LEVEL: z.string().default('info'),
+  APP_RELEASE: z.string().min(1).default('development'),
+  LOKI_BASE_URL: z.string().url().default('http://loki:3100'),
+  PROMETHEUS_BASE_URL: z.string().url().default('http://prometheus:9090'),
+  OBSERVABILITY_TIMEOUT_MS: z.coerce.number().int().min(500).max(30000).default(5000),
+  METRICS_TOKEN: z.string().optional(),
   CORS_ORIGIN: z.string().default('*'),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(900000),
   RATE_LIMIT_MAX: z.coerce.number().int().positive().default(300),
@@ -35,6 +40,16 @@ const envSchema = z.object({
   BREVO_SENDER_EMAIL: z.string().email().optional(),
   BREVO_SENDER_NAME: z.string().optional(),
   BREVO_SMS_SENDER: z.string().optional()
+}).superRefine((value, context) => {
+  // La route de metriques reste hors de Caddy, mais un token fort limite aussi
+  // les acces accidentels depuis un autre conteneur du reseau de production.
+  if (value.NODE_ENV === 'production' && (!value.METRICS_TOKEN || value.METRICS_TOKEN.length < 32)) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['METRICS_TOKEN'],
+      message: 'METRICS_TOKEN doit contenir au moins 32 caracteres en production'
+    });
+  }
 });
 
 const parsed = envSchema.safeParse(process.env);

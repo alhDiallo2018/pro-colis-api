@@ -15,6 +15,12 @@ services:
         condition: service_healthy
     volumes:
       - ./uploads:/app/uploads
+    networks: [default, observability]
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "3"
 
   postgres:
     image: postgres:16-alpine
@@ -31,6 +37,24 @@ services:
       - "${POSTGRES_PORT:-15432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    networks: [default, observability]
+    # Journaliser les erreurs sans recopier les requetes ni leurs parametres,
+    # qui peuvent contenir des donnees personnelles ou des secrets.
+    command:
+      - postgres
+      - -c
+      - log_min_messages=warning
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=panic
+      - -c
+      - log_parameter_max_length_on_error=0
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "3"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U procolis -d procolis"]
       interval: 10s
@@ -39,3 +63,9 @@ services:
 
 volumes:
   postgres-data:
+
+networks:
+  # Ce reseau nomme permet a une stack Compose separee de joindre l'API et
+  # PostgreSQL sans publier Loki, Prometheus ou les exporters sur l'hote.
+  observability:
+    name: ${PROCOLIS_DOCKER_NETWORK:-procolis-observability-shared}

@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: PRO COLIS
+    orgId: 1
+    folder: PRO COLIS
+    type: file
+    disableDeletion: true
+    editable: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards/json

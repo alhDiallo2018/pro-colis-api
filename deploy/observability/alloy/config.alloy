@@ -1,0 +1,191 @@
+logging {
+  level  = "info"
+  format = "json"
+}
+
+discovery.docker "local" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+}
+
+discovery.relabel "procolis_containers" {
+  targets = discovery.docker.local.targets
+
+  // Garder uniquement PRO COLIS evite d'aspirer les journaux d'autres projets
+  // presents sur le meme VPS.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(sendprocolis|procolis-node)-(api|postgres|caddy|alloy|loki|prometheus|grafana|alertmanager|node-exporter|postgres-exporter|blackbox-exporter)"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(sendprocolis|procolis-node)-(.*)"
+    target_label  = "service"
+    replacement   = "$2"
+  }
+
+  rule {
+    target_label = "environment"
+    replacement  = "production"
+  }
+
+  rule {
+    target_label = "release"
+    replacement  = sys.env("APP_RELEASE")
+  }
+}
+
+loki.source.docker "procolis" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.local.targets
+  labels        = { collector = "alloy" }
+  forward_to    = [loki.process.procolis.receiver]
+  relabel_rules = discovery.relabel.procolis_containers.rules
+}
+
+loki.process "procolis" {
+  forward_to = [loki.write.local.receiver]
+
+  // Pino et Caddy emettent du JSON. PostgreSQL reste en texte et est analyse
+  // par l'expression reguliere suivante sans conserver de requete SQL.
+  stage.json {
+    expressions = {
+      json_severity = "severity",
+      json_level    = "level",
+    }
+    drop_malformed = false
+  }
+
+  stage.regex {
+    expression = "(?P<pg_severity>DEBUG|INFO|NOTICE|WARNING|ERROR|FATAL|PANIC):"
+  }
+
+  // Transformer les vocabulaires Pino, Caddy et PostgreSQL en huit niveaux
+  // stables avant de creer le label Loki `severity`.
+  stage.template {
+    source = "severity"
+    template = `{{- if .json_severity -}}
+      {{- $s := ToLower (printf "%v" .json_severity) -}}
+      {{- if eq $s "warn" -}}warning{{- else if eq $s "fatal" -}}critical{{- else -}}{{ $s }}{{- end -}}
+    {{- else if .json_level -}}
+      {{- $l := ToLower (printf "%v" .json_level) -}}
+      {{- if or (eq $l "10") (eq $l "20") (eq $l "debug") (eq $l "trace") -}}debug
+      {{- else if or (eq $l "40") (eq $l "warn") -}}warning
+      {{- else if or (eq $l "50") (eq $l "error") -}}error
+      {{- else if or (eq $l "60") (eq $l "fatal") -}}critical
+      {{- else -}}info{{- end -}}
+    {{- else if .pg_severity -}}
+      {{- $p := ToLower (printf "%v" .pg_severity) -}}
+      {{- if eq $p "warn" -}}warning
+      {{- else if eq $p "fatal" -}}critical
+      {{- else if eq $p "panic" -}}emergency
+      {{- else -}}{{ $p }}{{- end -}}
+    {{- else -}}info{{- end -}}`
+  }
+
+  stage.labels {
+    values = { severity = "severity" }
+  }
+
+  // Derniere protection contre les jetons accidentellement inclus dans une
+  // chaine de message. La redaction principale reste effectuee dans Pino/Faro.
+  stage.replace {
+    expression = "(?i)(Bearer\\s+)[A-Za-z0-9._~+/-]+"
+    replace    = "$1[REDACTED]"
+  }
+
+  // Filet de securite pour les PII qui auraient ete incluses dans une chaine
+  // libre par un composant autre que l'API Node.
+  stage.replace {
+    expression = "(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}"
+    replace    = "[REDACTED_EMAIL]"
+  }
+
+  stage.replace {
+    expression = "\\+[0-9][0-9 .()-]{7,20}[0-9]"
+    replace    = "[REDACTED_PHONE]"
+  }
+
+  stage.drop {
+    longer_than         = "64KB"
+    drop_counter_reason = "oversized_log_line"
+  }
+}
+
+faro.receiver "frontend" {
+  // JSON conserve les champs d'exception afin que l'API puisse afficher la
+  // stack et le contexte normalises au lieu d'une simple ligne logfmt.
+  log_format = "json"
+
+  server {
+    listen_address          = "0.0.0.0"
+    listen_port             = 12347
+    cors_allowed_origins    = [sys.env("FARO_ALLOWED_ORIGIN")]
+    max_allowed_payload_size = "256KiB"
+
+    rate_limiting {
+      enabled    = true
+      strategy   = "per_app"
+      rate       = 20
+      burst_size = 40
+    }
+  }
+
+  // Les source maps sont deposees hors du build public, par release. Alloy ne
+  // tente jamais de les telecharger depuis le site de production.
+  sourcemaps {
+    download = false
+
+    location {
+      path                 = "/var/lib/alloy/sourcemaps/{{ .Release }}"
+      minified_path_prefix = sys.env("FARO_SOURCEMAP_PREFIX")
+    }
+  }
+
+  output {
+    logs = [loki.process.frontend.receiver]
+  }
+}
+
+loki.process "frontend" {
+  forward_to = [loki.write.local.receiver]
+
+  // Le frontend doit envoyer uniquement les exceptions et rejets non geres.
+  // Les source maps seront ajoutees par l'agent responsable du projet React.
+  stage.static_labels {
+    values = {
+      service     = "frontend",
+      environment = "production",
+      severity    = "error",
+      release     = sys.env("APP_RELEASE"),
+    }
+  }
+
+  stage.replace {
+    expression = "(?i)(Bearer\\s+)[A-Za-z0-9._~+/-]+"
+    replace    = "$1[REDACTED]"
+  }
+
+  stage.replace {
+    expression = "(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}"
+    replace    = "[REDACTED_EMAIL]"
+  }
+
+  stage.replace {
+    expression = "\\+[0-9][0-9 .()-]{7,20}[0-9]"
+    replace    = "[REDACTED_PHONE]"
+  }
+
+  stage.drop {
+    longer_than         = "64KB"
+    drop_counter_reason = "oversized_frontend_log"
+  }
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

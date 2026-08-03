@@ -93,6 +93,8 @@ async function syncDriverVehicle(client, user, body) {
 const parcelInclude = {
   departureGarage: true,
   arrivalGarage: true,
+  departureZone: true,
+  arrivalZone: true,
   driver: { include: { garage: true } },
   bids: { 
     include: { 
@@ -171,7 +173,10 @@ function handle(action, fn) {
       return await fn(req, res);
     } catch (error) {
       const normalized = normalizeError(error);
-      req.log.error(
+      const log = !normalized || (normalized.statusCode || 500) >= 500
+        ? req.log.error.bind(req.log)
+        : req.log.warn.bind(req.log);
+      log(
         {
           error,
           action,
@@ -606,8 +611,12 @@ function buildParcelData(user, body) {
     height: decimal(body.height),
     type: body.type || 'package',
     status: body.status || (isDriver ? 'confirmed' : isFree ? 'free' : 'pending'),
-    departureGarageId: body.departureGarageId || user.garageId,
-    arrivalGarageId: body.arrivalGarageId,
+    // Le mobile envoie des zones ; les garages restent alimentés quand le
+    // client les fournit encore (écrans garage-admin non migrés).
+    departureGarageId: body.departureGarageId || user.garageId || null,
+    arrivalGarageId: body.arrivalGarageId || null,
+    departureZoneId: body.departureZoneId || null,
+    arrivalZoneId: body.arrivalZoneId || null,
     driverId: body.driverId || (isDriver ? user.id : null),
     price: decimal(body.price),
     proposedPrice: decimal(body.proposedPrice),
@@ -630,6 +639,15 @@ function buildParcelData(user, body) {
 export const createParcel = handle('parcel.create', async (req, res) => {
   if (!req.body.receiverName || !req.body.receiverPhone || !req.body.description || !req.body.weight) {
     throw new ValidationError([{ path: 'body', message: 'Champs colis obligatoires manquants' }]);
+  }
+
+  // Les deux référentiels cohabitent : on exige un lieu de départ, sans imposer
+  // lequel. Sans ce garde-fou, un colis serait créé sans origine du tout depuis
+  // que `departure_garage_id` est nullable.
+  if (!req.body.departureZoneId && !req.body.departureGarageId && !req.user.garageId) {
+    throw new ValidationError([
+      { path: 'departureZoneId', message: 'Zone de départ requise' }
+    ]);
   }
 
   const result = await prisma.$transaction(async (tx) => {
@@ -2987,8 +3005,10 @@ export const createAdvertisement = handle('advertisements.create', async (req, r
   const advertisement = await prisma.advertisement.create({
     data: {
       driverId: req.user.id,
-      departureGarageId: req.body.departureGarageId,
-      arrivalGarageId: req.body.arrivalGarageId,
+      departureGarageId: req.body.departureGarageId || null,
+      arrivalGarageId: req.body.arrivalGarageId || null,
+      departureZoneId: req.body.departureZoneId || null,
+      arrivalZoneId: req.body.arrivalZoneId || null,
       departureCity: req.body.departureCity,
       arrivalCity: req.body.arrivalCity,
       departureAt: req.body.departureAt ? new Date(req.body.departureAt) : null,

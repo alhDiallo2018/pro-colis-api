@@ -8,6 +8,7 @@ import { requestIdMiddleware } from './middlewares/request-id.middleware.js';
 import { httpLogger } from './middlewares/http-logger.middleware.js';
 import { globalRateLimit } from './middlewares/rate-limit.middleware.js';
 import { errorMiddleware, notFoundMiddleware } from './middlewares/error.middleware.js';
+import { metricsHandler, metricsMiddleware } from './observability/metrics.js';
 import { healthRouter } from './modules/health/health.routes.js';
 import { authRouter } from './modules/auth/auth.routes.js';
 import { garageRouter } from './modules/garages/garage.routes.js';
@@ -16,6 +17,7 @@ import { uploadRouter } from './modules/uploads/upload.routes.js';
 import { mobileRouter } from './modules/mobile/mobile.routes.js';
 import { supportRouter } from './modules/support/support.routes.js';
 import { zoneRouter } from './modules/zones/zone.routes.js';
+import { observabilityRouter } from './modules/observability/observability.routes.js';
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -24,6 +26,7 @@ const __dirname = path.dirname(__filename);
 app.set('trust proxy', 1);
 app.use(requestIdMiddleware);
 app.use(httpLogger);
+app.use(metricsMiddleware);
 app.use(helmet());
 app.use(
   cors({
@@ -32,6 +35,9 @@ app.use(
   })
 );
 app.use(globalRateLimit);
+// Cette route n'est pas proxifiee par Caddy en production et exige en plus un
+// bearer token distinct des jetons utilisateurs.
+app.get('/internal/metrics', metricsHandler);
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 // Uploaded media are public assets embedded by the web app (a different origin),
@@ -52,6 +58,7 @@ apiV1.use('/public/garages', garageRouter);
 apiV1.use('/notifications', notificationRouter);
 apiV1.use('/admin/notifications', adminNotificationRouter);
 apiV1.use('/upload', uploadRouter);
+apiV1.use('/super-admin/observability', observabilityRouter);
 apiV1.use('/', zoneRouter);
 apiV1.use('/', supportRouter);
 apiV1.use('/', mobileRouter);

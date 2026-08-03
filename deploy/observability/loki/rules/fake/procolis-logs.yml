@@ -1,0 +1,23 @@
+groups:
+  - name: procolis-log-alerts
+    interval: 1m
+    rules:
+      - alert: ProColisCriticalLog
+        expr: sum(count_over_time({environment="production",severity=~"critical|alert|emergency"}[1m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          category: logs
+        annotations:
+          summary: "Journal critique detecte sur PRO COLIS"
+          description: "Au moins une entree critical, alert ou emergency a ete recue pendant la derniere minute."
+
+      - alert: ProColisBackendErrorBurst
+        expr: sum(count_over_time({environment="production",service=~"api|postgres",severity=~"error|critical|alert|emergency"}[5m])) >= 5
+        for: 0m
+        labels:
+          severity: critical
+          category: logs
+        annotations:
+          summary: "Hausse des erreurs backend PRO COLIS"
+          description: "Au moins cinq erreurs API ou PostgreSQL ont ete recues en cinq minutes."

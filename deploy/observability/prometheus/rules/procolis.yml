@@ -1,0 +1,93 @@
+groups:
+  - name: procolis-service-recording
+    interval: 30s
+    rules:
+      - record: procolis_service_up
+        expr: probe_success{job="api-health"}
+        labels:
+          service: api
+
+      - record: procolis_service_up
+        expr: pg_up{job="postgres"}
+        labels:
+          service: postgres
+
+      - record: procolis_service_up
+        expr: up{job="caddy"}
+        labels:
+          service: caddy
+
+      - record: procolis_service_up
+        expr: probe_success{job="loki-health"}
+        labels:
+          service: loki
+
+      - record: procolis_service_up
+        expr: up{job="alloy"}
+        labels:
+          service: alloy
+
+      - record: procolis_service_up
+        expr: up{job="prometheus"}
+        labels:
+          service: prometheus
+
+      - record: procolis:http_requests:rate5m
+        expr: sum(rate(procolis_http_requests_total[5m]))
+
+      - record: procolis:http_5xx:rate5m
+        expr: sum(rate(procolis_http_requests_total{status_code=~"5.."}[5m]))
+
+  - name: procolis-metric-alerts
+    interval: 30s
+    rules:
+      - alert: ProColisApiUnavailable
+        expr: procolis_service_up{service="api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "API PRO COLIS indisponible"
+          description: "La sonde HTTP de l'API echoue depuis au moins deux minutes."
+
+      - alert: ProColisPostgresUnavailable
+        expr: procolis_service_up{service="postgres"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "PostgreSQL PRO COLIS indisponible"
+          description: "postgres_exporter ne peut plus joindre la base depuis au moins deux minutes."
+
+      - alert: ProColisHighHttp5xxRate
+        expr: |
+          (
+            procolis:http_requests:rate5m * 300 >= 10
+          )
+          and
+          (
+            procolis:http_5xx:rate5m / procolis:http_requests:rate5m > 0.05
+          )
+        for: 2m
+        labels:
+          severity: critical
+          category: http
+        annotations:
+          summary: "Taux HTTP 5xx eleve sur PRO COLIS"
+          description: "Plus de 5 % des requetes sont en erreur 5xx avec au moins dix requetes sur cinq minutes."
+
+      - alert: ProColisDiskAlmostFull
+        expr: |
+          (
+            1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+                / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"}
+          ) > 0.85
+        for: 10m
+        labels:
+          severity: critical
+          category: capacity
+        annotations:
+          summary: "Disque du VPS PRO COLIS presque plein"
+          description: "Le point de montage {{ $labels.mountpoint }} depasse 85 % d'utilisation depuis dix minutes."

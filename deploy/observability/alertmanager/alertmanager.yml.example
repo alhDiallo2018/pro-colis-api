@@ -1,0 +1,36 @@
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: "smtp-relay.brevo.com:587"
+  smtp_from: "alerts@sendprocolis.example.com"
+  smtp_auth_username: "brevo-smtp-login@example.com"
+  smtp_auth_password_file: /run/secrets/brevo_smtp_key
+  smtp_require_tls: true
+
+route:
+  # Les alertes non critiques restent visibles dans Alertmanager mais ne
+  # declenchent pas d'email. Seule la sous-route critique notifie Brevo.
+  receiver: discard
+  group_by: [alertname, service, category]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - receiver: procolis-email
+      matchers:
+        - 'severity = "critical"'
+
+receivers:
+  - name: discard
+  - name: procolis-email
+    email_configs:
+      - to: "operations@sendprocolis.example.com"
+        send_resolved: true
+        headers:
+          subject: "[PRO COLIS] {{ .Status | toUpper }} — {{ .CommonLabels.alertname }}"
+
+inhibit_rules:
+  - source_matchers:
+      - 'severity = "critical"'
+    target_matchers:
+      - 'severity = "warning"'
+    equal: [alertname, service]

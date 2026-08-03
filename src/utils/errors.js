@@ -39,6 +39,25 @@ export class ValidationError extends AppError {
   }
 }
 
+export class InvalidObservabilityQueryError extends AppError {
+  constructor(message = 'Filtres d observabilite invalides', details = []) {
+    super(message, {
+      statusCode: 400,
+      code: 'INVALID_OBSERVABILITY_QUERY',
+      details
+    });
+  }
+}
+
+export class ObservabilityUnavailableError extends AppError {
+  constructor(message = 'Service d observabilite indisponible') {
+    super(message, {
+      statusCode: 503,
+      code: 'OBSERVABILITY_UNAVAILABLE'
+    });
+  }
+}
+
 /**
  * Translate low-level errors (mainly Prisma) into a client-friendly AppError.
  * Returns the original error if it is already an AppError, or null when the

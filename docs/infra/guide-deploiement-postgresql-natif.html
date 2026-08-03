@@ -1,0 +1,2445 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Guide complet de déploiement PRO COLIS sur Debian : DNS, Docker, Caddy, API, PostgreSQL 16 natif, sauvegardes et reprise."
+    />
+    <title>PRO COLIS — Guide complet de déploiement</title>
+
+    <style>
+      /*
+       * Identité visuelle du runbook : palette sombre inspirée d'un terminal
+       * d'exploitation, avec un accent citron réservé aux actions et statuts.
+       */
+      :root {
+        color-scheme: dark;
+        --ink: #eff4e8;
+        --ink-muted: #a9b5a3;
+        --paper: #0a0e0c;
+        --paper-raised: #111713;
+        --paper-soft: #171f1a;
+        --line: #2a352d;
+        --accent: #d8ff5f;
+        --accent-deep: #657d23;
+        --cyan: #74d9cc;
+        --warning: #ffc96b;
+        --danger: #ff806f;
+        --success: #9ee493;
+        --shadow: 0 24px 70px rgb(0 0 0 / 32%);
+        --radius-lg: 22px;
+        --radius-md: 14px;
+        --sidebar-width: 18rem;
+        --content-width: 76rem;
+        --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+        --font-body: "Avenir Next", Avenir, "Trebuchet MS", sans-serif;
+        --font-mono: "IBM Plex Mono", "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+        scroll-padding-top: 2rem;
+      }
+
+      body {
+        min-width: 20rem;
+        margin: 0;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 74% 8%, rgb(116 217 204 / 9%), transparent 28rem),
+          linear-gradient(rgb(255 255 255 / 2%) 1px, transparent 1px),
+          linear-gradient(90deg, rgb(255 255 255 / 2%) 1px, transparent 1px),
+          var(--paper);
+        background-size: auto, 42px 42px, 42px 42px, auto;
+        font-family: var(--font-body);
+        font-size: 1rem;
+        line-height: 1.7;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      a:focus-visible,
+      button:focus-visible {
+        outline: 3px solid var(--cyan);
+        outline-offset: 3px;
+      }
+
+      code,
+      pre {
+        font-family: var(--font-mono);
+      }
+
+      code:not(pre code) {
+        padding: 0.12rem 0.38rem;
+        color: var(--accent);
+        background: rgb(216 255 95 / 8%);
+        border: 1px solid rgb(216 255 95 / 16%);
+        border-radius: 0.35rem;
+        font-size: 0.88em;
+      }
+
+      .skip-link {
+        position: fixed;
+        top: 0.75rem;
+        left: 0.75rem;
+        z-index: 100;
+        padding: 0.7rem 1rem;
+        color: var(--paper);
+        background: var(--accent);
+        border-radius: 999px;
+        transform: translateY(-180%);
+        transition: transform 160ms ease;
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+      .page-shell {
+        display: grid;
+        grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+        width: min(100%, calc(var(--sidebar-width) + var(--content-width) + 6rem));
+        margin: 0 auto;
+      }
+
+      /* La navigation reste visible pendant l'exécution séquentielle du runbook. */
+      .sidebar {
+        position: sticky;
+        top: 0;
+        height: 100vh;
+        padding: 2.2rem 1.6rem;
+        border-right: 1px solid var(--line);
+        background: rgb(10 14 12 / 88%);
+        backdrop-filter: blur(16px);
+        overflow-y: auto;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        margin-bottom: 2.6rem;
+        text-decoration: none;
+      }
+
+      .brand-mark {
+        display: grid;
+        place-items: center;
+        width: 2.6rem;
+        height: 2.6rem;
+        color: var(--paper);
+        background: var(--accent);
+        border-radius: 50% 50% 50% 12%;
+        box-shadow: 0 0 0 6px rgb(216 255 95 / 8%);
+        font-weight: 900;
+      }
+
+      .brand-copy {
+        display: grid;
+        line-height: 1.1;
+      }
+
+      .brand-copy strong {
+        letter-spacing: 0.12em;
+        font-size: 0.86rem;
+      }
+
+      .brand-copy span {
+        margin-top: 0.35rem;
+        color: var(--ink-muted);
+        font-family: var(--font-mono);
+        font-size: 0.68rem;
+      }
+
+      .nav-label,
+      .eyebrow {
+        color: var(--accent);
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        font-weight: 700;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
+      .sidebar nav ul {
+        display: grid;
+        gap: 0.18rem;
+        margin: 0.7rem 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      /*
+       * Le sommaire est regroupé par domaine opérationnel. Les sous-sections
+       * restent compactes pour garder l'ensemble du runbook rapidement scannable.
+       */
+      .sidebar nav > ul {
+        gap: 1.15rem;
+      }
+
+      .nav-group-title {
+        display: flex;
+        gap: 0.55rem;
+        align-items: center;
+        padding: 0 0.55rem;
+        color: var(--ink);
+        font-family: var(--font-mono);
+        font-size: 0.66rem;
+        font-weight: 800;
+        letter-spacing: 0.11em;
+        text-transform: uppercase;
+      }
+
+      .nav-group-title::before {
+        content: "";
+        width: 0.42rem;
+        height: 0.42rem;
+        background: var(--accent-deep);
+        border-radius: 50%;
+      }
+
+      .sidebar nav .nav-sub {
+        gap: 0.1rem;
+        margin-top: 0.38rem;
+      }
+
+      .sidebar nav a {
+        display: grid;
+        grid-template-columns: 1.8rem 1fr;
+        gap: 0.45rem;
+        align-items: baseline;
+        padding: 0.48rem 0.55rem;
+        color: var(--ink-muted);
+        border-radius: 0.5rem;
+        text-decoration: none;
+        font-size: 0.8rem;
+        line-height: 1.35;
+        transition: color 160ms ease, background 160ms ease, transform 160ms ease;
+      }
+
+      .sidebar nav a:hover {
+        color: var(--ink);
+        background: var(--paper-soft);
+        transform: translateX(0.18rem);
+      }
+
+      .sidebar nav a.active {
+        color: var(--paper);
+        background: var(--accent);
+        font-weight: 800;
+      }
+
+      .sidebar nav a.active span:first-child {
+        color: var(--paper);
+      }
+
+      .sidebar nav a span:first-child {
+        color: var(--accent-deep);
+        font-family: var(--font-mono);
+      }
+
+      .sidebar-foot {
+        margin-top: 2rem;
+        padding-top: 1.1rem;
+        color: var(--ink-muted);
+        border-top: 1px solid var(--line);
+        font-family: var(--font-mono);
+        font-size: 0.68rem;
+      }
+
+      main {
+        min-width: 0;
+        padding: 4rem clamp(1.25rem, 5vw, 5rem) 8rem;
+      }
+
+      .hero {
+        position: relative;
+        min-height: 34rem;
+        padding: clamp(2rem, 6vw, 5.2rem);
+        overflow: hidden;
+        background:
+          linear-gradient(135deg, rgb(216 255 95 / 9%), transparent 46%),
+          var(--paper-raised);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow);
+      }
+
+      .hero::after {
+        content: "16";
+        position: absolute;
+        right: -0.06em;
+        bottom: -0.35em;
+        color: rgb(216 255 95 / 5%);
+        font-family: var(--font-display);
+        font-size: clamp(14rem, 30vw, 28rem);
+        font-weight: 800;
+        line-height: 1;
+        pointer-events: none;
+      }
+
+      .hero > * {
+        position: relative;
+        z-index: 1;
+      }
+
+      .hero h1 {
+        max-width: 14ch;
+        margin: 1.5rem 0;
+        font-family: var(--font-display);
+        font-size: clamp(3rem, 7vw, 6.5rem);
+        font-weight: 500;
+        letter-spacing: -0.055em;
+        line-height: 0.92;
+      }
+
+      .hero h1 em {
+        color: var(--accent);
+        font-style: italic;
+      }
+
+      .hero-lede {
+        max-width: 47rem;
+        margin: 0;
+        color: var(--ink-muted);
+        font-size: clamp(1.02rem, 2vw, 1.25rem);
+      }
+
+      .meta-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.7rem;
+        margin-top: 2.2rem;
+      }
+
+      .meta-pill {
+        display: inline-flex;
+        gap: 0.45rem;
+        align-items: center;
+        padding: 0.48rem 0.72rem;
+        color: var(--ink-muted);
+        background: rgb(255 255 255 / 3%);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+      }
+
+      .meta-pill::before {
+        content: "";
+        width: 0.45rem;
+        height: 0.45rem;
+        background: var(--success);
+        border-radius: 50%;
+        box-shadow: 0 0 0 4px rgb(158 228 147 / 10%);
+      }
+
+      .section {
+        padding-top: 6rem;
+      }
+
+      .section-heading {
+        display: grid;
+        grid-template-columns: minmax(4rem, 7rem) minmax(0, 1fr);
+        gap: 1.2rem;
+        align-items: start;
+        margin-bottom: 2rem;
+      }
+
+      .section-number {
+        color: var(--accent-deep);
+        font-family: var(--font-mono);
+        font-size: 0.82rem;
+        letter-spacing: 0.08em;
+      }
+
+      .section-heading h2 {
+        margin: 0;
+        font-family: var(--font-display);
+        font-size: clamp(2rem, 4vw, 3.6rem);
+        font-weight: 500;
+        letter-spacing: -0.035em;
+        line-height: 1.04;
+      }
+
+      .section-intro {
+        max-width: 52rem;
+        margin: -0.8rem 0 2.4rem min(8.2rem, 11vw);
+        color: var(--ink-muted);
+      }
+
+      h3 {
+        margin: 2.8rem 0 1rem;
+        font-family: var(--font-display);
+        font-size: 1.55rem;
+        font-weight: 600;
+        letter-spacing: -0.018em;
+      }
+
+      .architecture {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 3rem minmax(0, 1fr);
+        gap: 1rem;
+        align-items: stretch;
+      }
+
+      .architecture-card {
+        position: relative;
+        padding: 1.5rem;
+        background: var(--paper-raised);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+      }
+
+      .architecture-card.target {
+        border-color: rgb(216 255 95 / 40%);
+        box-shadow: inset 0 0 0 1px rgb(216 255 95 / 6%);
+      }
+
+      .architecture-card h3 {
+        margin: 0 0 1.3rem;
+        font-size: 1.25rem;
+      }
+
+      .architecture-card ul {
+        display: grid;
+        gap: 0.7rem;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .architecture-card li {
+        display: flex;
+        gap: 0.7rem;
+        align-items: flex-start;
+        color: var(--ink-muted);
+      }
+
+      .architecture-card li::before {
+        content: "↳";
+        color: var(--cyan);
+        font-family: var(--font-mono);
+      }
+
+      .architecture-arrow {
+        display: grid;
+        place-items: center;
+        color: var(--accent);
+        font-family: var(--font-mono);
+        font-size: 1.4rem;
+      }
+
+      .flow-line {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.6rem;
+        align-items: center;
+        margin-top: 1.4rem;
+        color: var(--ink-muted);
+        font-family: var(--font-mono);
+        font-size: 0.76rem;
+      }
+
+      .flow-node {
+        padding: 0.45rem 0.65rem;
+        color: var(--ink);
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 0.5rem;
+      }
+
+      .flow-node.strong {
+        color: var(--paper);
+        background: var(--accent);
+        border-color: var(--accent);
+        font-weight: 800;
+      }
+
+      .callout {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 1rem;
+        margin: 1.6rem 0;
+        padding: 1.2rem 1.35rem;
+        background: var(--paper-raised);
+        border: 1px solid var(--line);
+        border-left: 4px solid var(--cyan);
+        border-radius: 0 var(--radius-md) var(--radius-md) 0;
+      }
+
+      .callout.warning {
+        border-left-color: var(--warning);
+      }
+
+      .callout.danger {
+        border-left-color: var(--danger);
+      }
+
+      .callout.success {
+        border-left-color: var(--success);
+      }
+
+      .callout-icon {
+        color: var(--cyan);
+        font-family: var(--font-mono);
+        font-weight: 800;
+      }
+
+      .callout.warning .callout-icon {
+        color: var(--warning);
+      }
+
+      .callout.danger .callout-icon {
+        color: var(--danger);
+      }
+
+      .callout.success .callout-icon {
+        color: var(--success);
+      }
+
+      .callout p {
+        margin: 0;
+      }
+
+      .callout strong {
+        color: var(--ink);
+      }
+
+      .command-block {
+        position: relative;
+        margin: 1.15rem 0 1.6rem;
+        overflow: hidden;
+        background: #070a08;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+        box-shadow: 0 12px 35px rgb(0 0 0 / 20%);
+      }
+
+      .command-label {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        min-height: 2.3rem;
+        padding: 0.45rem 0.8rem;
+        color: var(--ink-muted);
+        background: var(--paper-soft);
+        border-bottom: 1px solid var(--line);
+        font-family: var(--font-mono);
+        font-size: 0.67rem;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+
+      .command-block pre {
+        margin: 0;
+        padding: 1.15rem 1.2rem 1.35rem;
+        overflow-x: auto;
+        color: #d9e5d3;
+        font-size: 0.82rem;
+        line-height: 1.65;
+        tab-size: 2;
+      }
+
+      .copy-button {
+        padding: 0.32rem 0.58rem;
+        color: var(--ink);
+        background: transparent;
+        border: 1px solid var(--line);
+        border-radius: 0.42rem;
+        cursor: pointer;
+        font: inherit;
+        font-size: 0.64rem;
+        text-transform: uppercase;
+        transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
+      }
+
+      .copy-button:hover,
+      .copy-button.copied {
+        color: var(--paper);
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+
+      .two-column {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+      }
+
+      .panel {
+        padding: 1.3rem;
+        background: var(--paper-raised);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+      }
+
+      .panel h3 {
+        margin-top: 0;
+      }
+
+      .panel p:last-child,
+      .panel ul:last-child {
+        margin-bottom: 0;
+      }
+
+      .checklist {
+        display: grid;
+        gap: 0.7rem;
+        margin: 1.4rem 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .checklist li {
+        display: grid;
+        grid-template-columns: 1.4rem minmax(0, 1fr);
+        gap: 0.8rem;
+        align-items: start;
+        padding: 0.85rem 1rem;
+        background: rgb(255 255 255 / 2%);
+        border: 1px solid var(--line);
+        border-radius: 0.65rem;
+      }
+
+      .checklist li::before {
+        content: "□";
+        color: var(--accent);
+        font-family: var(--font-mono);
+        font-size: 1.05rem;
+        line-height: 1.55;
+      }
+
+      .table-wrap {
+        overflow-x: auto;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: var(--paper-raised);
+        font-size: 0.88rem;
+      }
+
+      th,
+      td {
+        padding: 0.9rem 1rem;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        color: var(--accent);
+        background: var(--paper-soft);
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      .footer {
+        margin-top: 7rem;
+        padding-top: 1.5rem;
+        color: var(--ink-muted);
+        border-top: 1px solid var(--line);
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+      }
+
+      @media (max-width: 980px) {
+        .page-shell {
+          display: block;
+        }
+
+        .sidebar {
+          position: relative;
+          width: 100%;
+          height: auto;
+          padding: 1.2rem;
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+
+        .brand {
+          margin-bottom: 1rem;
+        }
+
+        .sidebar nav {
+          overflow-x: auto;
+        }
+
+        .sidebar nav ul {
+          display: flex;
+          width: max-content;
+        }
+
+        .sidebar nav > ul,
+        .sidebar nav .nav-sub {
+          gap: 0.2rem;
+          margin: 0;
+        }
+
+        .nav-group {
+          display: flex;
+          align-items: center;
+        }
+
+        .nav-group-title {
+          display: none;
+        }
+
+        .sidebar nav a {
+          display: block;
+          white-space: nowrap;
+        }
+
+        .sidebar nav a span:first-child,
+        .sidebar-foot,
+        .nav-label {
+          display: none;
+        }
+
+        main {
+          padding-top: 2rem;
+        }
+      }
+
+      @media (max-width: 700px) {
+        .hero {
+          min-height: 0;
+          padding: 2rem 1.4rem 7rem;
+        }
+
+        .section {
+          padding-top: 4.5rem;
+        }
+
+        .section-heading {
+          grid-template-columns: 1fr;
+          gap: 0.5rem;
+        }
+
+        .section-intro {
+          margin-left: 0;
+        }
+
+        .architecture,
+        .two-column {
+          grid-template-columns: 1fr;
+        }
+
+        .architecture-arrow {
+          min-height: 2rem;
+          transform: rotate(90deg);
+        }
+
+        .command-block pre {
+          font-size: 0.75rem;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          transition-duration: 0.01ms !important;
+        }
+      }
+
+      /* La version imprimée supprime la navigation et privilégie le contraste papier. */
+      @media print {
+        :root {
+          color-scheme: light;
+          --ink: #101510;
+          --ink-muted: #3e493f;
+          --paper: #ffffff;
+          --paper-raised: #ffffff;
+          --paper-soft: #f0f3ec;
+          --line: #cbd2c7;
+          --accent: #3f5d00;
+          --accent-deep: #4a5b2d;
+          --cyan: #086b63;
+          --warning: #8a5100;
+          --danger: #a42e22;
+          --success: #226d31;
+        }
+
+        body {
+          background: white;
+          font-size: 9.5pt;
+        }
+
+        .page-shell {
+          display: block;
+        }
+
+        .sidebar,
+        .copy-button,
+        .skip-link {
+          display: none !important;
+        }
+
+        main {
+          padding: 0;
+        }
+
+        .hero,
+        .panel,
+        .architecture-card,
+        .command-block,
+        .callout {
+          break-inside: avoid;
+          box-shadow: none;
+        }
+
+        .hero {
+          min-height: 0;
+        }
+
+        .section {
+          padding-top: 2.5rem;
+        }
+
+        .command-block pre {
+          color: #111;
+          background: #f7f8f5;
+          white-space: pre-wrap;
+          overflow-wrap: anywhere;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#contenu">Aller au contenu</a>
+
+    <div class="page-shell">
+      <aside class="sidebar" aria-label="Navigation du guide">
+        <a class="brand" href="#top">
+          <span class="brand-mark" aria-hidden="true">P</span>
+          <span class="brand-copy">
+            <strong>PRO COLIS</strong>
+            <span>INFRA / RUNBOOK 02</span>
+          </span>
+        </a>
+
+        <div class="nav-label">Runbook de production</div>
+        <nav aria-label="Sommaire">
+          <ul>
+            <li class="nav-group">
+              <div class="nav-group-title">Système</div>
+              <ul class="nav-sub">
+                <li><a href="#architecture"><span>00</span><span>Architecture cible</span></a></li>
+              </ul>
+            </li>
+
+            <li class="nav-group">
+              <div class="nav-group-title">Installation</div>
+              <ul class="nav-sub">
+                <li><a href="#dns"><span>01</span><span>DNS &amp; réseau</span></a></li>
+                <li><a href="#vps"><span>02</span><span>Préparer Debian</span></a></li>
+                <li><a href="#repos"><span>03</span><span>Cloner les dépôts</span></a></li>
+                <li><a href="#configuration"><span>04</span><span>Secrets &amp; variables</span></a></li>
+                <li><a href="#prerequis"><span>05</span><span>Contrôles préalables</span></a></li>
+              </ul>
+            </li>
+
+            <li class="nav-group">
+              <div class="nav-group-title">Base native</div>
+              <ul class="nav-sub">
+                <li><a href="#sauvegarde"><span>06</span><span>Sauvegarde source</span></a></li>
+                <li><a href="#installation"><span>07</span><span>PostgreSQL 16</span></a></li>
+                <li><a href="#securite"><span>08</span><span>Rôle &amp; socket</span></a></li>
+              </ul>
+            </li>
+
+            <li class="nav-group">
+              <div class="nav-group-title">Conteneurs &amp; edge</div>
+              <ul class="nav-sub">
+                <li><a href="#caddy"><span>09</span><span>Caddy &amp; HTTPS</span></a></li>
+                <li><a href="#compose"><span>10</span><span>Docker Compose</span></a></li>
+                <li><a href="#deploiement"><span>11</span><span>Build &amp; démarrage</span></a></li>
+              </ul>
+            </li>
+
+            <li class="nav-group">
+              <div class="nav-group-title">Transition</div>
+              <ul class="nav-sub">
+                <li><a href="#migration"><span>12</span><span>Migration finale</span></a></li>
+                <li><a href="#validation"><span>13</span><span>Validation</span></a></li>
+              </ul>
+            </li>
+
+            <li class="nav-group">
+              <div class="nav-group-title">Exploitation</div>
+              <ul class="nav-sub">
+                <li><a href="#mises-a-jour"><span>14</span><span>Mises à jour</span></a></li>
+                <li><a href="#exploitation"><span>15</span><span>Backups &amp; supervision</span></a></li>
+                <li><a href="#donnees-app"><span>16</span><span>Uploads &amp; admin</span></a></li>
+              </ul>
+            </li>
+
+            <li class="nav-group">
+              <div class="nav-group-title">Reprise</div>
+              <ul class="nav-sub">
+                <li><a href="#rollback"><span>17</span><span>Retour arrière</span></a></li>
+                <li><a href="#incidents"><span>18</span><span>Dépannage</span></a></li>
+              </ul>
+            </li>
+          </ul>
+        </nav>
+
+        <div class="sidebar-foot">
+          Debian · Docker · Caddy<br />
+          PostgreSQL 16 · Prisma<br />
+          Révision : 2026-08-01
+        </div>
+      </aside>
+
+      <main id="contenu">
+        <header class="hero" id="top">
+          <div class="eyebrow">Guide de déploiement · Infrastructure</div>
+          <h1>Déployer PRO COLIS, <em>de bout en bout.</em></h1>
+          <p class="hero-lede">
+            Guide d’installation et d’exploitation du domaine, de Caddy, des conteneurs Web/API,
+            des uploads et de PostgreSQL&nbsp;16 natif sur un VPS Debian.
+          </p>
+
+          <div class="meta-strip" aria-label="Caractéristiques de la procédure">
+            <span class="meta-pill">HTTPS automatique</span>
+            <span class="meta-pill">API et Web conteneurisés</span>
+            <span class="meta-pill">PostgreSQL natif</span>
+            <span class="meta-pill">Rollback documenté</span>
+          </div>
+        </header>
+
+        <section class="section" id="architecture">
+          <div class="section-heading">
+            <span class="section-number">00 / CIBLE</span>
+            <h2>Une seule entrée publique, des responsabilités nettes</h2>
+          </div>
+          <p class="section-intro">
+            Caddy est le seul service exposé. Il sert la SPA React et reverse-proxy l’API Express.
+            PostgreSQL est géré par Debian et joint depuis l’API par un socket Unix monté dans le
+            conteneur.
+          </p>
+
+          <div class="architecture" aria-label="Comparaison de l'ancienne et de la nouvelle architecture">
+            <article class="architecture-card">
+              <div class="eyebrow">Avant</div>
+              <h3>Architecture historique</h3>
+              <ul>
+                <li>Conteneurs Caddy, API et PostgreSQL</li>
+                <li>Base dans le volume <code>postgres-data</code></li>
+                <li>API → DNS Docker <code>postgres:5432</code></li>
+                <li>Cycle de vie de la base lié à Compose</li>
+              </ul>
+            </article>
+
+            <div class="architecture-arrow" aria-hidden="true">→</div>
+
+            <article class="architecture-card target">
+              <div class="eyebrow">Après</div>
+              <h3>Architecture de production cible</h3>
+              <ul>
+                <li>Conteneurs Caddy et API uniquement</li>
+                <li>PostgreSQL <code>16/main</code> piloté par systemd</li>
+                <li>API → socket <code>/var/run/postgresql</code></li>
+                <li>Données DB hors du cycle de vie Docker</li>
+              </ul>
+            </article>
+          </div>
+
+          <div class="flow-line" aria-label="Flux de connexion cible">
+            <span class="flow-node">Internet</span>
+            <span>→</span>
+            <span class="flow-node">Caddy :80/:443</span>
+            <span>→</span>
+            <span class="flow-node">SPA / API :8080</span>
+            <span>→</span>
+            <span class="flow-node strong">socket Unix</span>
+            <span>→</span>
+            <span class="flow-node">PostgreSQL 16</span>
+          </div>
+
+          <h3>Routage et persistance</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Composant</th>
+                  <th>Responsabilité</th>
+                  <th>Exposition / persistance</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Caddy</td>
+                  <td>TLS, SPA, compression et reverse-proxy</td>
+                  <td>Ports <code>80/443</code>, volumes <code>caddy-data</code> et <code>caddy-config</code></td>
+                </tr>
+                <tr>
+                  <td>API Express</td>
+                  <td><code>/api/*</code>, <code>/uploads/*</code> et IPN PayDunya</td>
+                  <td>Réseau Compose uniquement, volume <code>api-uploads</code></td>
+                </tr>
+                <tr>
+                  <td>PostgreSQL 16</td>
+                  <td>Données métier et migrations Prisma</td>
+                  <td>Socket Unix uniquement, données dans <code>/var/lib/postgresql/16/main</code></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout danger">
+            <span class="callout-icon" aria-hidden="true">!</span>
+            <p>
+              <strong>Ne jamais copier le contenu brut du volume Docker.</strong> Le passage d’une
+              image Alpine à une installation Debian doit être réalisé avec un dump logique
+              <code>pg_dump</code> puis <code>pg_restore</code>.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="dns">
+          <div class="section-heading">
+            <span class="section-number">01 / RÉSEAU</span>
+            <h2>Préparer le DNS et les ports publics</h2>
+          </div>
+          <p class="section-intro">
+            Le domaine principal et, si utilisé, le sous-domaine <code>www</code> doivent pointer vers
+            l’IP publique du VPS avant le premier démarrage de Caddy.
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Type</th><th>Nom</th><th>Valeur</th><th>Usage</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>A</code></td>
+                  <td><code>sendprocolis.exemple.com</code></td>
+                  <td><code>IP_PUBLIQUE_DU_VPS</code></td>
+                  <td>Domaine principal</td>
+                </tr>
+                <tr>
+                  <td><code>A</code> ou <code>CNAME</code></td>
+                  <td><code>www.sendprocolis.exemple.com</code></td>
+                  <td>IP du VPS ou domaine principal</td>
+                  <td>Redirection <code>www</code> → domaine principal</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · contrôles DNS</span></div>
+            <pre><code>dig +short sendprocolis.exemple.com A
+dig +short www.sendprocolis.exemple.com A
+
+sudo ss -ltnp | grep -E ':(80|443)\b' || true</code></pre>
+          </div>
+
+          <div class="callout warning">
+            <span class="callout-icon" aria-hidden="true">!</span>
+            <p>
+              Let’s Encrypt ne pourra pas émettre le certificat si le DNS n’est pas propagé ou si les
+              ports <code>80</code> et <code>443</code> sont filtrés. Le port <code>5432</code> ne doit
+              jamais être ouvert sur Internet.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="vps">
+          <div class="section-heading">
+            <span class="section-number">02 / DEBIAN</span>
+            <h2>Préparer un VPS Debian</h2>
+          </div>
+          <p class="section-intro">
+            Installer Docker depuis son dépôt officiel, activer Compose et limiter le pare-feu à SSH,
+            HTTP et HTTPS. PostgreSQL 16 sera installé séparément dans la section Base native.
+          </p>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · Docker Engine et Compose</span></div>
+            <pre><code>sudo apt-get update
+sudo apt-get install -y ca-certificates curl git ufw
+
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/debian \
+$(. /etc/os-release &amp;&amp; echo "$VERSION_CODENAME") stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list &gt; /dev/null
+
+sudo apt-get update
+sudo apt-get install -y \
+  docker-ce \
+  docker-ce-cli \
+  containerd.io \
+  docker-buildx-plugin \
+  docker-compose-plugin
+
+sudo usermod -aG docker "$USER"</code></pre>
+          </div>
+
+          <p>Se déconnecter puis se reconnecter afin que le groupe Docker soit pris en compte.</p>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · pare-feu</span></div>
+            <pre><code># Toujours autoriser SSH avant d'activer UFW.
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw deny 5432/tcp
+sudo ufw --force enable
+
+sudo ufw status verbose
+docker --version
+docker compose version</code></pre>
+          </div>
+
+          <div class="callout danger">
+            <span class="callout-icon" aria-hidden="true">!</span>
+            <p>
+              Vérifier le port SSH réel avant <code>ufw enable</code>. Si SSH écoute sur un autre port,
+              autoriser ce port à la place de <code>22/tcp</code> afin de ne pas verrouiller le VPS.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="repos">
+          <div class="section-heading">
+            <span class="section-number">03 / CODE</span>
+            <h2>Cloner les deux dépôts côte à côte</h2>
+          </div>
+          <p class="section-intro">
+            Le Compose de production se trouve dans le dépôt Web et construit l’API avec le contexte
+            voisin <code>../SendProColis-Api</code>. Les noms et la profondeur des répertoires sont donc
+            importants.
+          </p>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · arborescence de production</span></div>
+            <pre><code>mkdir -p ~/procolis
+cd ~/procolis
+
+git clone URL_SENDPROCOLIS_WEB SendProColis-Web
+git clone URL_SENDPROCOLIS_API SendProColis-Api
+
+cd ~/procolis/SendProColis-Web</code></pre>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Arborescence attendue</span></div>
+            <pre><code>~/procolis/
+├── SendProColis-Web/   # Caddy, SPA et Compose de production
+└── SendProColis-Api/   # API Express, Prisma et migrations</code></pre>
+          </div>
+
+          <div class="callout">
+            <span class="callout-icon" aria-hidden="true">i</span>
+            <p>
+              Sauf indication contraire, les commandes <code>docker compose</code> de production sont à
+              exécuter depuis <code>~/procolis/SendProColis-Web</code>. Le Compose autonome du dépôt API
+              reste destiné au développement et à la migration historique.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="configuration">
+          <div class="section-heading">
+            <span class="section-number">04 / SECRETS</span>
+            <h2>Configurer l’environnement de production</h2>
+          </div>
+          <p class="section-intro">
+            Les secrets vivent dans <code>SendProColis-Web/.env</code> sur le VPS. Le fichier ne doit ni
+            être committé, ni être copié dans une image, ni apparaître dans les logs.
+          </p>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · initialisation</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Web
+cp .env.production.example .env
+chmod 600 .env
+
+openssl rand -hex 32  # Mot de passe du rôle PostgreSQL
+openssl rand -hex 32  # JWT_ACCESS_SECRET
+openssl rand -hex 32  # JWT_REFRESH_SECRET</code></pre>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>.env · structure cible</span></div>
+            <pre><code>DOMAIN=sendprocolis.exemple.com
+TLS_EMAIL=admin@exemple.com
+
+# Le mot de passe doit être identique à celui du rôle natif procolis.
+DATABASE_URL=postgresql://procolis:MOT_DE_PASSE_HEXA@localhost/procolis?host=/var/run/postgresql/&amp;schema=public
+
+JWT_ACCESS_SECRET=SECRET_HEXA_32_OCTETS
+JWT_REFRESH_SECRET=SECRET_HEXA_32_OCTETS
+
+BREVO_API_KEY=xkeysib-...
+BREVO_SENDER_EMAIL=no-reply@sendprocolis.com
+BREVO_SENDER_NAME=SENDPROCOLIS
+BREVO_SMS_SENDER=SENDPROCOLIS
+
+# Paiement : utiliser live uniquement après validation des clés et callbacks.
+PAYDUNYA_MODE=live
+PAYDUNYA_MASTER_KEY=...
+PAYDUNYA_PRIVATE_KEY=...
+PAYDUNYA_TOKEN=...</code></pre>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Variable</th><th>Portée</th><th>Remarque</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code>DOMAIN</code></td><td>Caddy + build SPA</td><td>Sans protocole ni slash final</td></tr>
+                <tr><td><code>TLS_EMAIL</code></td><td>Caddy</td><td>Compte ACME / alertes certificat</td></tr>
+                <tr><td><code>DATABASE_URL</code></td><td>API + Prisma</td><td>Socket Unix natif, mot de passe hexadécimal</td></tr>
+                <tr><td><code>JWT_*_SECRET</code></td><td>API</td><td>Deux secrets différents, 32 octets recommandés</td></tr>
+                <tr><td><code>BREVO_*</code></td><td>API</td><td>Email et SMS ; expéditeur vérifié requis</td></tr>
+                <tr><td><code>PAYDUNYA_*</code></td><td>API</td><td>Secrets facultatifs hors fonctionnalités de paiement</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout success">
+            <span class="callout-icon" aria-hidden="true">✓</span>
+            <p>
+              <code>PUBLIC_BASE_URL</code>, <code>CORS_ORIGIN</code> et
+              <code>VITE_API_BASE_URL</code> sont dérivés de <code>DOMAIN</code> dans le Compose cible.
+              Toute modification du domaine impose une reconstruction du front Vite.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="prerequis">
+          <div class="section-heading">
+            <span class="section-number">05 / CONTRÔLES</span>
+            <h2>Valider le VPS avant la migration</h2>
+          </div>
+          <p class="section-intro">
+            Exécuter les commandes depuis la racine du projet sur le VPS. Une fenêtre de maintenance
+            est nécessaire pour garantir qu’aucune écriture ne survient entre le dump et la bascule.
+          </p>
+
+          <ul class="checklist">
+            <li>Accès SSH avec un utilisateur membre du groupe Docker et autorisé à utiliser <code>sudo</code>.</li>
+            <li>Conteneur source identifié : <code>procolis-node-postgres</code> ou <code>sendprocolis-postgres</code> selon l’ancienne stack.</li>
+            <li>Espace disque disponible pour au moins deux dumps complets et la base restaurée.</li>
+            <li>Mot de passe PostgreSQL fort stocké dans un gestionnaire de secrets.</li>
+            <li>Maintenance annoncée et procédure de rollback connue par l’opérateur.</li>
+          </ul>
+
+          <h3>État initial</h3>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · inventaire</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Api
+
+docker compose ps
+
+docker exec procolis-node-postgres \
+  psql -U procolis -d procolis \
+  -c "SELECT version();"
+
+sudo ss -ltnp | grep ':5432' || true
+command -v pg_lsclusters &gt;/dev/null &amp;&amp; pg_lsclusters || true</code></pre>
+          </div>
+
+          <div class="callout warning">
+            <span class="callout-icon" aria-hidden="true">?</span>
+            <p>
+              Si le port <code>5432</code> est déjà occupé, identifier le processus ou le cluster
+              avant de continuer. Ne pas installer un second cluster sur un port choisi implicitement.
+            </p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-icon" aria-hidden="true">i</span>
+            <p>
+              Les commandes de migration ci-dessous utilisent la source historique
+              <code>procolis-node-postgres</code>, l’utilisateur <code>procolis</code> et la base
+              <code>procolis</code>. Si l’ancienne production utilise les noms
+              <code>sendprocolis-*</code>, résoudre d’abord les valeurs exactes avec
+              <code>docker inspect</code> et les substituer partout de manière cohérente.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="sauvegarde">
+          <div class="section-heading">
+            <span class="section-number">06 / BACKUP</span>
+            <h2>Sauvegarder avant toute modification</h2>
+          </div>
+          <p class="section-intro">
+            Les dumps sont stockés hors du dépôt afin qu’ils ne soient jamais ajoutés à Git ni inclus
+            dans l’image par le <code>COPY . .</code> du Dockerfile.
+          </p>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · répertoire privé</span></div>
+            <pre><code>BACKUP_DIR=/var/backups/procolis
+
+sudo install -d \
+  -m 700 \
+  -o "$(id -un)" \
+  -g "$(id -gn)" \
+  "$BACKUP_DIR"
+
+PRE_BACKUP="$BACKUP_DIR/procolis-preflight-$(date +%Y%m%d-%H%M%S).dump"</code></pre>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · dump custom et contrôle</span></div>
+            <pre><code>docker exec procolis-node-postgres \
+  pg_dump -U procolis -d procolis \
+  --format=custom \
+  --verbose \
+  &gt; "$PRE_BACKUP"
+
+test -s "$PRE_BACKUP"
+
+docker exec -i procolis-node-postgres \
+  pg_restore --list \
+  &lt; "$PRE_BACKUP" \
+  &gt; /dev/null
+
+chmod 600 "$PRE_BACKUP"
+sha256sum "$PRE_BACKUP"
+du -h "$PRE_BACKUP"</code></pre>
+          </div>
+
+          <div class="callout success">
+            <span class="callout-icon" aria-hidden="true">✓</span>
+            <p>
+              Continuer uniquement si le fichier est non vide, si <code>pg_restore --list</code> se
+              termine sans erreur et si sa somme SHA-256 a été conservée.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="installation">
+          <div class="section-heading">
+            <span class="section-number">07 / POSTGRES</span>
+            <h2>Installer PostgreSQL 16 nativement</h2>
+          </div>
+          <p class="section-intro">
+            La version majeure cible reste 16, identique à celle de l’image source. Le dépôt PGDG
+            fournit une version précise et les mises à jour de maintenance associées.
+          </p>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · installation PGDG</span></div>
+            <pre><code>sudo apt update
+sudo apt install -y postgresql-common
+
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+
+sudo apt update
+sudo apt install -y postgresql-16 postgresql-client-16
+
+sudo systemctl enable --now postgresql</code></pre>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · santé du cluster</span></div>
+            <pre><code>sudo systemctl status postgresql --no-pager
+pg_lsclusters
+
+sudo -u postgres psql -Atqc \
+  "SELECT current_setting('server_version');"</code></pre>
+          </div>
+
+          <p>
+            Le cluster attendu est <code>16/main</code>, port <code>5432</code>, statut
+            <code>online</code>.
+          </p>
+        </section>
+
+        <section class="section" id="securite">
+          <div class="section-heading">
+            <span class="section-number">08 / ACCÈS</span>
+            <h2>Créer le rôle et protéger le socket</h2>
+          </div>
+          <p class="section-intro">
+            Le rôle applicatif n’est ni super-utilisateur, ni créateur de rôles ou de bases. Son accès
+            au socket local exige une authentification SCRAM-SHA-256.
+          </p>
+
+          <div class="two-column">
+            <article class="panel">
+              <h3>Mot de passe</h3>
+              <p>Générer un secret compatible avec une URL sans encodage supplémentaire :</p>
+              <div class="command-block">
+                <div class="command-label"><span>Shell</span></div>
+                <pre><code>openssl rand -hex 32</code></pre>
+              </div>
+              <p>Le stocker immédiatement dans le gestionnaire de secrets.</p>
+            </article>
+
+            <article class="panel">
+              <h3>Rôle et base</h3>
+              <div class="command-block">
+                <div class="command-label"><span>Shell</span></div>
+                <pre><code>sudo -u postgres createuser \
+  --pwprompt \
+  --no-superuser \
+  --no-createdb \
+  --no-createrole \
+  procolis
+
+sudo -u postgres createdb \
+  --owner=procolis \
+  --template=template0 \
+  --encoding=UTF8 \
+  procolis</code></pre>
+              </div>
+            </article>
+          </div>
+
+          <h3>Règle <code>pg_hba.conf</code></h3>
+          <p>Localiser le fichier réellement chargé :</p>
+          <div class="command-block">
+            <div class="command-label"><span>Shell</span></div>
+            <pre><code>sudo -u postgres psql -Atqc "SHOW hba_file;"</code></pre>
+          </div>
+
+          <p>
+            Ajouter la règle suivante <strong>avant</strong> la règle générique
+            <code>local all all peer</code> :
+          </p>
+          <div class="command-block">
+            <div class="command-label"><span>pg_hba.conf</span></div>
+            <pre><code># L'API PRO COLIS utilise le socket PostgreSQL monté dans son conteneur.
+# SCRAM impose l'utilisation du mot de passe fort du rôle applicatif.
+local   procolis   procolis   scram-sha-256</code></pre>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · recharger et tester</span></div>
+            <pre><code>sudo systemctl reload postgresql
+
+sudo -u postgres psql -x -c "
+SELECT line_number, type, database, user_name, auth_method, error
+FROM pg_hba_file_rules
+WHERE error IS NOT NULL;
+"
+
+psql \
+  'postgresql://procolis@localhost/procolis?host=/var/run/postgresql/' \
+  -W \
+  -c "SELECT current_user, current_database();"</code></pre>
+          </div>
+
+          <div class="callout danger">
+            <span class="callout-icon" aria-hidden="true">!</span>
+            <p>
+              Ne jamais utiliser <code>trust</code> pour le rôle applicatif et ne jamais appliquer
+              <code>chmod 777</code> au répertoire de sauvegarde. Le port <code>5432</code> ne doit pas
+              écouter sur <code>0.0.0.0</code> ni sur l’IP publique.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="caddy">
+          <div class="section-heading">
+            <span class="section-number">09 / EDGE</span>
+            <h2>Caddy centralise le Web, l’API et HTTPS</h2>
+          </div>
+          <p class="section-intro">
+            L’image Web est construite en deux étapes : Vite compile la SPA avec l’URL publique de
+            l’API, puis Caddy sert les fichiers de <code>/srv</code> et reverse-proxy les routes backend.
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Chemin public</th><th>Destination</th><th>Comportement</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code>/</code></td><td>SPA React dans Caddy</td><td>Fallback <code>index.html</code> pour le routing client</td></tr>
+                <tr><td><code>/api/*</code></td><td><code>api:8080</code></td><td>Reverse-proxy sans modifier le chemin</td></tr>
+                <tr><td><code>/uploads/*</code></td><td><code>api:8080</code></td><td>Médias persistés dans <code>api-uploads</code></td></tr>
+                <tr><td><code>POST /payment-status.php</code></td><td>IPN PayDunya</td><td>Réécrit vers <code>/api/v1/payments/paydunya/ipn</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Caddyfile · configuration de référence</span></div>
+            <pre><code>{
+  email {$TLS_EMAIL}
+}
+
+# Cette redirection exige un DNS www pointant vers le VPS.
+www.{$DOMAIN} {
+  redir https://{$DOMAIN}{uri} 308
+}
+
+{$DOMAIN} {
+  encode zstd gzip
+
+  @backend path /api/* /uploads/*
+  handle @backend {
+    reverse_proxy api:8080
+  }
+
+  # PayDunya appelle cet endpoint en POST serveur-à-serveur.
+  @paydunyaIpn {
+    path /payment-status.php
+    method POST
+  }
+  handle @paydunyaIpn {
+    rewrite * /api/v1/payments/paydunya/ipn
+    reverse_proxy api:8080
+  }
+
+  handle {
+    root * /srv
+    try_files {path} /index.html
+    file_server
+  }
+}</code></pre>
+          </div>
+
+          <div class="callout">
+            <span class="callout-icon" aria-hidden="true">i</span>
+            <p>
+              <code>VITE_API_BASE_URL</code> est injectée pendant le build Vite sous la forme
+              <code>https://DOMAIN/api/v1</code>. Un changement de domaine nécessite donc un rebuild,
+              pas seulement un redémarrage de Caddy.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="compose">
+          <div class="section-heading">
+            <span class="section-number">10 / DOCKER</span>
+            <h2>Compose de production à deux services</h2>
+          </div>
+          <p class="section-intro">
+            Le Compose cible est lancé depuis <code>SendProColis-Web</code>. Il construit Caddy et l’API,
+            conserve leurs données persistantes et monte le socket natif dans l’API. PostgreSQL n’est
+            plus un service Compose.
+          </p>
+
+          <h3>Sauvegarder la configuration actuelle</h3>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · fichiers de rollback</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Web
+
+cp -a docker-compose.yml \
+  "$BACKUP_DIR/docker-compose.yml.before-native-postgres"
+
+cp -a .env \
+  "$BACKUP_DIR/env.before-native-postgres"
+
+chmod 600 "$BACKUP_DIR/env.before-native-postgres"
+
+# Conserver aussi la stack API autonome si elle porte la source historique.
+cp -a ../SendProColis-Api/docker-compose.yml \
+  "$BACKUP_DIR/api-compose.before-native-postgres.yml"
+cp -a ../SendProColis-Api/.env \
+  "$BACKUP_DIR/api-env.before-native-postgres"
+chmod 600 "$BACKUP_DIR/api-env.before-native-postgres"</code></pre>
+          </div>
+
+          <h3>Configuration cible</h3>
+          <div class="command-block">
+            <div class="command-label"><span>SendProColis-Web/docker-compose.yml</span></div>
+            <pre><code># Production : Caddy + API Docker, PostgreSQL 16 natif Debian.
+services:
+  caddy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: https://${DOMAIN}/api/v1
+    image: sendprocolis-web:latest
+    container_name: sendprocolis-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN doit etre defini}
+      TLS_EMAIL: ${TLS_EMAIL:?TLS_EMAIL doit etre defini}
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: ../SendProColis-Api
+    image: sendprocolis-api:latest
+    container_name: sendprocolis-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL doit etre definie}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET requis}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET requis}
+      JWT_ACCESS_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 30d
+      OTP_EXPIRES_MINUTES: 10
+      UPLOAD_STORAGE: local
+      UPLOAD_LOCAL_DIR: uploads
+      PUBLIC_BASE_URL: https://${DOMAIN}
+      CORS_ORIGIN: https://${DOMAIN}
+      LOG_LEVEL: info
+      RATE_LIMIT_WINDOW_MS: 900000
+      RATE_LIMIT_MAX: 300
+      AUTH_RATE_LIMIT_MAX: 30
+      BREVO_API_KEY: ${BREVO_API_KEY:-}
+      BREVO_SENDER_EMAIL: ${BREVO_SENDER_EMAIL:-}
+      BREVO_SENDER_NAME: ${BREVO_SENDER_NAME:-PRO COLIS}
+      BREVO_SMS_SENDER: ${BREVO_SMS_SENDER:-ProColis}
+      PAYDUNYA_MODE: ${PAYDUNYA_MODE:-test}
+      PAYDUNYA_MASTER_KEY: ${PAYDUNYA_MASTER_KEY:-}
+      PAYDUNYA_PRIVATE_KEY: ${PAYDUNYA_PRIVATE_KEY:-}
+      PAYDUNYA_TOKEN: ${PAYDUNYA_TOKEN:-}
+    volumes:
+      - api-uploads:/app/uploads
+
+      # Le socket natif évite tout port PostgreSQL sur le réseau Docker.
+      - type: bind
+        source: /var/run/postgresql
+        target: /var/run/postgresql
+    # Aucun ports: l'API est joignable uniquement par Caddy.
+
+volumes:
+  caddy-data:
+  caddy-config:
+  api-uploads:</code></pre>
+          </div>
+
+          <p>Par rapport à l’ancienne stack, supprimer impérativement :</p>
+          <ul class="checklist">
+            <li>Le service Compose <code>postgres</code> et son healthcheck.</li>
+            <li>Le bloc <code>api.depends_on.postgres</code>.</li>
+            <li>Le volume top-level <code>postgres-data</code>.</li>
+            <li>L’URL contenant l’hôte Docker <code>postgres:5432</code>.</li>
+            <li>Tout mapping public du port API ou du port PostgreSQL.</li>
+          </ul>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · validation sans afficher les secrets</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Web
+docker compose config -q</code></pre>
+          </div>
+        </section>
+
+        <section class="section" id="deploiement">
+          <div class="section-heading">
+            <span class="section-number">11 / START</span>
+            <h2>Construire et démarrer la stack</h2>
+          </div>
+          <p class="section-intro">
+            La commande complète reconstruit les images et remplace les conteneurs existants. Les
+            migrations Prisma sont exécutées automatiquement par l’image API avant le démarrage du
+            serveur Node.js.
+          </p>
+
+          <div class="callout warning">
+            <span class="callout-icon" aria-hidden="true">!</span>
+            <p>
+              Pour une migration depuis PostgreSQL Docker, ne démarrer la nouvelle API qu’après le
+              dump, la restauration et les comparaisons de la section Transition. Sur une installation
+              neuve, la commande ci-dessous peut être exécutée dès que la base native est prête.
+            </p>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · build et lancement</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Web
+
+docker compose config -q
+docker compose up -d --build --force-recreate
+
+docker compose ps
+docker compose logs --tail=150 caddy api</code></pre>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · recette initiale</span></div>
+            <pre><code>curl -fsS https://sendprocolis.exemple.com/api/v1/health
+
+docker compose exec api npx prisma migrate status
+
+docker compose exec api \
+  sh -lc 'test -S /var/run/postgresql/.s.PGSQL.5432 &amp;&amp; echo "Socket PostgreSQL OK"'</code></pre>
+          </div>
+
+          <div class="callout success">
+            <span class="callout-icon" aria-hidden="true">✓</span>
+            <p>
+              L’API n’a pas de port hôte dans la stack cible. Tous les tests HTTP externes passent par
+              Caddy et le domaine HTTPS, ce qui valide simultanément DNS, TLS, routage et application.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="migration">
+          <div class="section-heading">
+            <span class="section-number">12 / CUTOVER</span>
+            <h2>Geler, exporter, restaurer</h2>
+          </div>
+          <p class="section-intro">
+            Cette phase ouvre la maintenance. L’ancienne base reste disponible en lecture pour les
+            contrôles, mais l’API est arrêtée afin de figer les écritures.
+          </p>
+
+          <h3>1. Arrêt applicatif et dump final</h3>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · source Docker</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Api
+
+docker compose stop api
+
+docker exec procolis-node-postgres \
+  psql -U procolis -d procolis -Atc "
+SELECT count(*)
+FROM pg_stat_activity
+WHERE datname = 'procolis'
+  AND pid &lt;&gt; pg_backend_pid();
+"
+
+FINAL_BACKUP="$BACKUP_DIR/procolis-final-$(date +%Y%m%d-%H%M%S).dump"
+
+docker exec procolis-node-postgres \
+  pg_dump -U procolis -d procolis \
+  --format=custom \
+  --verbose \
+  &gt; "$FINAL_BACKUP"
+
+test -s "$FINAL_BACKUP"
+docker exec -i procolis-node-postgres pg_restore --list \
+  &lt; "$FINAL_BACKUP" \
+  &gt; /dev/null
+
+chmod 600 "$FINAL_BACKUP"
+sha256sum "$FINAL_BACKUP"</code></pre>
+          </div>
+
+          <h3>2. Restauration transactionnelle</h3>
+          <p>Confirmer que la destination ne contient encore aucune table applicative :</p>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · précontrôle destination</span></div>
+            <pre><code>sudo -u postgres psql -d procolis -Atc "
+SELECT count(*)
+FROM pg_catalog.pg_tables
+WHERE schemaname = 'public';
+"</code></pre>
+          </div>
+
+          <p>Le résultat attendu est <code>0</code>.</p>
+
+          <div class="callout">
+            <span class="callout-icon" aria-hidden="true">i</span>
+            <p>
+              Le répertoire de sauvegarde est volontairement en mode <code>700</code>. Le dump est donc
+              transmis à <code>pg_restore</code> par l’entrée standard : le shell <code>debian</code> ouvre
+              le fichier, puis l’utilisateur <code>postgres</code> reçoit son contenu sans avoir accès au
+              répertoire.
+            </p>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · destination native</span></div>
+            <pre><code>RESTORE_LOG="$BACKUP_DIR/restore-$(date +%Y%m%d-%H%M%S).log"
+set -o pipefail
+
+sudo -u postgres pg_restore \
+  --dbname=procolis \
+  --no-owner \
+  --role=procolis \
+  --exit-on-error \
+  --single-transaction \
+  --verbose \
+  &lt; "$FINAL_BACKUP" \
+  2&gt;&amp;1 | tee "$RESTORE_LOG"
+
+RESTORE_STATUS=$?
+echo "Code de restauration : $RESTORE_STATUS"</code></pre>
+          </div>
+
+          <div class="callout danger">
+            <span class="callout-icon" aria-hidden="true">!</span>
+            <p>
+              Le code doit être <code>0</code>. Tout autre code impose l’arrêt immédiat de la procédure.
+              Grâce à <code>--single-transaction</code>, une erreur annule la restauration en cours.
+            </p>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · statistiques</span></div>
+            <pre><code>sudo -u postgres psql -d procolis -c "ANALYZE;"</code></pre>
+          </div>
+        </section>
+
+        <section class="section" id="validation">
+          <div class="section-heading">
+            <span class="section-number">13 / GO-LIVE</span>
+            <h2>Comparer avant de basculer</h2>
+          </div>
+          <p class="section-intro">
+            La source Docker reste active mais l’API est arrêtée. Comparer des tables métier critiques,
+            vérifier Prisma, puis seulement arrêter le moteur source.
+          </p>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · requête de contrôle</span></div>
+            <pre><code>CHECK_SQL='
+SELECT '\''User'\'' AS table_name, count(*) FROM public."User"
+UNION ALL
+SELECT '\''Parcel'\'', count(*) FROM public."Parcel"
+UNION ALL
+SELECT '\''Payment'\'', count(*) FROM public."Payment"
+UNION ALL
+SELECT '\''WalletTransaction'\'', count(*) FROM public."WalletTransaction"
+UNION ALL
+SELECT '\''_prisma_migrations'\'', count(*) FROM public."_prisma_migrations"
+ORDER BY 1;
+'
+
+docker exec procolis-node-postgres \
+  psql -U procolis -d procolis -Atc "$CHECK_SQL" \
+  | tee "$BACKUP_DIR/source-counts.txt"
+
+sudo -u postgres \
+  psql -d procolis -Atc "$CHECK_SQL" \
+  | tee "$BACKUP_DIR/native-counts.txt"
+
+diff -u \
+  "$BACKUP_DIR/source-counts.txt" \
+  "$BACKUP_DIR/native-counts.txt"</code></pre>
+          </div>
+
+          <p>
+            Si <code>diff</code> ne retourne rien, arrêter la source puis lancer la stack de production
+            cible depuis le dépôt Web :
+          </p>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · bascule</span></div>
+            <pre><code>docker stop procolis-node-postgres
+
+cd ~/procolis/SendProColis-Web
+docker compose up -d --build --force-recreate
+
+docker compose ps
+docker compose logs --tail=150 caddy api</code></pre>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · tests post-déploiement</span></div>
+            <pre><code>docker compose exec api \
+  sh -lc 'test -S /var/run/postgresql/.s.PGSQL.5432 &amp;&amp; echo "Socket PostgreSQL OK"'
+
+docker compose exec api npx prisma migrate status
+
+curl -fsS https://sendprocolis.exemple.com/api/v1/health
+
+sudo systemctl is-active postgresql
+sudo ss -ltnp | grep ':5432' || true</code></pre>
+          </div>
+
+          <ul class="checklist">
+            <li>Le conteneur API est <code>Up</code> et ses logs ne contiennent aucune erreur Prisma.</li>
+            <li>Le socket <code>.s.PGSQL.5432</code> est visible dans le conteneur.</li>
+            <li><code>prisma migrate status</code> confirme que le schéma est à jour.</li>
+            <li>L’endpoint <code>/health</code> répond avec un code HTTP 2xx.</li>
+            <li>Le port 5432 n’écoute pas sur l’interface publique.</li>
+          </ul>
+        </section>
+
+        <section class="section" id="mises-a-jour">
+          <div class="section-heading">
+            <span class="section-number">14 / UPDATE</span>
+            <h2>Mettre à jour sans conserver d’anciens conteneurs</h2>
+          </div>
+          <p class="section-intro">
+            Tirer les deux dépôts, reconstruire les images puis forcer la recréation. Cette dernière
+            étape est indispensable pour que les conteneurs utilisent réellement les nouvelles images.
+          </p>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · déploiement d’une version</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Web
+git pull --ff-only
+
+cd ~/procolis/SendProColis-Api
+git pull --ff-only
+
+cd ~/procolis/SendProColis-Web
+docker compose config -q
+docker compose up -d --build --force-recreate
+
+docker compose ps
+docker compose logs --tail=150 caddy api
+curl -fsS https://sendprocolis.exemple.com/api/v1/health</code></pre>
+          </div>
+
+          <div class="callout">
+            <span class="callout-icon" aria-hidden="true">i</span>
+            <p>
+              Le démarrage de l’image API lance <code>npx prisma migrate deploy</code> avant Node.js.
+              Une migration défectueuse fait donc échouer le conteneur et doit être diagnostiquée dans
+              <code>docker compose logs api</code> avant toute autre action.
+            </p>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · nettoyage après validation</span></div>
+            <pre><code># Exécuter uniquement après avoir validé la nouvelle version.
+docker image prune -f</code></pre>
+          </div>
+
+          <div class="callout warning">
+            <span class="callout-icon" aria-hidden="true">!</span>
+            <p>
+              Ne pas associer ce nettoyage à <code>docker volume prune</code>. Les volumes Caddy et
+              uploads portent des données persistantes et ne doivent jamais être supprimés par une
+              commande de maintenance générique.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="exploitation">
+          <div class="section-heading">
+            <span class="section-number">15 / RUN</span>
+            <h2>Sauvegarder et superviser toute la stack</h2>
+          </div>
+          <p class="section-intro">
+            PostgreSQL est piloté par systemd ; Caddy et l’API par Compose. La stratégie de sauvegarde
+            couvre séparément la base native, les uploads et la configuration du VPS.
+          </p>
+
+          <h3>Commandes d’exploitation</h3>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Besoin</th>
+                  <th>Commande</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>État du service</td>
+                  <td><code>sudo systemctl status postgresql --no-pager</code></td>
+                </tr>
+                <tr>
+                  <td>État des clusters</td>
+                  <td><code>pg_lsclusters</code></td>
+                </tr>
+                <tr>
+                  <td>Disponibilité</td>
+                  <td><code>pg_isready -h /var/run/postgresql -p 5432</code></td>
+                </tr>
+                <tr>
+                  <td>Logs PostgreSQL 16</td>
+                  <td><code>sudo journalctl -u postgresql@16-main --since today</code></td>
+                </tr>
+                <tr>
+                  <td>Connexions PRO COLIS</td>
+                  <td><code>sudo -u postgres psql -d procolis -c "SELECT * FROM pg_stat_activity WHERE datname = 'procolis';"</code></td>
+                </tr>
+                <tr>
+                  <td>Taille de la base</td>
+                  <td><code>sudo -u postgres psql -d procolis -c "SELECT pg_size_pretty(pg_database_size('procolis'));"</code></td>
+                </tr>
+                <tr>
+                  <td>État Docker</td>
+                  <td><code>cd ~/procolis/SendProColis-Web &amp;&amp; docker compose ps</code></td>
+                </tr>
+                <tr>
+                  <td>Logs API / edge</td>
+                  <td><code>docker compose logs --tail=200 caddy api</code></td>
+                </tr>
+                <tr>
+                  <td>Renouvellement TLS</td>
+                  <td><code>docker compose logs caddy | grep -i certificate</code></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Sauvegarde manuelle native</h3>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · à automatiser</span></div>
+            <pre><code>NATIVE_BACKUP="$BACKUP_DIR/procolis-native-$(date +%Y%m%d-%H%M%S).dump"
+
+sudo -u postgres pg_dump \
+  --dbname=procolis \
+  --format=custom \
+  --verbose \
+  &gt; "$NATIVE_BACKUP"
+
+test -s "$NATIVE_BACKUP"
+pg_restore --list "$NATIVE_BACKUP" &gt; /dev/null
+chmod 600 "$NATIVE_BACKUP"
+sha256sum "$NATIVE_BACKUP"</code></pre>
+          </div>
+
+          <h3>Sauvegarde des uploads</h3>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · volume api-uploads</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Web
+
+UPLOADS_BACKUP="$BACKUP_DIR/uploads-$(date +%Y%m%d-%H%M%S).tar.gz"
+UPLOADS_VOLUME="$(docker volume ls \
+  --filter name=api-uploads \
+  --format '{{.Name}}' \
+  | head -n 1)"
+
+test -n "$UPLOADS_VOLUME"
+
+docker run --rm \
+  --mount type=volume,source="$UPLOADS_VOLUME",target=/data,readonly \
+  --mount type=bind,source="$BACKUP_DIR",target=/backup \
+  alpine \
+  tar czf "/backup/$(basename "$UPLOADS_BACKUP")" -C /data .
+
+test -s "$UPLOADS_BACKUP"
+chmod 600 "$UPLOADS_BACKUP"
+sha256sum "$UPLOADS_BACKUP"</code></pre>
+          </div>
+
+          <h3>Politique minimale</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Donnée</th><th>Méthode</th><th>Rétention indicative</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>PostgreSQL</td><td><code>pg_dump -Fc</code> + copie chiffrée hors VPS</td><td>7 quotidiennes, 4 hebdomadaires, 6 mensuelles</td></tr>
+                <tr><td>Uploads</td><td>Archive du volume <code>api-uploads</code></td><td>Quotidienne ou selon le volume de médias</td></tr>
+                <tr><td>Configuration</td><td><code>.env</code>, Compose et Caddyfile chiffrés</td><td>À chaque modification</td></tr>
+                <tr><td>Caddy</td><td>Volumes persistés ; certificats régénérables</td><td>Facultative, priorité faible</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warning">
+            <span class="callout-icon" aria-hidden="true">↻</span>
+            <p>
+              Un dump présent uniquement sur le VPS ne constitue pas une stratégie de sauvegarde.
+              Ajouter une copie chiffrée hors machine, une politique de rétention et des tests de
+              restauration réguliers.
+            </p>
+          </div>
+        </section>
+
+        <section class="section" id="donnees-app">
+          <div class="section-heading">
+            <span class="section-number">16 / APP</span>
+            <h2>Gérer les uploads et l’administration initiale</h2>
+          </div>
+          <p class="section-intro">
+            Les médias sont stockés dans le volume Docker <code>api-uploads</code>, tandis que les
+            comptes et configurations fonctionnelles résident dans PostgreSQL natif.
+          </p>
+
+          <h3>Cycle de vie des médias</h3>
+          <div class="flow-line" aria-label="Flux d'un fichier uploadé">
+            <span class="flow-node">Client HTTPS</span>
+            <span>→</span>
+            <span class="flow-node">Caddy /uploads</span>
+            <span>→</span>
+            <span class="flow-node">API /app/uploads</span>
+            <span>→</span>
+            <span class="flow-node strong">api-uploads</span>
+          </div>
+
+          <ul class="checklist">
+            <li><code>UPLOAD_STORAGE=local</code> et <code>UPLOAD_LOCAL_DIR=uploads</code> restent configurés dans l’API.</li>
+            <li><code>PUBLIC_BASE_URL=https://DOMAIN</code> permet de générer des URLs publiques correctes.</li>
+            <li>Le volume <code>api-uploads</code> doit être sauvegardé avant toute suppression ou recréation destructive.</li>
+            <li>Les routes <code>/uploads/*</code> doivent continuer à être transmises par Caddy à l’API.</li>
+          </ul>
+
+          <h3>Créer ou sécuriser le super-administrateur</h3>
+          <p>
+            Ce seed dédié ne crée aucune donnée de démonstration. Il crée le super-administrateur ou
+            met à jour celui qui possède déjà le même email ou téléphone.
+          </p>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · saisie sans historique</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Web
+
+read -r -p "Nom complet : " PROCOLIS_SUPERADMIN_FULL_NAME
+read -r -p "Email : " PROCOLIS_SUPERADMIN_EMAIL
+read -r -p "Téléphone international (+221...) : " PROCOLIS_SUPERADMIN_PHONE
+read -r -s -p "PIN sécurisé à 6 chiffres : " PROCOLIS_SUPERADMIN_PIN &amp;&amp; echo
+read -r -s -p "Mot de passe (12 caractères minimum) : " PROCOLIS_SUPERADMIN_PASSWORD &amp;&amp; echo
+
+docker compose exec \
+  -e PROCOLIS_SUPERADMIN_FULL_NAME="$PROCOLIS_SUPERADMIN_FULL_NAME" \
+  -e PROCOLIS_SUPERADMIN_EMAIL="$PROCOLIS_SUPERADMIN_EMAIL" \
+  -e PROCOLIS_SUPERADMIN_PHONE="$PROCOLIS_SUPERADMIN_PHONE" \
+  -e PROCOLIS_SUPERADMIN_PIN="$PROCOLIS_SUPERADMIN_PIN" \
+  -e PROCOLIS_SUPERADMIN_PASSWORD="$PROCOLIS_SUPERADMIN_PASSWORD" \
+  api npm run seed:super-admin
+
+unset \
+  PROCOLIS_SUPERADMIN_FULL_NAME \
+  PROCOLIS_SUPERADMIN_EMAIL \
+  PROCOLIS_SUPERADMIN_PHONE \
+  PROCOLIS_SUPERADMIN_PIN \
+  PROCOLIS_SUPERADMIN_PASSWORD</code></pre>
+          </div>
+
+          <div class="callout success">
+            <span class="callout-icon" aria-hidden="true">✓</span>
+            <p>
+              Le script refuse les PIN courants comme <code>123456</code>, n’affiche pas les secrets et
+              ne transforme pas automatiquement un compte d’un autre rôle en super-administrateur.
+            </p>
+          </div>
+
+          <h3>Données de démonstration</h3>
+          <div class="callout danger">
+            <span class="callout-icon" aria-hidden="true">!</span>
+            <p>
+              <strong>Ne jamais exécuter <code>prisma/seed.js</code> sur une vraie production.</strong>
+              Il crée des comptes de démonstration utilisant notamment le PIN <code>123456</code>.
+            </p>
+          </div>
+
+          <h3>Callbacks PayDunya</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Usage</th><th>URL publique</th><th>Traitement</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>IPN pay-in</td>
+                  <td><code>https://DOMAIN/payment-status.php</code></td>
+                  <td>Le POST est réécrit par Caddy vers l’API</td>
+                </tr>
+                <tr>
+                  <td>Retour navigateur</td>
+                  <td><code>https://DOMAIN/payment-status.php</code></td>
+                  <td>Le GET est servi par la SPA</td>
+                </tr>
+                <tr>
+                  <td>Callback décaissement</td>
+                  <td><code>https://DOMAIN/api/v1/payments/paydunya/disburse-callback</code></td>
+                  <td>Construit depuis <code>PUBLIC_BASE_URL</code></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="section" id="rollback">
+          <div class="section-heading">
+            <span class="section-number">17 / REPLI</span>
+            <h2>Retour arrière contrôlé</h2>
+          </div>
+          <p class="section-intro">
+            Le rollback direct est autorisé uniquement tant qu’aucune nouvelle écriture de production
+            n’a été acceptée par la base native.
+          </p>
+
+          <div class="two-column">
+            <article class="panel">
+              <h3>Ancienne stack unifiée Web</h3>
+              <p>Utiliser ce chemin si le service PostgreSQL appartenait au Compose du dépôt Web.</p>
+              <div class="command-block">
+                <div class="command-label"><span>Shell · restauration Compose Web</span></div>
+                <pre><code>cd ~/procolis/SendProColis-Web
+docker compose stop caddy api
+
+cp -a \
+  "$BACKUP_DIR/docker-compose.yml.before-native-postgres" \
+  docker-compose.yml
+cp -a \
+  "$BACKUP_DIR/env.before-native-postgres" \
+  .env
+
+docker compose config -q
+docker compose up -d --build --force-recreate</code></pre>
+              </div>
+            </article>
+
+            <article class="panel">
+              <h3>Ancienne stack API autonome</h3>
+              <p>Utiliser ce chemin si la source était <code>procolis-node-postgres</code>.</p>
+              <div class="command-block">
+                <div class="command-label"><span>Shell · restauration Compose API</span></div>
+                <pre><code>cd ~/procolis/SendProColis-Web
+docker compose stop caddy api
+
+cd ~/procolis/SendProColis-Api
+cp -a \
+  "$BACKUP_DIR/api-compose.before-native-postgres.yml" \
+  docker-compose.yml
+cp -a \
+  "$BACKUP_DIR/api-env.before-native-postgres" \
+  .env
+
+docker compose config -q
+docker compose up -d --build --force-recreate</code></pre>
+              </div>
+            </article>
+          </div>
+
+          <div class="callout danger">
+            <span class="callout-icon" aria-hidden="true">!</span>
+            <p>
+              Après la reprise des écritures sur PostgreSQL natif, revenir au volume Docker ferait
+              perdre ces nouvelles données. Dans ce cas, préparer une migration inverse à partir d’un
+              nouveau dump ; ne pas exécuter le bloc ci-dessus.
+            </p>
+          </div>
+
+          <p>
+            Conserver le conteneur source arrêté, le volume <code>postgres-data</code> et le dump final
+            pendant la période de validation. Ne jamais lancer <code>docker compose down -v</code>
+            pendant cette période.
+          </p>
+        </section>
+
+        <section class="section" id="incidents">
+          <div class="section-heading">
+            <span class="section-number">18 / AIDE</span>
+            <h2>Incidents connus</h2>
+          </div>
+          <p class="section-intro">
+            Commencer par identifier la couche en défaut : DNS/TLS, Caddy, conteneur API, socket Unix,
+            authentification PostgreSQL ou données persistantes.
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Symptôme</th><th>Cause probable</th><th>Action</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Certificat TLS non émis</td>
+                  <td>DNS non propagé ou ports 80/443 filtrés</td>
+                  <td><code>dig +short DOMAIN</code>, <code>sudo ufw status</code>, puis logs Caddy</td>
+                </tr>
+                <tr>
+                  <td>Le front charge, mais les appels API échouent</td>
+                  <td><code>DOMAIN</code> changé sans rebuild Vite</td>
+                  <td><code>docker compose up -d --build --force-recreate caddy</code></td>
+                </tr>
+                <tr>
+                  <td>Le site reste sur l’ancienne version</td>
+                  <td>Images construites sans recréer les conteneurs</td>
+                  <td>Relancer avec <code>--build --force-recreate</code>, puis rechargement navigateur forcé</td>
+                </tr>
+                <tr>
+                  <td>Images ou audios cassés</td>
+                  <td><code>PUBLIC_BASE_URL</code> incorrect ou volume non monté</td>
+                  <td>Contrôler l’URL, <code>/app/uploads</code> et le volume <code>api-uploads</code></td>
+                </tr>
+                <tr>
+                  <td>API redémarre en boucle</td>
+                  <td>Migration Prisma, socket ou <code>DATABASE_URL</code></td>
+                  <td>Logs API, présence du socket, règles HBA et état de PostgreSQL</td>
+                </tr>
+                <tr>
+                  <td>502 Bad Gateway</td>
+                  <td>API absente du réseau Compose ou pas encore prête</td>
+                  <td><code>docker compose ps</code> puis <code>docker compose logs api caddy</code></td>
+                </tr>
+                <tr>
+                  <td>Connexion PostgreSQL refusée</td>
+                  <td>Service arrêté, socket absent ou règle SCRAM non chargée</td>
+                  <td><code>pg_isready</code>, <code>pg_hba_file_rules</code> et journal systemd</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="two-column">
+            <article class="panel">
+              <div class="eyebrow">Compose</div>
+              <h3>Service postgres indéfini</h3>
+              <p><code>api depends on undefined service "postgres"</code></p>
+              <p>
+                Le service a été supprimé, mais <code>api.depends_on.postgres</code> existe encore.
+                Supprimer tout le bloc <code>depends_on</code>, puis relancer :
+              </p>
+              <div class="command-block">
+                <div class="command-label"><span>Shell</span></div>
+                <pre><code>docker compose config -q</code></pre>
+              </div>
+            </article>
+
+            <article class="panel">
+              <div class="eyebrow">Restauration</div>
+              <h3>Permission denied sur le dump</h3>
+              <p><code>pg_restore: could not open input file: Permission denied</code></p>
+              <p>
+                L’utilisateur <code>postgres</code> ne peut pas traverser le dossier en mode
+                <code>700</code>. Ne pas relâcher les permissions : transmettre le dump sur stdin.
+              </p>
+              <div class="command-block">
+                <div class="command-label"><span>Shell · principe</span></div>
+                <pre><code>sudo -u postgres pg_restore \
+  --dbname=procolis \
+  &lt; "$FINAL_BACKUP"</code></pre>
+              </div>
+            </article>
+          </div>
+
+          <h3>Diagnostic de connexion API</h3>
+          <div class="command-block">
+            <div class="command-label"><span>Shell</span></div>
+            <pre><code>cd ~/procolis/SendProColis-Web
+
+docker compose ps
+docker compose logs --tail=200 caddy api
+
+docker compose exec api ls -la /var/run/postgresql
+
+pg_isready -h /var/run/postgresql -p 5432
+
+sudo -u postgres psql -x -c "
+SELECT line_number, type, database, user_name, address, auth_method, error
+FROM pg_hba_file_rules;
+"
+
+sudo journalctl -u postgresql@16-main -n 150 --no-pager</code></pre>
+          </div>
+
+          <h3>Vérifier les variables sans afficher les secrets</h3>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · présence uniquement</span></div>
+            <pre><code>docker compose exec api node --input-type=module -e '
+const required = [
+  "DATABASE_URL",
+  "JWT_ACCESS_SECRET",
+  "JWT_REFRESH_SECRET",
+  "PUBLIC_BASE_URL",
+  "CORS_ORIGIN"
+];
+for (const name of required) {
+  console.log(`${name}: ${process.env[name] ? "définie" : "MANQUANTE"}`);
+}
+'</code></pre>
+          </div>
+        </section>
+
+        <footer class="footer">
+          <p>
+            PRO COLIS · Guide d’infrastructure · Debian, Docker, Caddy, Prisma et PostgreSQL 16 natif ·
+            Les secrets, dumps et fichiers <code>.env</code> ne doivent jamais être ajoutés au dépôt Git.
+          </p>
+        </footer>
+      </main>
+    </div>
+
+    <script>
+      /*
+       * Ajoute une copie presse-papiers progressive aux blocs de commandes.
+       * Le guide reste entièrement lisible et exploitable lorsque JavaScript est désactivé.
+       */
+      if (navigator.clipboard) {
+        document.querySelectorAll(".command-block").forEach((block) => {
+          const label = block.querySelector(".command-label");
+          const code = block.querySelector("pre code");
+
+          if (!label || !code) return;
+
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "copy-button";
+          button.textContent = "Copier";
+          button.setAttribute("aria-label", "Copier la commande");
+
+          button.addEventListener("click", async () => {
+            await navigator.clipboard.writeText(code.textContent);
+            button.textContent = "Copié";
+            button.classList.add("copied");
+
+            window.setTimeout(() => {
+              button.textContent = "Copier";
+              button.classList.remove("copied");
+            }, 1600);
+          });
+
+          label.appendChild(button);
+        });
+      }
+
+      /*
+       * Signale la section courante dans la sidebar. L'observateur est purement
+       * progressif : les liens et ancres continuent à fonctionner sans JavaScript.
+       */
+      if ("IntersectionObserver" in window) {
+        const navLinks = new Map(
+          [...document.querySelectorAll('.sidebar nav a[href^="#"]')].map((link) => [
+            link.getAttribute("href").slice(1),
+            link
+          ])
+        );
+
+        const sectionObserver = new IntersectionObserver(
+          (entries) => {
+            const visible = entries
+              .filter((entry) => entry.isIntersecting)
+              .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+
+            if (!visible) return;
+
+            navLinks.forEach((link) => {
+              link.classList.remove("active");
+              link.removeAttribute("aria-current");
+            });
+
+            const activeLink = navLinks.get(visible.target.id);
+            if (activeLink) {
+              activeLink.classList.add("active");
+              activeLink.setAttribute("aria-current", "location");
+            }
+          },
+          { rootMargin: "-12% 0px -72% 0px", threshold: [0, 0.1, 0.35] }
+        );
+
+        document.querySelectorAll("main section[id]").forEach((section) => {
+          sectionObserver.observe(section);
+        });
+      }
+    </script>
+  </body>
+</html>
