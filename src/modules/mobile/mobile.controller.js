@@ -3419,12 +3419,15 @@ export const garageStats = handle('garage.stats', async (req, res) => {
 
 async function globalStats() {
   const startOfDay = new Date(new Date().toDateString());
-  const [totalUsers, totalDrivers, totalClients, totalGarages, totalVehicles, totalParcels, parcelsInTransit, parcelsDeliveredToday, parcelsPending, totalRevenue] =
+  const [totalUsers, totalDrivers, totalClients, totalGarages, totalZones, totalVehicles, totalParcels, parcelsInTransit, parcelsDeliveredToday, parcelsPending, totalRevenue] =
     await Promise.all([
       prisma.user.count({ where: { status: { not: 'deleted' } } }),
       prisma.user.count({ where: { role: 'driver', status: 'active' } }),
       prisma.user.count({ where: { role: 'client', status: 'active' } }),
       prisma.garage.count({ where: { deletedAt: null } }),
+      // Le référentiel de lieux est désormais `zones` ; `totalGarages` compte
+      // encore la table héritée et reste exposé pour l'app mobile.
+      prisma.zone.count(),
       prisma.vehicle.count({ where: { deletedAt: null } }),
       prisma.parcel.count({ where: { deletedAt: null } }),
       prisma.parcel.count({ where: { status: 'in_transit' } }),
@@ -3437,6 +3440,7 @@ async function globalStats() {
     totalDrivers,
     totalClients,
     totalGarages,
+    totalZones,
     totalVehicles,
     totalParcels,
     parcelsInTransit,
