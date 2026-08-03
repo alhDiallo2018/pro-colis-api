@@ -6,6 +6,9 @@ coverage/
 dist/
 uploads/*
 !uploads/.gitkeep
+# Dumps PostgreSQL : contenu integral de la base, jamais versionne.
+backups/*
+!backups/.gitkeep
 npm-debug.log*
 .DS_Store
 *.json

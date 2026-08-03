@@ -2,6 +2,59 @@ import { ok, fail } from '../../utils/api-response.js';
 import { serializeUser } from '../../utils/mobile-serializers.js';
 import * as authService from './auth.service.js';
 import { sendOtpSms, sendOtpEmail, isBrevoConfigured } from '../../utils/brevo.js';
+import { env } from '../../config/env.js';
+
+/**
+ * Decide ce que la reponse dit d'un code a usage unique.
+ *
+ * Sans Brevo, le code ne part par aucun canal : le renvoyer dans le corps de la
+ * reponse est le seul moyen de travailler en local. En production, c'est une
+ * prise de controle de compte a distance — n'importe qui demande un code pour
+ * le numero d'autrui et le recoit dans la reponse HTTP, sans jamais acceder au
+ * telephone vise. Le repli reste donc strictement hors production.
+ *
+ * En production sans Brevo, le code est bien genere mais ne peut atteindre
+ * personne : c'est une panne de configuration, pas un succes. On repond 503
+ * plutot que de simuler un envoi, ce qui laisserait l'utilisateur devant un
+ * ecran de saisie qu'aucun code ne viendra remplir.
+ */
+function otpDelivery({ code, sentMessage, log, action }) {
+  if (isBrevoConfigured()) {
+    return { delivered: true, message: sentMessage, data: { sent: true } };
+  }
+
+  if (env.NODE_ENV === 'production') {
+    log?.error(
+      { action, brevoConfigured: false },
+      'Brevo non configure en production : aucun code OTP ne peut etre livre'
+    );
+    return {
+      delivered: false,
+      status: 503,
+      message: 'Envoi du code impossible pour le moment',
+      code: 'OTP_DELIVERY_UNAVAILABLE'
+    };
+  }
+
+  return {
+    delivered: true,
+    message: `Code genere (Brevo non configure) : ${code}`,
+    data: { code }
+  };
+}
+
+/** Applique la decision de `otpDelivery` a la reponse Express. */
+function respondOtp(res, delivery) {
+  if (!delivery.delivered) {
+    return fail(res, {
+      status: delivery.status,
+      message: delivery.message,
+      code: delivery.code,
+      details: []
+    });
+  }
+  return ok(res, { message: delivery.message, data: delivery.data });
+}
 
 export async function register(req, res) {
   try {
@@ -107,12 +160,15 @@ export async function sendOtp(req, res) {
       }
     }
 
-    return ok(res, {
-      message: isBrevoConfigured()
-        ? 'Code envoye'
-        : `Code genere (Brevo non configure) : ${code}`,
-      data: isBrevoConfigured() ? { sent: true } : { code }
-    });
+    return respondOtp(
+      res,
+      otpDelivery({
+        code,
+        sentMessage: 'Code envoye',
+        log: req.log,
+        action: 'auth.sendOtp'
+      })
+    );
   } catch (error) {
     req.log.error(
       { error, action: 'auth.sendOtp', requestId: req.requestId },
@@ -164,12 +220,15 @@ export async function forgotPassword(req, res) {
       }
     }
 
-    return ok(res, {
-      message: isBrevoConfigured()
-        ? 'Code de reinitialisation envoye'
-        : `Code genere (Brevo non configure) : ${code}`,
-      data: isBrevoConfigured() ? { sent: true } : { code }
-    });
+    return respondOtp(
+      res,
+      otpDelivery({
+        code,
+        sentMessage: 'Code de reinitialisation envoye',
+        log: req.log,
+        action: 'auth.forgotPassword'
+      })
+    );
   } catch (error) {
     req.log.error(
       { error, action: 'auth.forgotPassword', requestId: req.requestId, identifier: req.validated?.body?.identifier },
@@ -186,11 +245,11 @@ export async function forgotPassword(req, res) {
 
 export async function resetPassword(req, res) {
   try {
-    const { identifier, otpCode, newPassword } = req.validated.body;
-    const result = await authService.resetPassword({ identifier, otpCode, newPassword });
+    const { identifier, otpCode, newPassword, newPin } = req.validated.body;
+    const result = await authService.resetPassword({ identifier, otpCode, newPassword, newPin });
 
     return ok(res, {
-      message: 'Mot de passe reinitialise',
+      message: result.pinReset ? 'Code PIN reinitialise' : 'Mot de passe reinitialise',
       data: result
     });
   } catch (error) {
@@ -271,12 +330,15 @@ export async function resendVerification(req, res) {
       }
     }
 
-    return ok(res, {
-      message: isBrevoConfigured()
-        ? 'Code de verification renvoye'
-        : `Code genere (Brevo non configure) : ${code}`,
-      data: isBrevoConfigured() ? { sent: true } : { code }
-    });
+    return respondOtp(
+      res,
+      otpDelivery({
+        code,
+        sentMessage: 'Code de verification renvoye',
+        log: req.log,
+        action: 'auth.resendVerification'
+      })
+    );
   } catch (error) {
     req.log.error(
       { error, action: 'auth.resendVerification', requestId: req.requestId, identifier: req.validated?.body?.identifier },

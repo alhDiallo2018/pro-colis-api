@@ -737,6 +737,13 @@ async function seedProfileUsage({ customer, driver, garages }) {
 
 async function seedScoreConfigs() {
   const configs = [
+    // Bareme d'estimation, lu par `estimateParcel`. Seme explicitement pour que
+    // l'ecran de configuration affiche des valeurs reelles plutot que les
+    // defauts implicites du controleur.
+    { key: 'pricing.baseFee', value: 1000 },
+    { key: 'pricing.pricePerKg', value: 500 },
+    { key: 'pricing.urgentFee', value: 1000 },
+    { key: 'pricing.insuranceFee', value: 1000 },
     { key: 'score.cfaPerPoint', value: 1 },
     { key: 'score.deliveryCompleted', value: 120 },
     { key: 'score.commitmentFee', value: 1 },

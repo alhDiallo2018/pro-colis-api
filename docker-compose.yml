@@ -15,6 +15,9 @@ services:
         condition: service_healthy
     volumes:
       - ./uploads:/app/uploads
+      # Les dumps doivent survivre au conteneur : sans ce montage, chaque
+      # redéploiement effacerait l'historique des sauvegardes.
+      - ./backups:/app/backups
     networks: [default, observability]
     logging:
       driver: local

@@ -23,6 +23,12 @@ export async function authenticate(req, _res, next) {
           where: { deletedAt: null },
           orderBy: { createdAt: 'desc' },
           take: 1
+        },
+        // Zone de rattachement (referentiel courant) : sans elle les ecrans
+        // « Ma zone » des deux clients croient l'utilisateur non rattache.
+        driverZones: {
+          include: { zone: { select: { id: true, name: true, displayName: true } } },
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }]
         }
       }
     });

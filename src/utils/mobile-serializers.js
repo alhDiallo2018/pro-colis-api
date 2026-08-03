@@ -41,6 +41,12 @@ export function serializeUser(user) {
   // absents plutot que faussement vides.
   const vehicle = Array.isArray(user.vehicles) ? user.vehicles[0] : user.vehicle;
 
+  // Meme regle pour la zone de rattachement, qui vit dans `zone_drivers` : sans
+  // include le champ reste absent plutot que de repondre "aucune zone". Le lien
+  // principal prime, sinon le premier rattachement.
+  const zoneLinks = Array.isArray(user.driverZones) ? user.driverZones : null;
+  const zoneLink = zoneLinks ? (zoneLinks.find((link) => link.isPrimary) ?? zoneLinks[0]) : null;
+
   return {
     id: user.id,
     email: user.email,
@@ -55,6 +61,8 @@ export function serializeUser(user) {
     gender: user.gender,
     garageId: user.garageId,
     garageName: user.garage?.name,
+    zoneId: zoneLinks ? (zoneLink?.zoneId ?? null) : undefined,
+    zoneName: zoneLink?.zone?.name,
     vehicleId: vehicle?.id,
     vehiclePlate: vehicle?.plateNumber,
     vehicleModel: vehicle?.model,
@@ -382,20 +390,30 @@ export function serializeAdvertisementOffer(offer) {
   };
 }
 
-export function serializeAuditLog(log) {
+/**
+ * `detailed` gouverne l'exposition des instantanes avant/apres, qui contiennent
+ * des valeurs metier completes. Sans lui, la ligne dit qui a fait quoi, quand
+ * et depuis ou, mais pas ce qui a change dans le detail.
+ */
+export function serializeAuditLog(log, { detailed = true } = {}) {
   if (!log) return null;
   return {
     id: log.id,
     actorId: log.actorId,
     actorRole: log.actorRole,
+    actor: log.actor
+      ? { id: log.actor.id, fullName: log.actor.fullName, phone: log.actor.phone, role: log.actor.role }
+      : null,
     action: log.action,
     entityType: log.entityType,
     entityId: log.entityId,
-    beforeData: log.beforeData,
-    afterData: log.afterData,
+    beforeData: detailed ? log.beforeData : undefined,
+    afterData: detailed ? log.afterData : undefined,
+    hasChangeSnapshot: Boolean(log.beforeData || log.afterData),
     ipAddress: log.ipAddress,
     userAgent: log.userAgent,
     requestId: log.requestId,
+    redacted: !detailed,
     createdAt: dateToIso(log.createdAt)
   };
 }

@@ -2,12 +2,20 @@ import { prisma } from '../../config/prisma.js';
 import { fail, ok } from '../../utils/api-response.js';
 import { normalizeError } from '../../utils/errors.js';
 import {
+  OBSERVABILITY_FULL_ACCESS_ROLES,
   exportLogs,
   getLogs,
   getServices,
   getSummary,
-  parseObservabilityQuery
+  parseObservabilityQuery,
+  redactEntriesForSupport
 } from './observability.service.js';
+
+// Le niveau de detail depend du role, pas de la route : ajouter un role dans le
+// routeur ne doit jamais exposer les stacks par inadvertance.
+function hasFullAccess(req) {
+  return OBSERVABILITY_FULL_ACCESS_ROLES.includes(req.user?.role);
+}
 
 function handleControllerError(req, res, error, action) {
   const normalized = normalizeError(error);
@@ -49,7 +57,8 @@ export async function list(req, res) {
   try {
     const filters = parseObservabilityQuery(req.query);
     const result = await getLogs(filters);
-    return ok(res, { message: 'Journaux techniques', data: result });
+    const logs = hasFullAccess(req) ? result.logs : redactEntriesForSupport(result.logs);
+    return ok(res, { message: 'Journaux techniques', data: { ...result, logs } });
   } catch (error) {
     return handleControllerError(req, res, error, 'observability.list');
   }
@@ -66,6 +75,17 @@ export async function services(req, res) {
 
 export async function exportEntries(req, res) {
   try {
+    // Second verrou apres le garde de route : un export contient les stacks
+    // completes et ne doit jamais sortir vers un role restreint.
+    if (!hasFullAccess(req)) {
+      return fail(res, {
+        status: 403,
+        message: 'Export reserve au super administrateur',
+        code: 'FORBIDDEN',
+        details: []
+      });
+    }
+
     const filters = parseObservabilityQuery(req.query, { exportMode: true });
     const exported = await exportLogs(filters);
 

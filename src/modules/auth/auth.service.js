@@ -19,6 +19,12 @@ const USER_INCLUDE = {
     where: { deletedAt: null },
     orderBy: { createdAt: 'desc' },
     take: 1
+  },
+  // Zone de rattachement : la reponse de connexion alimente directement la
+  // session des clients, qui s'en servent pour l'ecran « Ma zone ».
+  driverZones: {
+    include: { zone: { select: { id: true, name: true, displayName: true } } },
+    orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }]
   }
 };
 
@@ -272,7 +278,7 @@ export async function forgotPassword({ identifier }) {
   return { code, phone: user.phone, email: user.email };
 }
 
-export async function resetPassword({ identifier, otpCode, newPassword }) {
+export async function resetPassword({ identifier, otpCode, newPassword, newPin }) {
   const type = `reset-password:${identifier}`;
 
   const record = await prisma.otpCode.findFirst({
@@ -298,20 +304,28 @@ export async function resetPassword({ identifier, otpCode, newPassword }) {
     throw new NotFoundError('Utilisateur introuvable');
   }
 
-  const passwordHash = await bcrypt.hash(newPassword, 12);
+  // Le PIN est la seule identification utilisee a la connexion : le
+  // reinitialiser est le cas nominal, le mot de passe restant possible pour les
+  // integrations qui s'en servent encore.
+  const data = {};
+  if (newPassword) data.passwordHash = await bcrypt.hash(newPassword, 12);
+  if (newPin) data.pinHash = await bcrypt.hash(newPin, 12);
 
   await prisma.$transaction([
-    prisma.user.update({
-      where: { id: user.id },
-      data: { passwordHash }
-    }),
+    prisma.user.update({ where: { id: user.id }, data }),
     prisma.otpCode.update({
       where: { id: record.id },
       data: { isUsed: true }
+    }),
+    // Une reinitialisation revoque les sessions ouvertes : sans cela, un appareil
+    // deja connecte survivrait a la reprise de controle du compte.
+    prisma.refreshToken.updateMany({
+      where: { userId: user.id, revokedAt: null },
+      data: { revokedAt: new Date() }
     })
   ]);
 
-  return { reset: true };
+  return { reset: true, pinReset: Boolean(newPin), passwordReset: Boolean(newPassword) };
 }
 
 export async function changePassword({ userId, currentPassword, newPassword }) {

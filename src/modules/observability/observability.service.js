@@ -11,6 +11,10 @@ const MAX_EXPORT_RANGE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RANGE_MS = 60 * 60 * 1000;
 
 export const OBSERVABILITY_SOURCES = ['api', 'postgres', 'caddy', 'frontend', 'docker'];
+
+// Roles autorises a lire les journaux techniques sans restriction. Tout autre
+// role passe par `redactEntryForSupport`.
+export const OBSERVABILITY_FULL_ACCESS_ROLES = ['super_admin'];
 export const OBSERVABILITY_LEVELS = [
   'debug',
   'info',
@@ -312,6 +316,31 @@ async function queryLogs(filters, limit) {
     limit: filters.cursor ? Math.min(limit + 50, 10_000) : limit
   });
   return normalizeLokiStreams(payload).filter((entry) => entryPrecedesCursor(entry, filters.cursor));
+}
+
+/**
+ * Vue restreinte destinee au support technique. Le support doit pouvoir
+ * qualifier un incident (quoi, quand, ou, quelle requete) sans lire le detail
+ * d'implementation : la stack, le contexte libre du logger et l'identifiant de
+ * l'utilisateur concerne sont retires. La redaction s'applique apres la
+ * pagination pour ne pas invalider le curseur, qui est calcule sur l'entree
+ * complete.
+ */
+export function redactEntryForSupport(entry) {
+  const { error, context, userId, ...visible } = entry;
+  void context;
+  void userId;
+  return {
+    ...visible,
+    // Le type et le code d'erreur restent des informations de triage ; le
+    // message et la stack peuvent, eux, transporter du contexte metier.
+    error: error ? { name: error.name, code: error.code } : undefined,
+    redacted: true
+  };
+}
+
+export function redactEntriesForSupport(entries) {
+  return entries.map(redactEntryForSupport);
 }
 
 export async function getLogs(filters) {

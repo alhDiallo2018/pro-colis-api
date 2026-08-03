@@ -8,7 +8,17 @@ export const zoneRouter = Router();
 const superAdmin = [authenticate, requireRoles('super_admin', 'support')];
 
 zoneRouter.get('/public/zones', optionalAuthenticate, zoneController.listPublicZones);
+// Déclarée ici plutôt que dans le module mobile : la résolution zone / garage
+// miroir vit avec le référentiel. Le routeur zone étant monté avant le routeur
+// mobile, ce chemin passe avant `/public/drivers/:driverId`.
+zoneRouter.get('/public/drivers/zone/:zoneId', optionalAuthenticate, zoneController.zonePublicDrivers);
 zoneRouter.get('/zones/detect', optionalAuthenticate, zoneController.detectZones);
+
+// Favoris exprimés en zones. `/favorites/garages` (module mobile) reste servi
+// pour les clients publiés avant la migration.
+zoneRouter.get('/favorites/zones', authenticate, zoneController.listFavoriteZones);
+zoneRouter.post('/favorites/zones/:zoneId', authenticate, zoneController.addFavoriteZone);
+zoneRouter.delete('/favorites/zones/:zoneId', authenticate, zoneController.removeFavoriteZone);
 // Résolution d'un lieu Google Places → zone (création à la volée en "pending").
 zoneRouter.post('/zones/resolve', authenticate, zoneController.resolveZone);
 

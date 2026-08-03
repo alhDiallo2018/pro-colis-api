@@ -74,12 +74,21 @@ export const forgotPasswordSchema = z.object({
   query: z.object({}).default({})
 });
 
+// La connexion des deux clients se fait au code PIN : une reinitialisation qui
+// n'ecrirait que `passwordHash` laisserait l'utilisateur toujours dehors. On
+// accepte donc `newPin`, `newPassword`, ou les deux — mais pas aucun des deux.
 export const resetPasswordSchema = z.object({
-  body: z.object({
-    identifier: z.string().min(3),
-    otpCode: z.string().min(4).max(10),
-    newPassword: z.string().min(8)
-  }),
+  body: z
+    .object({
+      identifier: z.string().min(3),
+      otpCode: z.string().min(4).max(10),
+      newPassword: z.string().min(8).optional(),
+      newPin: pinSchema.optional()
+    })
+    .refine((data) => data.newPassword || data.newPin, {
+      path: ['newPin'],
+      message: 'Un nouveau code PIN ou un nouveau mot de passe est requis'
+    }),
   params: z.object({}).default({}),
   query: z.object({}).default({})
 });

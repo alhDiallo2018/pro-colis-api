@@ -3,6 +3,7 @@ import { env } from '../../config/env.js';
 import { ok, fail } from '../../utils/api-response.js';
 import { getPagination, paginationMeta } from '../../utils/pagination.js';
 import { NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
+import { serializeUser } from '../../utils/mobile-serializers.js';
 
 const DEFAULT_RADIUS_KM = 30;
 
@@ -800,4 +801,113 @@ export const migrateGarages = handle('zones.migrate', async (req, res) => {
     message: 'Migration des garages en zones terminee',
     data: { data: { created, skipped, total: garages.length } }
   });
+});
+
+// ============================================================
+// ZONES - Chauffeurs publics et favoris
+// ============================================================
+
+/**
+ * Resout un identifiant recu des fronts en zone + garage miroir.
+ *
+ * Les clients publies avant la migration envoient encore l'identifiant du
+ * garage miroir la ou le web envoie desormais celui de la zone : accepter les
+ * deux evite un 404 selon la version de l'appelant.
+ */
+async function resolveZoneRef(id) {
+  if (!id || !UUID_RE.test(id)) return { zone: null, garageId: null };
+
+  const zone = await prisma.zone.findUnique({ where: { id } });
+  if (zone) {
+    const metadata = zone.metadata && typeof zone.metadata === 'object' ? zone.metadata : {};
+    const linked =
+      (typeof metadata.garageId === 'string' && metadata.garageId) ||
+      (typeof metadata.migratedFromGarageId === 'string' && metadata.migratedFromGarageId) ||
+      (typeof zone.placeId === 'string' && zone.placeId.startsWith('garage:')
+        ? zone.placeId.slice('garage:'.length)
+        : null);
+    return { zone, garageId: linked && UUID_RE.test(linked) ? linked : null };
+  }
+
+  const garage = await prisma.garage.findFirst({ where: { id, deletedAt: null } });
+  if (!garage) return { zone: null, garageId: null };
+
+  const mirrored = await prisma.zone.findFirst({
+    where: {
+      OR: [
+        { metadata: { path: ['garageId'], equals: id } },
+        { metadata: { path: ['migratedFromGarageId'], equals: id } },
+        { placeId: `garage:${id}` }
+      ]
+    }
+  });
+
+  return { zone: mirrored, garageId: id };
+}
+
+/**
+ * GET /public/drivers/zone/:zoneId — chauffeurs actifs d'une zone.
+ *
+ * Deux rattachements coexistent pendant la migration : la table `zone_drivers`
+ * (referentiel courant) et la colonne heritee `users.garage_id` pointant sur le
+ * garage miroir. On renvoie l'union des deux, dedoublonnee.
+ */
+export const zonePublicDrivers = handle('zones.publicDrivers', async (req, res) => {
+  const { zone, garageId } = await resolveZoneRef(req.params.zoneId);
+  if (!zone && !garageId) throw new NotFoundError('Zone introuvable');
+
+  const filters = [];
+  if (zone) filters.push({ driverZones: { some: { zoneId: zone.id } } });
+  if (garageId) filters.push({ garageId });
+
+  const drivers = await prisma.user.findMany({
+    where: { role: 'driver', status: 'active', OR: filters },
+    include: {
+      garage: true,
+      vehicles: { where: { deletedAt: null }, orderBy: { createdAt: 'desc' }, take: 1 }
+    },
+    orderBy: { fullName: 'asc' }
+  });
+
+  return ok(res, {
+    message: 'Chauffeurs de la zone',
+    data: { drivers: drivers.map(serializeUser) }
+  });
+});
+
+export const listFavoriteZones = handle('zones.favorites.list', async (req, res) => {
+  const favorites = await prisma.favoriteZone.findMany({
+    where: { userId: req.user.id },
+    include: { zone: { include: { _count: { select: { driverZones: true } } } } },
+    orderBy: { createdAt: 'desc' }
+  });
+
+  return ok(res, {
+    message: 'Zones favorites',
+    data: { zones: favorites.map((favorite) => serializeZone(favorite.zone)) }
+  });
+});
+
+export const addFavoriteZone = handle('zones.favorites.add', async (req, res) => {
+  const { zone } = await resolveZoneRef(req.params.zoneId);
+  if (!zone) throw new NotFoundError('Zone introuvable');
+
+  await prisma.favoriteZone.upsert({
+    where: { userId_zoneId: { userId: req.user.id, zoneId: zone.id } },
+    update: {},
+    create: { userId: req.user.id, zoneId: zone.id }
+  });
+
+  return ok(res, { message: 'Zone ajoutee aux favoris', data: { zone: serializeZone(zone) } });
+});
+
+export const removeFavoriteZone = handle('zones.favorites.remove', async (req, res) => {
+  // Suppression idempotente : on accepte aussi bien l'identifiant de la zone que
+  // celui du garage miroir, et un favori deja retire ne remonte pas d'erreur.
+  const { zone } = await resolveZoneRef(req.params.zoneId);
+  const zoneId = zone?.id ?? req.params.zoneId;
+
+  await prisma.favoriteZone.deleteMany({ where: { userId: req.user.id, zoneId } });
+
+  return ok(res, { message: 'Zone retiree des favoris' });
 });

@@ -94,8 +94,16 @@ LogQL libre. L'API construit elle-meme les requetes a partir de filtres valides.
 
 ## API super-admin
 
-Toutes les routes sont reservees exclusivement au role `super_admin`. Un role
-`support`, `admin`, `driver` ou `client` recoit `403 FORBIDDEN`.
+Les routes de consultation (`summary`, `logs`, `services`) sont ouvertes aux
+roles `super_admin` et `support_technique`. L'export reste reserve
+exclusivement au `super_admin`. Un role `support`, `support_commercial`,
+`admin`, `driver` ou `client` recoit `403 FORBIDDEN`.
+
+Le `support_technique` recoit une **vue reduite** : chaque entree est renvoyee
+sans `error.message`, sans `error.stack`, sans `context` et sans `userId`, et
+porte `redacted: true`. Seuls le type et le code d'erreur sont conserves pour
+le triage. La redaction est appliquee par le controleur d'apres le role, apres
+la pagination, afin de ne pas invalider le curseur.
 
 ### Resume
 
@@ -197,8 +205,33 @@ La page super-admin « Observabilite » doit afficher :
 - export CSV et JSONL ;
 - etats chargement, vide, erreur et observabilite indisponible.
 
+L'ecran est partage avec l'espace support technique, qui masque l'export et
+affiche un bandeau expliquant que le detail technique est restreint des que le
+serveur renvoie `redacted: true`.
+
 Il n'existe ni selecteur de fichier `.log`, ni bouton « vider le fichier » :
 Loki gere des flux et la retention est automatique.
+
+## Contrat pour l'application mobile
+
+Le client Flutter (`/Volumes/Oracle/Mobile/ProColis`) consomme les memes routes
+via `lib/services/api/observability_api.dart` :
+
+- `lib/screens/super-admin/logs_screen.dart` — routes `/admin/logs` (super
+  admin) et `/support-tech/logs` (support technique) ;
+- `lib/screens/super-admin/audit_logs_screen.dart` — routes `/admin/audit` et
+  `/support-admin/audit`.
+
+Deux ecarts assumes avec le web :
+
+- **L'export n'est pas porte.** Il renvoie un fichier de 10 000 entrees avec les
+  stacks completes, destine a une analyse sur poste de travail.
+- **Pas d'actualisation automatique toutes les 30 secondes.** Le
+  rafraichissement est manuel, pour ne pas consommer batterie et donnees
+  mobiles en arriere-plan.
+
+Comme sur le web, le bandeau « vue restreinte » est pilote par le drapeau
+`redacted` renvoye par le serveur, jamais par le role lu cote client.
 
 ## Deploiement
 
@@ -220,7 +253,8 @@ Loki gere des flux et la retention est automatique.
   normale.
 - Aucun secret connu n'est present dans Loki, les exports ou les reponses API.
 - Les limites de periode, taille, pagination et timeout sont appliquees.
-- Seul `super_admin` peut consulter ou exporter les journaux.
+- Seuls `super_admin` et `support_technique` peuvent consulter les journaux, et
+  seul `super_admin` peut les exporter ou lire une stack trace.
 - La coupure de Loki ou Prometheus retourne un `503` propre et journalise.
 - Une alerte synthetique critique produit bien un email.
 - Les tests backend couvrent validation, RBAC, normalisation, redaction,

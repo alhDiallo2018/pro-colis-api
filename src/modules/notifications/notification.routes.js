@@ -17,8 +17,10 @@ notificationRouter.post('/email/send', requireRoles('admin', 'super_admin'), mes
 notificationRouter.post('/email/send-bulk', requireRoles('super_admin', 'support'), messagingController.sendBulkEmailMessage);
 notificationRouter.patch('/:notificationId/read', notificationController.markAsRead);
 notificationRouter.post('/read-all', notificationController.markAllAsRead);
-notificationRouter.delete('/:notificationId', notificationController.deleteNotification);
+// `/all` doit précéder `/:notificationId` : sinon Express capte le mot « all »
+// comme identifiant et la purge répond 404.
 notificationRouter.delete('/all', notificationController.deleteAllNotifications);
+notificationRouter.delete('/:notificationId', notificationController.deleteNotification);
 
 // Configuration Brevo — montee sous /admin/notifications (super admin uniquement).
 export const adminNotificationRouter = Router();

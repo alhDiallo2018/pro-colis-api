@@ -32,10 +32,15 @@ const exportRateLimit = rateLimit({
 
 export const observabilityRouter = Router();
 
-// Les traces et stacks peuvent contenir du contexte sensible : contrairement
-// aux autres ecrans de support, aucun role support n'est autorise ici.
-observabilityRouter.use(authenticate, requireRoles('super_admin'));
-observabilityRouter.get('/summary', consultationRateLimit, observabilityController.summary);
-observabilityRouter.get('/logs', consultationRateLimit, observabilityController.list);
-observabilityRouter.get('/services', consultationRateLimit, observabilityController.services);
-observabilityRouter.get('/export', exportRateLimit, observabilityController.exportEntries);
+// Les traces et stacks peuvent contenir du contexte sensible. Le support
+// technique lit les journaux pour qualifier un incident, mais le controleur ne
+// lui renvoie qu'une vue reduite (ni stack, ni contexte, ni userId) ; l'export,
+// qui contient les entrees completes, reste reserve au super administrateur.
+const readRoles = requireRoles('super_admin', 'support_technique');
+const exportRoles = requireRoles('super_admin');
+
+observabilityRouter.use(authenticate);
+observabilityRouter.get('/summary', readRoles, consultationRateLimit, observabilityController.summary);
+observabilityRouter.get('/logs', readRoles, consultationRateLimit, observabilityController.list);
+observabilityRouter.get('/services', readRoles, consultationRateLimit, observabilityController.services);
+observabilityRouter.get('/export', exportRoles, exportRateLimit, observabilityController.exportEntries);

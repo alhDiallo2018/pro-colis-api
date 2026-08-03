@@ -261,6 +261,7 @@ model User {
   identityVerifications   IdentityVerification[] @relation("IdentityOwner")
   reviewedIdentities      IdentityVerification[] @relation("IdentityReviewer")
   favoriteGarages         FavoriteGarage[]
+  favoriteZones           FavoriteZone[]
   addresses               Address[]
   sentMessages            Message[]              @relation("MessageSender")
   receivedMessages        Message[]              @relation("MessageReceiver")
@@ -901,6 +902,21 @@ model FavoriteGarage {
   @@map("favorite_garages")
 }
 
+/// Favoris exprimes dans le referentiel courant (zones). `favorite_garages`
+/// reste en place pour les clients publies avant la migration : les deux tables
+/// coexistent, la zone etant la source de verite.
+model FavoriteZone {
+  userId    String   @map("user_id") @db.Uuid
+  zoneId    String   @map("zone_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  zone      Zone     @relation(fields: [zoneId], references: [id], onDelete: Cascade)
+
+  @@id([userId, zoneId])
+  @@index([zoneId])
+  @@map("favorite_zones")
+}
+
 model Address {
   id        String   @id @default(uuid()) @db.Uuid
   userId    String   @map("user_id") @db.Uuid
@@ -931,6 +947,13 @@ model Message {
   readAt      DateTime? @map("read_at") @db.Timestamptz
   handledById String?   @map("handled_by") @db.Uuid
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  /// Renseigne a la premiere edition du texte par son auteur. Sert de marqueur
+  /// « modifie » cote client : la date de creation reste celle de l'envoi.
+  editedAt    DateTime? @map("edited_at") @db.Timestamptz
+  /// Suppression logique. Un message supprime disparait des fils et des
+  /// conversations mais reste en base, les notifications et les negociations
+  /// deja emises y faisant reference.
+  deletedAt   DateTime? @map("deleted_at") @db.Timestamptz
   sender      User      @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
   receiver    User      @relation("MessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
   handledBy   User?     @relation("MessageHandledBy", fields: [handledById], references: [id], onDelete: SetNull)
@@ -1070,6 +1093,7 @@ model Zone {
   parent      Zone?        @relation("ZoneHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
   children    Zone[]       @relation("ZoneHierarchy")
   driverZones ZoneDriver[]
+  favorites   FavoriteZone[]
 
   departureParcels        Parcel[]        @relation("ParcelDepartureZone")
   arrivalParcels          Parcel[]        @relation("ParcelArrivalZone")

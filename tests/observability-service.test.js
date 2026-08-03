@@ -6,7 +6,9 @@ import {
   getServices,
   normalizeLokiStreams,
   normalizeSeverity,
-  parseObservabilityQuery
+  parseObservabilityQuery,
+  redactEntriesForSupport,
+  redactEntryForSupport
 } from '../src/modules/observability/observability.service.js';
 import { sanitizeForLog } from '../src/config/logger.js';
 
@@ -195,5 +197,59 @@ describe('observability upstream clients', () => {
     });
     expect(exported.content).toContain("'=HYPERLINK");
     expect(exported.count).toBe(1);
+  });
+});
+
+describe('support redaction', () => {
+  const entry = {
+    id: 'entry-1',
+    timestamp: '2026-08-02T00:15:08.000Z',
+    severity: 'error',
+    source: 'api',
+    message: 'Unhandled API error',
+    requestId: 'req-1',
+    route: '/api/v1/parcels',
+    method: 'GET',
+    statusCode: 500,
+    durationMs: 42,
+    userId: 'a3f0c1e2-0000-4000-8000-000000000001',
+    error: { name: 'PrismaClientKnownRequestError', code: 'P2002', message: 'unique constraint', stack: 'at handler' },
+    context: { parcelId: 'p-1' }
+  };
+
+  it('keeps the triage fields a support agent needs', () => {
+    const redacted = redactEntryForSupport(entry);
+    expect(redacted).toMatchObject({
+      id: 'entry-1',
+      severity: 'error',
+      source: 'api',
+      message: 'Unhandled API error',
+      requestId: 'req-1',
+      route: '/api/v1/parcels',
+      statusCode: 500,
+      redacted: true
+    });
+    expect(redacted.error).toEqual({ name: 'PrismaClientKnownRequestError', code: 'P2002' });
+  });
+
+  it('drops the stack, the free-form context and the impacted user', () => {
+    const redacted = redactEntryForSupport(entry);
+    expect(redacted.error.stack).toBeUndefined();
+    expect(redacted.error.message).toBeUndefined();
+    expect(redacted.context).toBeUndefined();
+    expect(redacted.userId).toBeUndefined();
+    expect(JSON.stringify(redacted)).not.toContain('at handler');
+    expect(JSON.stringify(redacted)).not.toContain('p-1');
+  });
+
+  it('leaves an entry without error object intact', () => {
+    const [redacted] = redactEntriesForSupport([{ id: 'entry-2', severity: 'info', message: 'started' }]);
+    expect(redacted).toEqual({ id: 'entry-2', severity: 'info', message: 'started', error: undefined, redacted: true });
+  });
+
+  it('does not mutate the source entry', () => {
+    redactEntryForSupport(entry);
+    expect(entry.error.stack).toBe('at handler');
+    expect(entry.context).toEqual({ parcelId: 'p-1' });
   });
 });

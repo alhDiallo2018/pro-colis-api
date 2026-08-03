@@ -589,6 +589,163 @@ export const userStats = handle('users.stats', async (req, res) => {
 // PARCELS
 // ============================================================
 
+// Valeurs des enums Prisma reprises ici pour refuser une saisie invalide par un
+// 422 explicite. Sans ce controle, une valeur inconnue partait jusqu'a Prisma et
+// remontait en 500 opaque.
+const PARCEL_TYPES = ['document', 'package', 'fragile', 'perishable', 'valuable'];
+const PAYMENT_METHODS = ['wave', 'freemMoney', 'orange_money', 'card', 'cash'];
+const PAYMENT_CHANNELS = ['cash', 'platform'];
+const CASH_COLLECTION_POINTS = ['sender_pickup', 'receiver_delivery'];
+
+// Champs qu'un expediteur peut corriger sur un colis pas encore engage. La liste
+// est explicite : `status`, `driverId`, `totalAmount`, `trackingNumber`,
+// `negotiatedPrice` ou `senderId` n'y figurent pas — ils relevent du cycle de vie
+// et non de la saisie. Un `data: req.body` laisserait au contraire le client
+// reecrire n'importe quelle colonne de la table.
+const PARCEL_EDITABLE_TEXT_FIELDS = [
+  'senderName',
+  'senderPhone',
+  'senderEmail',
+  'receiverName',
+  'receiverPhone',
+  'receiverEmail',
+  'receiverAddress',
+  'description',
+  'notes',
+  'paymentPhoneNumber'
+];
+const PARCEL_EDITABLE_DECIMAL_FIELDS = ['weight', 'length', 'width', 'height', 'price', 'proposedPrice'];
+const PARCEL_EDITABLE_BOOLEAN_FIELDS = ['isInsured', 'isUrgent'];
+const PARCEL_EDITABLE_ID_FIELDS = [
+  'departureZoneId',
+  'arrivalZoneId',
+  'departureGarageId',
+  'arrivalGarageId'
+];
+const PARCEL_EDITABLE_ENUM_FIELDS = {
+  type: PARCEL_TYPES,
+  paymentMethod: PAYMENT_METHODS,
+  paymentChannel: PAYMENT_CHANNELS,
+  cashCollectionPoint: CASH_COLLECTION_POINTS
+};
+
+// Obligatoires a la creation : une modification peut les corriger, jamais les
+// vider — la colonne est NOT NULL cote base.
+const PARCEL_REQUIRED_FIELDS = ['receiverName', 'receiverPhone', 'description', 'weight'];
+
+// Modifier l'un de ces champs change l'offre que les chauffeurs ont chiffree :
+// ceux qui ont une enchere en cours doivent pouvoir la revoir.
+const PARCEL_BID_SENSITIVE_FIELDS = [
+  'weight',
+  'length',
+  'width',
+  'height',
+  'description',
+  'type',
+  'price',
+  'proposedPrice',
+  'isUrgent',
+  'departureZoneId',
+  'arrivalZoneId',
+  'departureGarageId',
+  'arrivalGarageId'
+];
+
+// Un colis n'est modifiable que tant qu'aucun chauffeur ne s'est engage dessus.
+const PARCEL_EDITABLE_STATUSES = ['pending', 'free'];
+
+function pickAuditFields(source, fields) {
+  return Object.fromEntries(
+    fields.map((field) => {
+      const value = source[field];
+      if (value === null || value === undefined) return [field, null];
+      if (typeof value === 'boolean') return [field, value];
+      if (Array.isArray(value)) return [field, value.map(String)];
+      // Les Decimal Prisma et les dates sont normalises en texte pour rester
+      // lisibles dans le journal d'audit.
+      return [field, String(value)];
+    })
+  );
+}
+
+/**
+ * Traduit le corps de requete en donnees Prisma, champ par champ. Une chaine
+ * vidée devient `null` : c'est ainsi qu'un client efface une adresse ou une note
+ * facultative. Les champs obligatoires sont verifies ensuite.
+ */
+function buildParcelUpdateData(body) {
+  const data = {};
+
+  for (const field of PARCEL_EDITABLE_TEXT_FIELDS) {
+    if (body[field] === undefined) continue;
+    const value = body[field] === null ? null : String(body[field]).trim();
+    data[field] = value === '' ? null : value;
+  }
+
+  for (const field of PARCEL_EDITABLE_DECIMAL_FIELDS) {
+    if (body[field] === undefined) continue;
+    const value = decimal(body[field]);
+    if (value !== null && !Number.isFinite(Number(value))) {
+      throw new ValidationError([{ path: field, message: 'Valeur numerique attendue' }]);
+    }
+    if (value !== null && Number(value) < 0) {
+      throw new ValidationError([{ path: field, message: 'Valeur negative refusee' }]);
+    }
+    data[field] = value;
+  }
+
+  for (const field of PARCEL_EDITABLE_BOOLEAN_FIELDS) {
+    if (body[field] === undefined) continue;
+    data[field] = Boolean(body[field]);
+  }
+
+  for (const field of PARCEL_EDITABLE_ID_FIELDS) {
+    if (body[field] === undefined) continue;
+    data[field] = body[field] || null;
+  }
+
+  for (const [field, allowed] of Object.entries(PARCEL_EDITABLE_ENUM_FIELDS)) {
+    if (body[field] === undefined) continue;
+    if (body[field] === null || body[field] === '') {
+      data[field] = null;
+      continue;
+    }
+    if (!allowed.includes(body[field])) {
+      throw new ValidationError([
+        { path: field, message: `Valeur attendue parmi : ${allowed.join(', ')}` }
+      ]);
+    }
+    data[field] = body[field];
+  }
+
+  if (body.acceptedPaymentChannels !== undefined) {
+    if (!Array.isArray(body.acceptedPaymentChannels)) {
+      throw new ValidationError([
+        { path: 'acceptedPaymentChannels', message: 'Liste de canaux attendue' }
+      ]);
+    }
+    const invalid = body.acceptedPaymentChannels.filter((channel) => !PAYMENT_CHANNELS.includes(channel));
+    if (invalid.length) {
+      throw new ValidationError([
+        { path: 'acceptedPaymentChannels', message: `Canaux inconnus : ${invalid.join(', ')}` }
+      ]);
+    }
+    data.acceptedPaymentChannels = body.acceptedPaymentChannels;
+  }
+
+  const emptied = PARCEL_REQUIRED_FIELDS.filter((field) => field in data && data[field] === null);
+  if (emptied.length) {
+    throw new ValidationError(
+      emptied.map((field) => ({ path: field, message: 'Ce champ ne peut pas etre vide' }))
+    );
+  }
+  if (data.weight !== undefined && Number(data.weight) <= 0) {
+    throw new ValidationError([{ path: 'weight', message: 'Poids superieur a zero requis' }]);
+  }
+
+  return data;
+}
+
 function buildParcelData(user, body) {
   const isDriver = user.role === 'driver';
   const isFree = Boolean(body.isFreeForBidding);
@@ -678,6 +835,129 @@ export const createParcel = handle('parcel.create', async (req, res) => {
   });
 
   return ok(res, { status: 201, message: 'Colis cree', data: { parcel: serializeParcel(result) } });
+});
+
+/**
+ * Correction d'un colis par son expediteur. `findAccessibleParcel` restreint
+ * deja l'acces au createur (un destinataire lit le colis mais ne le modifie
+ * pas) ; les gardes ci-dessous refusent la modification des qu'un engagement
+ * existe — chauffeur assigne, offre acceptee ou paiement entame.
+ */
+export const updateParcel = handle('parcel.update', async (req, res) => {
+  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+
+  if (!PARCEL_EDITABLE_STATUSES.includes(parcel.status)) {
+    throw new ConflictError('Ce colis est deja engage : son contenu n\'est plus modifiable');
+  }
+  if (parcel.driverId) {
+    throw new ConflictError('Un chauffeur est deja assigne a ce colis');
+  }
+  // Le statut devrait suffire, mais une enchere acceptee ou un prix negocie
+  // restent les seuls signaux fiables qu'un accord de prix existe deja : un
+  // colis reste techniquement en `pending` entre l'acceptation et la confirmation.
+  const hasAcceptedBid = (parcel.bids || []).some((bid) => bid.status === 'accepted');
+  if (hasAcceptedBid || parcel.selectedBidId || parcel.negotiatedPrice) {
+    throw new ConflictError('Une offre a deja ete acceptee pour ce colis');
+  }
+  const settledPayment = await prisma.payment.findFirst({
+    where: { parcelId: parcel.id, status: { in: ['processing', 'completed'] } },
+    select: { id: true }
+  });
+  if (settledPayment) {
+    throw new ConflictError('Un paiement est deja engage sur ce colis');
+  }
+
+  const data = buildParcelUpdateData(req.body);
+  if (Object.keys(data).length === 0) {
+    throw new ValidationError([{ path: 'body', message: 'Aucun champ modifiable fourni' }]);
+  }
+
+  // Le lieu de depart reste obligatoire apres fusion, comme a la creation :
+  // sinon une modification laisserait un colis sans origine.
+  const departureZoneId = 'departureZoneId' in data ? data.departureZoneId : parcel.departureZoneId;
+  const departureGarageId = 'departureGarageId' in data ? data.departureGarageId : parcel.departureGarageId;
+  if (!departureZoneId && !departureGarageId) {
+    throw new ValidationError([{ path: 'departureZoneId', message: 'Zone de depart requise' }]);
+  }
+
+  // Tant qu'aucun prix n'est negocie — ce que les gardes ci-dessus garantissent —
+  // le montant total suit le prix demande, comme a la creation.
+  if (data.price !== undefined || data.proposedPrice !== undefined) {
+    const proposed = 'proposedPrice' in data ? data.proposedPrice : parcel.proposedPrice;
+    const price = 'price' in data ? data.price : parcel.price;
+    data.totalAmount = decimal(proposed ?? price, '0');
+  }
+
+  const changedFields = Object.keys(data).filter(
+    (field) => String(parcel[field] ?? '') !== String(data[field] ?? '')
+  );
+  if (changedFields.length === 0) {
+    return ok(res, { message: 'Colis inchange', data: { parcel: serializeParcel(parcel) } });
+  }
+
+  const result = await prisma.$transaction(async (tx) => {
+    const updated = await tx.parcel.update({
+      where: { id: parcel.id },
+      data,
+      include: parcelInclude
+    });
+
+    // La modification apparait dans la chronologie du colis : le destinataire et
+    // le support doivent pouvoir constater qu'une correction a eu lieu.
+    const event = await tx.parcelEvent.create({
+      data: {
+        parcelId: parcel.id,
+        status: updated.status,
+        description: 'Colis modifie par l\'expediteur',
+        userId: req.user.id,
+        userName: req.user.fullName,
+        userRole: req.user.role,
+        metadata: { changedFields }
+      }
+    });
+
+    await audit(tx, req, {
+      action: 'parcel.update',
+      entityType: 'parcel',
+      entityId: parcel.id,
+      beforeData: pickAuditFields(parcel, changedFields),
+      afterData: pickAuditFields(updated, changedFields)
+    });
+
+    // Les chauffeurs ayant une enchere en cours ont chiffre l'ancienne annonce.
+    // Sans avertissement, leur offre porterait sur un colis qui n'est plus celui
+    // qu'ils ont evalue.
+    const materialChanges = changedFields.filter((field) => PARCEL_BID_SENSITIVE_FIELDS.includes(field));
+    if (materialChanges.length) {
+      const pendingBids = (parcel.bids || []).filter((bid) =>
+        ['pending', 'countered'].includes(bid.status)
+      );
+      for (const bid of pendingBids) {
+        await notify(tx, {
+          userId: bid.driverId,
+          parcelId: parcel.id,
+          bidId: bid.id,
+          senderId: req.user.id,
+          senderName: req.user.fullName,
+          type: 'parcel_updated',
+          title: 'Colis modifie',
+          body: `Le colis ${updated.trackingNumber} a ete modifie par l'expediteur. Verifiez votre offre.`,
+          data: { parcelId: parcel.id, bidId: bid.id, changedFields: materialChanges },
+          priority: 'high'
+        });
+      }
+    }
+
+    return { parcel: updated, event };
+  });
+
+  return ok(res, {
+    message: 'Colis mis a jour',
+    data: {
+      parcel: serializeParcel(result.parcel),
+      event: serializeParcelEvent(result.event)
+    }
+  });
 });
 
 // ============================================================
@@ -1148,14 +1428,49 @@ export const deliveryProof = handle('parcel.proof', async (req, res) => {
   return ok(res, { message: 'Preuve livraison', data: { proof: { signatureUrl: parcel.signatureUrl, photoUrls: serializeParcel(parcel).photoUrls } } });
 });
 
+/**
+ * Bareme de l'estimation, lu dans `SystemConfig`.
+ *
+ * Ces quatre cles sont editables par le super administrateur (groupe
+ * « Tarification » de l'ecran de configuration, web et mobile). Elles etaient
+ * codees en dur ici : un administrateur pouvait changer le tarif sans qu'aucune
+ * estimation ne bouge. Les valeurs de repli reprennent les anciennes
+ * constantes, pour qu'une base sans ces cles se comporte comme avant.
+ */
+async function pricingConfig() {
+  const [baseFee, pricePerKg, urgentFee, insuranceFee] = await Promise.all([
+    getConfigValue('pricing.baseFee', 1000),
+    getConfigValue('pricing.pricePerKg', 500),
+    getConfigValue('pricing.urgentFee', 1000),
+    getConfigValue('pricing.insuranceFee', 1000)
+  ]);
+  return {
+    baseFee: number(baseFee, 1000),
+    pricePerKg: number(pricePerKg, 500),
+    urgentFee: number(urgentFee, 1000),
+    insuranceFee: number(insuranceFee, 1000)
+  };
+}
+
 export const estimateParcel = handle('parcel.estimate', async (req, res) => {
   const weight = number(req.body.weight, 1);
-  const baseFee = 1000;
-  const pricePerKg = 500;
-  const urgentFee = req.body.isUrgent ? 1000 : 0;
-  const insuranceFee = req.body.isInsured ? 1000 : 0;
-  const total = baseFee + weight * pricePerKg + urgentFee + insuranceFee;
-  return ok(res, { message: 'Estimation prix', data: { estimate: { amount: total, currency: 'XOF', baseFee, pricePerKg, urgentFee, insuranceFee } } });
+  const pricing = await pricingConfig();
+  const urgentFee = req.body.isUrgent ? pricing.urgentFee : 0;
+  const insuranceFee = req.body.isInsured ? pricing.insuranceFee : 0;
+  const total = pricing.baseFee + weight * pricing.pricePerKg + urgentFee + insuranceFee;
+  return ok(res, {
+    message: 'Estimation prix',
+    data: {
+      estimate: {
+        amount: total,
+        currency: 'XOF',
+        baseFee: pricing.baseFee,
+        pricePerKg: pricing.pricePerKg,
+        urgentFee,
+        insuranceFee
+      }
+    }
+  });
 });
 
 // ============================================================
@@ -2646,6 +2961,25 @@ export const favoriteGarages = handle('favorites.garages', async (req, res) => {
 // MESSAGES - Messages
 // ============================================================
 
+// Un message reste modifiable un quart d'heure. Au-dela, le destinataire a eu
+// le temps de le lire et d'agir dessus : le reecrire fausserait l'echange.
+const MESSAGE_EDIT_WINDOW_MS = 15 * 60 * 1000;
+const MESSAGE_BODY_MAX_LENGTH = 4000;
+
+// Les propositions de prix circulent dans le fil de discussion sous ce prefixe
+// (widget de negociation cote mobile). Elles engagent une negociation
+// commerciale : leur auteur ne peut donc ni les reecrire ni les effacer, sinon
+// l'historique d'un accord deviendrait incoherent. Seule la moderation peut les
+// supprimer.
+const PRICE_PROPOSAL_PREFIX = '__PRIX__';
+
+// Roles autorises a supprimer le message d'un tiers, au titre de la moderation.
+const MESSAGE_MODERATOR_ROLES = ['super_admin', 'support'];
+
+function isPriceProposal(message) {
+  return (message.body || '').startsWith(PRICE_PROPOSAL_PREFIX);
+}
+
 function serializeMessage(m) {
   if (!m) return null;
   return {
@@ -2658,48 +2992,117 @@ function serializeMessage(m) {
     photoUrl: m.photoUrl,
     videoUrl: m.videoUrl,
     isRead: m.isRead,
-    createdAt: m.createdAt
+    createdAt: m.createdAt,
+    // `createdAt` reste la date d'envoi : les clients affichent le marqueur
+    // « modifie » a partir de `editedAt`, sans reordonner le fil.
+    editedAt: m.editedAt || null,
+    isEdited: Boolean(m.editedAt)
   };
 }
 
+function messagePreview(message) {
+  if (message.photoUrl) return '📷 Photo';
+  if (message.videoUrl) return '🎥 Vidéo';
+  if (message.audioUrl) return '🎤 Message vocal';
+  if (isPriceProposal(message)) return '💰 Proposition de prix';
+  return (message.body || '').slice(0, 80) || 'Nouveau message';
+}
+
+/**
+ * Rattacher un message a un colis le fait apparaitre dans le fil de ce colis.
+ * On exige donc un lien reel avec le colis, sans reprendre le filtre strict de
+ * lecture : un chauffeur qui a seulement enchéri sur un colis libre doit
+ * pouvoir en discuter avec le client, exactement comme il peut en consulter le
+ * detail.
+ */
+async function assertParcelConversationAccess(user, parcelId) {
+  if (user.role === 'driver') {
+    await findAccessibleParcelForDriver(user, parcelId);
+    return;
+  }
+  await findReadableParcel(user, parcelId);
+}
+
+/**
+ * Charge un message encore vivant et verifie que l'utilisateur en est bien
+ * l'auteur. L'edition n'est jamais deleguee a la moderation : reecrire les mots
+ * d'un tiers n'est pas une operation legitime.
+ */
+async function findEditableMessage(user, messageId) {
+  const message = await prisma.message.findUnique({ where: { id: messageId } });
+  if (!message || message.deletedAt) throw new NotFoundError('Message introuvable');
+  if (message.senderId !== user.id) {
+    throw new ForbiddenError('Seul l\'auteur peut modifier son message');
+  }
+  return message;
+}
+
 export const sendMessage = handle('messages.send', async (req, res) => {
-  if (!req.body.receiverId) throw new ValidationError([{ path: 'receiverId', message: 'Destinataire requis' }]);
-  if (!req.body.body && !req.body.audioUrl && !req.body.photoUrl && !req.body.videoUrl) {
+  const receiverId = req.body.receiverId;
+  if (!receiverId) throw new ValidationError([{ path: 'receiverId', message: 'Destinataire requis' }]);
+  if (receiverId === req.user.id) {
+    throw new ValidationError([
+      { path: 'receiverId', message: 'Impossible de s\'envoyer un message a soi-meme' }
+    ]);
+  }
+
+  const body = typeof req.body.body === 'string' ? req.body.body.trim() : '';
+  const hasMedia = Boolean(req.body.audioUrl || req.body.photoUrl || req.body.videoUrl);
+  if (!body && !hasMedia) {
     throw new ValidationError([{ path: 'body', message: 'Message vide' }]);
   }
+  if (body.length > MESSAGE_BODY_MAX_LENGTH) {
+    throw new ValidationError([
+      { path: 'body', message: `Message limite a ${MESSAGE_BODY_MAX_LENGTH} caracteres` }
+    ]);
+  }
+
+  // Sans cette lecture, un destinataire inexistant remontait en violation de
+  // cle etrangere Prisma, donc en 500 opaque au lieu d'un 404 exploitable par
+  // les clients.
+  const receiver = await prisma.user.findFirst({
+    where: { id: receiverId, deletedAt: null },
+    select: { id: true, status: true }
+  });
+  if (!receiver) throw new NotFoundError('Destinataire introuvable');
+  if (receiver.status !== 'active') {
+    throw new ConflictError('Ce compte ne peut plus recevoir de messages');
+  }
+
+  const parcelId = req.body.parcelId || null;
+  if (parcelId) await assertParcelConversationAccess(req.user, parcelId);
+
   const message = await prisma.message.create({
     data: {
       senderId: req.user.id,
-      receiverId: req.body.receiverId,
-      parcelId: req.body.parcelId || null,
-      body: req.body.body || '',
+      receiverId,
+      parcelId,
+      body,
       audioUrl: req.body.audioUrl || null,
       photoUrl: req.body.photoUrl || null,
       videoUrl: req.body.videoUrl || null
     }
   });
 
+  // La notification ne conditionne pas l'envoi : le message est deja ecrit, une
+  // ligne de notification en echec ne doit pas le faire perdre a son auteur.
+  // Les messages de discussion ne partent volontairement pas en e-mail / SMS,
+  // contrairement aux notifications metier qui passent par `notify`.
   try {
-    const sender = await prisma.user.findUnique({ where: { id: req.user.id }, select: { fullName: true } });
-    const preview = message.photoUrl
-      ? '📷 Photo'
-      : message.videoUrl
-        ? '🎥 Vidéo'
-        : message.audioUrl
-          ? '🎤 Message vocal'
-          : (message.body || '').startsWith('__PRIX__')
-            ? '💰 Proposition de prix'
-            : (message.body || '').slice(0, 80) || 'Nouveau message';
+    const sender = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { fullName: true }
+    });
     await prisma.notification.create({
       data: {
-        userId: req.body.receiverId,
+        userId: receiverId,
         senderId: req.user.id,
         senderName: sender?.fullName || 'PRO COLIS',
-        parcelId: req.body.parcelId || null,
+        parcelId,
         type: 'message',
         title: sender?.fullName ? `Nouveau message de ${sender.fullName}` : 'Nouveau message',
-        body: preview,
-        data: { messageId: message.id, parcelId: req.body.parcelId || null }
+        body: messagePreview(message),
+        data: { messageId: message.id, parcelId }
       }
     });
   } catch {
@@ -2709,6 +3112,103 @@ export const sendMessage = handle('messages.send', async (req, res) => {
   return ok(res, { status: 201, message: 'Message envoye', data: { message: serializeMessage(message) } });
 });
 
+export const updateMessage = handle('messages.update', async (req, res) => {
+  const existing = await findEditableMessage(req.user, req.params.messageId);
+
+  if (isPriceProposal(existing)) {
+    throw new ConflictError('Une proposition de prix ne peut pas etre modifiee');
+  }
+
+  const elapsed = Date.now() - new Date(existing.createdAt).getTime();
+  if (elapsed > MESSAGE_EDIT_WINDOW_MS) {
+    throw new ConflictError('Le delai de modification de ce message est depasse');
+  }
+
+  const body = typeof req.body.body === 'string' ? req.body.body.trim() : '';
+  if (!body) {
+    throw new ValidationError([{ path: 'body', message: 'Le texte du message est requis' }]);
+  }
+  if (body.length > MESSAGE_BODY_MAX_LENGTH) {
+    throw new ValidationError([
+      { path: 'body', message: `Message limite a ${MESSAGE_BODY_MAX_LENGTH} caracteres` }
+    ]);
+  }
+  // Une edition qui ne change rien ne doit pas poser de marqueur « modifie ».
+  if (body === existing.body) {
+    return ok(res, { message: 'Message inchange', data: { message: serializeMessage(existing) } });
+  }
+
+  const message = await prisma.$transaction(async (tx) => {
+    const updated = await tx.message.update({
+      where: { id: existing.id },
+      data: { body, editedAt: new Date() }
+    });
+
+    // Le contenu des echanges est verse aux litiges de livraison : la version
+    // precedente doit rester consultable meme apres reecriture.
+    await audit(tx, req, {
+      action: 'message.update',
+      entityType: 'message',
+      entityId: updated.id,
+      beforeData: { body: existing.body },
+      afterData: { body: updated.body }
+    });
+
+    return updated;
+  });
+
+  return ok(res, { message: 'Message modifie', data: { message: serializeMessage(message) } });
+});
+
+export const deleteMessage = handle('messages.delete', async (req, res) => {
+  const existing = await prisma.message.findUnique({ where: { id: req.params.messageId } });
+  if (!existing) throw new NotFoundError('Message introuvable');
+
+  const isAuthor = existing.senderId === req.user.id;
+  const isModerator = MESSAGE_MODERATOR_ROLES.includes(req.user.role);
+  if (!isAuthor && !isModerator) {
+    throw new ForbiddenError('Seul l\'auteur peut supprimer son message');
+  }
+  if (isAuthor && !isModerator && isPriceProposal(existing)) {
+    throw new ConflictError('Une proposition de prix ne peut pas etre supprimee');
+  }
+  // Rejouer la suppression renvoie l'etat courant : le mobile peut relancer la
+  // requete apres une coupure reseau sans traiter un 404 trompeur.
+  if (existing.deletedAt) {
+    return ok(res, { message: 'Message deja supprime' });
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.message.update({
+      where: { id: existing.id },
+      data: { deletedAt: new Date() }
+    });
+
+    // Un message supprime avant lecture laissait une notification qui ouvrait un
+    // fil vide. On retire donc la pastille non lue qui le designe.
+    if (!existing.isRead) {
+      await tx.notification.deleteMany({
+        where: {
+          type: 'message',
+          userId: existing.receiverId,
+          isRead: false,
+          data: { path: ['messageId'], equals: existing.id }
+        }
+      });
+    }
+
+    await audit(tx, req, {
+      action: 'message.delete',
+      entityType: 'message',
+      entityId: existing.id,
+      beforeData: { body: existing.body, senderId: existing.senderId, isRead: existing.isRead },
+      afterData: { deleted: true, moderated: !isAuthor }
+    });
+  });
+
+  return ok(res, { message: 'Message supprime' });
+});
+
 export const messageThread = handle('messages.thread', async (req, res) => {
   const peerId = req.query.peerId;
   const parcelId = req.query.parcelId || null;
@@ -2716,6 +3216,8 @@ export const messageThread = handle('messages.thread', async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
 
   const where = {
+    // Un message supprime par son auteur disparait du fil des deux cotes.
+    deletedAt: null,
     OR: [
       { senderId: req.user.id, receiverId: peerId },
       { senderId: peerId, receiverId: req.user.id }
@@ -2735,7 +3237,8 @@ export const messageThread = handle('messages.thread', async (req, res) => {
         receiverId: req.user.id,
         senderId: peerId,
         parcelId: parcelId === null ? null : parcelId,
-        isRead: false
+        isRead: false,
+        deletedAt: null
       },
       data: { isRead: true, readAt: new Date() }
     }),
@@ -2752,7 +3255,10 @@ export const conversations = handle('messages.conversations', async (req, res) =
   res.setHeader('Cache-Control', 'private, no-store');
 
   const messages = await prisma.message.findMany({
-    where: { OR: [{ senderId: req.user.id }, { receiverId: req.user.id }] },
+    where: {
+      deletedAt: null,
+      OR: [{ senderId: req.user.id }, { receiverId: req.user.id }]
+    },
     include: {
       sender: { select: { id: true, fullName: true, profilePhoto: true, role: true } },
       receiver: { select: { id: true, fullName: true, profilePhoto: true, role: true } },
@@ -2794,7 +3300,21 @@ export const conversations = handle('messages.conversations', async (req, res) =
 });
 
 export const readMessage = handle('messages.read', async (req, res) => {
-  await prisma.message.updateMany({ where: { id: req.params.messageId, receiverId: req.user.id }, data: { isRead: true, readAt: new Date() } });
+  // Seul le destinataire marque un message comme lu. Le filtre servait deja de
+  // garde d'autorisation, mais son resultat etait ignore : un identifiant
+  // inconnu ou le message d'un tiers renvoyait un succes trompeur.
+  const marked = await prisma.message.updateMany({
+    where: { id: req.params.messageId, receiverId: req.user.id, deletedAt: null },
+    data: { isRead: true, readAt: new Date() }
+  });
+  if (marked.count === 0) {
+    const exists = await prisma.message.findFirst({
+      where: { id: req.params.messageId, receiverId: req.user.id, deletedAt: null },
+      select: { id: true }
+    });
+    // Le message existe et m'est bien adresse : il etait simplement deja lu.
+    if (!exists) throw new NotFoundError('Message introuvable');
+  }
   return ok(res, { message: 'Message lu' });
 });
 
@@ -2985,6 +3505,78 @@ export const identityStatus = handle('identity.status', async (req, res) => {
 // ADVERTISEMENTS - Annonces
 // ============================================================
 
+// Champs qu'un chauffeur peut corriger sur son annonce. Le `data: req.body` qui
+// precedait laissait passer n'importe quelle colonne — `driverId`, `status`,
+// `createdAt` compris — et n'appliquait aucune conversion : une date ou un poids
+// transmis en texte partaient tels quels vers Prisma.
+const ADVERTISEMENT_EDITABLE_TEXT_FIELDS = ['departureCity', 'arrivalCity', 'description', 'audioUrl'];
+const ADVERTISEMENT_EDITABLE_DECIMAL_FIELDS = ['availableWeight', 'proposedPrice'];
+const ADVERTISEMENT_EDITABLE_ID_FIELDS = [
+  'departureGarageId',
+  'arrivalGarageId',
+  'departureZoneId',
+  'arrivalZoneId'
+];
+
+// Une annonce fermee ou annulee est une trace : elle n'est plus modifiable.
+const ADVERTISEMENT_EDITABLE_STATUSES = ['open'];
+// Offres encore en jeu : a avertir ou a refuser selon l'action sur l'annonce.
+const ADVERTISEMENT_LIVE_OFFER_STATUSES = ['pending', 'countered'];
+// Statuts de colis encore rattachables a une offre de trajet.
+const PARCEL_OFFERABLE_STATUSES = ['pending', 'free'];
+
+/**
+ * Charge une annonce et verifie que l'appelant en est le chauffeur proprietaire.
+ * Les routes annonces etaient montees avec `authenticate` seul : fermeture, refus
+ * et negociation d'offre s'executaient sans aucun controle de propriete.
+ */
+async function findOwnedAdvertisement(user, advertisementId, include) {
+  const advertisement = await prisma.advertisement.findUnique({
+    where: { id: advertisementId },
+    ...(include ? { include } : {})
+  });
+  if (!advertisement) throw new NotFoundError('Annonce introuvable');
+  if (user.role !== 'super_admin' && advertisement.driverId !== user.id) {
+    throw new ForbiddenError('Annonce non autorisee');
+  }
+  return advertisement;
+}
+
+// Publier un trajet dont le depart est passe reviendrait a annoncer un vehicule
+// deja parti : les clients y deposeraient des offres inexploitables.
+function parseFutureDate(value, path) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new ValidationError([{ path, message: 'Date invalide' }]);
+  }
+  if (date.getTime() <= Date.now()) {
+    throw new ValidationError([{ path, message: 'La date de depart doit etre future' }]);
+  }
+  return date;
+}
+
+// `decimal` accepte n'importe quelle entree ; ce garde-fou refuse en plus une
+// valeur non numerique ou negative avant qu'elle n'atteigne la base.
+function positiveDecimal(value, path) {
+  const parsed = decimal(value);
+  if (parsed === null) return null;
+  if (!Number.isFinite(Number(parsed)) || Number(parsed) < 0) {
+    throw new ValidationError([{ path, message: 'Valeur numerique positive attendue' }]);
+  }
+  return parsed;
+}
+
+// Une annonce doit garder une origine et une destination, quel que soit le
+// referentiel utilise : les zones et les villes libres cohabitent encore.
+function assertAdvertisementRoute(source) {
+  if (!source.departureZoneId && !source.departureGarageId && !source.departureCity) {
+    throw new ValidationError([{ path: 'departureZoneId', message: 'Lieu de depart requis' }]);
+  }
+  if (!source.arrivalZoneId && !source.arrivalGarageId && !source.arrivalCity) {
+    throw new ValidationError([{ path: 'arrivalZoneId', message: 'Lieu d\'arrivee requis' }]);
+  }
+}
+
 export const listAdvertisements = handle('advertisements.list', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
   const where = cleanUndefined({ status: req.query.status });
@@ -3002,23 +3594,41 @@ export const myAdvertisements = handle('advertisements.my', async (req, res) => 
 
 export const createAdvertisement = handle('advertisements.create', async (req, res) => {
   await assertDriverVerified(req);
-  const advertisement = await prisma.advertisement.create({
-    data: {
-      driverId: req.user.id,
-      departureGarageId: req.body.departureGarageId || null,
-      arrivalGarageId: req.body.arrivalGarageId || null,
-      departureZoneId: req.body.departureZoneId || null,
-      arrivalZoneId: req.body.arrivalZoneId || null,
-      departureCity: req.body.departureCity,
-      arrivalCity: req.body.arrivalCity,
-      departureAt: req.body.departureAt ? new Date(req.body.departureAt) : null,
-      availableWeight: decimal(req.body.availableWeight),
-      proposedPrice: decimal(req.body.proposedPrice),
-      description: req.body.description,
-      audioUrl: req.body.audioUrl
-    },
-    include: { driver: true, offers: true }
+  assertAdvertisementRoute(req.body);
+
+  const advertisement = await prisma.$transaction(async (tx) => {
+    const created = await tx.advertisement.create({
+      data: {
+        driverId: req.user.id,
+        departureGarageId: req.body.departureGarageId || null,
+        arrivalGarageId: req.body.arrivalGarageId || null,
+        departureZoneId: req.body.departureZoneId || null,
+        arrivalZoneId: req.body.arrivalZoneId || null,
+        departureCity: req.body.departureCity,
+        arrivalCity: req.body.arrivalCity,
+        departureAt: req.body.departureAt ? parseFutureDate(req.body.departureAt, 'departureAt') : null,
+        availableWeight: positiveDecimal(req.body.availableWeight, 'availableWeight'),
+        proposedPrice: positiveDecimal(req.body.proposedPrice, 'proposedPrice'),
+        description: req.body.description,
+        audioUrl: req.body.audioUrl
+      },
+      include: { driver: true, offers: true }
+    });
+
+    await audit(tx, req, {
+      action: 'advertisement.create',
+      entityType: 'advertisement',
+      entityId: created.id,
+      afterData: {
+        status: created.status,
+        departureAt: created.departureAt ? created.departureAt.toISOString() : null,
+        proposedPrice: created.proposedPrice ? String(created.proposedPrice) : null
+      }
+    });
+
+    return created;
   });
+
   return ok(res, { status: 201, message: 'Annonce creee', data: { advertisement: serializeAdvertisement(advertisement) } });
 });
 
@@ -3035,33 +3645,271 @@ export const advertisementDetail = handle('advertisements.detail', async (req, r
 });
 
 export const updateAdvertisement = handle('advertisements.update', async (req, res) => {
-  const advertisement = await prisma.advertisement.findUnique({ where: { id: req.params.advertisementId } });
-  if (!advertisement) throw new NotFoundError('Annonce introuvable');
-  if (req.user.role !== 'super_admin' && advertisement.driverId !== req.user.id) throw new ForbiddenError('Annonce non autorisee');
-  const updated = await prisma.advertisement.update({ where: { id: advertisement.id }, data: req.body, include: { driver: true, offers: true } });
+  const advertisement = await findOwnedAdvertisement(req.user, req.params.advertisementId, { offers: true });
+
+  if (!ADVERTISEMENT_EDITABLE_STATUSES.includes(advertisement.status)) {
+    throw new ConflictError('Une annonce fermee ou annulee n\'est plus modifiable');
+  }
+  // Une offre acceptee vaut engagement sur le trajet publie : en changer la date
+  // ou l'itineraire apres coup tromperait le client dont le colis est deja pris
+  // en charge.
+  if (advertisement.offers.some((offer) => offer.status === 'accepted')) {
+    throw new ConflictError('Une offre a deja ete acceptee sur cette annonce');
+  }
+
+  const data = {};
+  for (const field of ADVERTISEMENT_EDITABLE_TEXT_FIELDS) {
+    if (req.body[field] === undefined) continue;
+    const value = req.body[field] === null ? null : String(req.body[field]).trim();
+    data[field] = value === '' ? null : value;
+  }
+  for (const field of ADVERTISEMENT_EDITABLE_DECIMAL_FIELDS) {
+    if (req.body[field] === undefined) continue;
+    data[field] = positiveDecimal(req.body[field], field);
+  }
+  for (const field of ADVERTISEMENT_EDITABLE_ID_FIELDS) {
+    if (req.body[field] === undefined) continue;
+    data[field] = req.body[field] || null;
+  }
+  if (req.body.departureAt !== undefined) {
+    data.departureAt = req.body.departureAt ? parseFutureDate(req.body.departureAt, 'departureAt') : null;
+  }
+
+  if (Object.keys(data).length === 0) {
+    throw new ValidationError([{ path: 'body', message: 'Aucun champ modifiable fourni' }]);
+  }
+
+  // Le trajet doit rester complet apres fusion : une modification ne peut pas
+  // laisser l'annonce sans origine ni sans destination.
+  assertAdvertisementRoute({ ...advertisement, ...data });
+
+  const changedFields = Object.keys(data).filter(
+    (field) => String(advertisement[field] ?? '') !== String(data[field] ?? '')
+  );
+  if (changedFields.length === 0) {
+    return ok(res, {
+      message: 'Annonce inchangee',
+      data: { advertisement: serializeAdvertisement(advertisement) }
+    });
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const result = await tx.advertisement.update({
+      where: { id: advertisement.id },
+      data,
+      include: { driver: true, offers: true }
+    });
+
+    await audit(tx, req, {
+      action: 'advertisement.update',
+      entityType: 'advertisement',
+      entityId: advertisement.id,
+      beforeData: pickAuditFields(advertisement, changedFields),
+      afterData: pickAuditFields(result, changedFields)
+    });
+
+    // Les clients qui ont une offre en cours l'ont calee sur le trajet publie :
+    // ils doivent savoir que la date, le prix ou l'itineraire a bouge.
+    const liveOffers = advertisement.offers.filter((offer) =>
+      ADVERTISEMENT_LIVE_OFFER_STATUSES.includes(offer.status)
+    );
+    for (const offer of liveOffers) {
+      await notify(tx, {
+        userId: offer.clientId,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'ad_updated',
+        title: 'Annonce modifiee',
+        body: 'Le chauffeur a modifie son annonce. Verifiez votre offre en cours.',
+        data: { advertisementId: advertisement.id, offerId: offer.id, changedFields },
+        priority: 'high'
+      });
+    }
+
+    return result;
+  });
+
   return ok(res, { message: 'Annonce mise a jour', data: { advertisement: serializeAdvertisement(updated) } });
 });
 
 export const deleteAdvertisement = handle('advertisements.delete', async (req, res) => {
-  const advertisement = await prisma.advertisement.findUnique({ where: { id: req.params.advertisementId } });
-  if (!advertisement) throw new NotFoundError('Annonce introuvable');
-  if (req.user.role !== 'super_admin' && advertisement.driverId !== req.user.id) throw new ForbiddenError('Annonce non autorisee');
-  await prisma.advertisement.delete({ where: { id: advertisement.id } });
+  const advertisement = await findOwnedAdvertisement(req.user, req.params.advertisementId, { offers: true });
+
+  // La suppression efface les offres en cascade, donc la trace d'un accord et le
+  // lien vers le colis engage. On la refuse dans ce cas : fermer l'annonce est
+  // l'operation qui conserve l'historique.
+  if (advertisement.offers.some((offer) => offer.status === 'accepted')) {
+    throw new ConflictError(
+      'Une offre acceptee est rattachee a cette annonce : fermez-la au lieu de la supprimer'
+    );
+  }
+
+  await prisma.$transaction(async (tx) => {
+    const liveOffers = advertisement.offers.filter((offer) =>
+      ADVERTISEMENT_LIVE_OFFER_STATUSES.includes(offer.status)
+    );
+    // Les offres partent en cascade : sans ce message, le client verrait son
+    // offre disparaitre sans explication.
+    for (const offer of liveOffers) {
+      await notify(tx, {
+        userId: offer.clientId,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'ad_offer_rejected',
+        title: 'Annonce retiree',
+        body: 'Le chauffeur a retire son annonce. Votre offre n\'est plus en jeu.',
+        data: { advertisementId: advertisement.id, offerId: offer.id }
+      });
+    }
+
+    await audit(tx, req, {
+      action: 'advertisement.delete',
+      entityType: 'advertisement',
+      entityId: advertisement.id,
+      beforeData: {
+        status: advertisement.status,
+        driverId: advertisement.driverId,
+        offerCount: advertisement.offers.length
+      }
+    });
+
+    await tx.advertisement.delete({ where: { id: advertisement.id } });
+  });
+
   return ok(res, { message: 'Annonce supprimee' });
 });
 
 export const closeAdvertisement = handle('advertisements.close', async (req, res) => {
-  const advertisement = await prisma.advertisement.update({ where: { id: req.params.advertisementId }, data: { status: 'closed', metadata: { reason: req.body.reason } }, include: { driver: true, offers: true } });
-  return ok(res, { message: 'Annonce fermee', data: { advertisement: serializeAdvertisement(advertisement) } });
+  const advertisement = await findOwnedAdvertisement(req.user, req.params.advertisementId, {
+    driver: true,
+    offers: true
+  });
+
+  // Rejouer la fermeture renvoie l'etat courant : le mobile peut relancer
+  // l'appel apres une coupure reseau sans traiter un conflit.
+  if (advertisement.status !== 'open') {
+    return ok(res, {
+      message: 'Annonce deja fermee',
+      data: { advertisement: serializeAdvertisement(advertisement) }
+    });
+  }
+
+  const reason = req.body.reason ? String(req.body.reason).trim() : null;
+
+  const closed = await prisma.$transaction(async (tx) => {
+    // Une annonce fermee ne peut plus rien accepter : laisser des offres en
+    // attente ferait patienter les clients indefiniment. Ce refus precede la
+    // mise a jour de l'annonce pour que son `include: { offers }` renvoie l'etat
+    // final — sinon la reponse porterait encore les offres en attente.
+    const liveOffers = advertisement.offers.filter((offer) =>
+      ADVERTISEMENT_LIVE_OFFER_STATUSES.includes(offer.status)
+    );
+    if (liveOffers.length) {
+      await tx.advertisementOffer.updateMany({
+        where: { id: { in: liveOffers.map((offer) => offer.id) } },
+        data: {
+          status: 'rejected',
+          responseMessage: reason || 'L\'annonce a ete fermee par le chauffeur',
+          respondedAt: new Date()
+        }
+      });
+      for (const offer of liveOffers) {
+        await notify(tx, {
+          userId: offer.clientId,
+          senderId: req.user.id,
+          senderName: req.user.fullName,
+          type: 'ad_offer_rejected',
+          title: 'Annonce fermee',
+          body: 'Le chauffeur a ferme son annonce. Votre offre n\'a pas ete retenue.',
+          data: { advertisementId: advertisement.id, offerId: offer.id }
+        });
+      }
+    }
+
+    const result = await tx.advertisement.update({
+      where: { id: advertisement.id },
+      data: {
+        status: 'closed',
+        // `metadata` etait ecrase par `{ reason }`, ce qui perdait tout ce que
+        // l'annonce portait deja.
+        metadata: {
+          ...(advertisement.metadata && typeof advertisement.metadata === 'object'
+            ? advertisement.metadata
+            : {}),
+          closedReason: reason,
+          closedAt: new Date().toISOString()
+        }
+      },
+      include: { driver: true, offers: true }
+    });
+
+    await audit(tx, req, {
+      action: 'advertisement.close',
+      entityType: 'advertisement',
+      entityId: advertisement.id,
+      beforeData: { status: advertisement.status },
+      afterData: { status: 'closed', reason, rejectedOffers: liveOffers.length }
+    });
+
+    return result;
+  });
+
+  return ok(res, { message: 'Annonce fermee', data: { advertisement: serializeAdvertisement(closed) } });
 });
 
 export const createAdvertisementOffer = handle('advertisements.offerCreate', async (req, res) => {
   const ad = await prisma.advertisement.findUnique({ where: { id: req.params.advertisementId } });
   if (!ad) throw new NotFoundError('Annonce introuvable');
+  if (ad.status !== 'open') {
+    throw new ConflictError('Cette annonce n\'accepte plus d\'offres');
+  }
+  if (ad.driverId === req.user.id) {
+    throw new ForbiddenError('Impossible de faire une offre sur sa propre annonce');
+  }
+  if (ad.departureAt && new Date(ad.departureAt).getTime() <= Date.now()) {
+    throw new ConflictError('Le depart de cette annonce est deja passe');
+  }
+
+  const price = positiveDecimal(req.body.price, 'price');
+  if (price === null || Number(price) <= 0) {
+    throw new ValidationError([{ path: 'price', message: 'Prix superieur a zero requis' }]);
+  }
+
+  // Le colis reste facultatif : l'ecran d'offre propose explicitement de
+  // negocier avant d'avoir cree le colis. Quand il est fourni, il doit
+  // appartenir au client et etre encore disponible, sinon l'acceptation
+  // echouerait plus tard cote chauffeur.
+  const parcelId = req.body.parcelId || null;
+  if (parcelId) {
+    const parcel = await prisma.parcel.findFirst({
+      where: { id: parcelId, senderId: req.user.id, deletedAt: null },
+      select: { id: true, status: true, driverId: true }
+    });
+    if (!parcel) throw new NotFoundError('Colis introuvable');
+    if (parcel.driverId) throw new ConflictError('Ce colis est deja assigne a un chauffeur');
+    if (!PARCEL_OFFERABLE_STATUSES.includes(parcel.status)) {
+      throw new ConflictError('Ce colis n\'est plus disponible pour une offre de trajet');
+    }
+
+    // Deux offres vivantes du meme client sur la meme annonce pour le meme colis
+    // laisseraient le chauffeur sans savoir laquelle traiter.
+    const duplicate = await prisma.advertisementOffer.findFirst({
+      where: {
+        advertisementId: ad.id,
+        clientId: req.user.id,
+        parcelId,
+        status: { in: ADVERTISEMENT_LIVE_OFFER_STATUSES }
+      },
+      select: { id: true }
+    });
+    if (duplicate) {
+      throw new ConflictError('Une offre est deja en cours pour ce colis sur cette annonce');
+    }
+  }
 
   const offer = await prisma.$transaction(async (tx) => {
     const created = await tx.advertisementOffer.create({
-      data: { advertisementId: ad.id, clientId: req.user.id, parcelId: req.body.parcelId, price: decimal(req.body.price, '0'), message: req.body.message },
+      data: { advertisementId: ad.id, clientId: req.user.id, parcelId, price, message: req.body.message },
       include: { client: true, parcel: { include: { media: true } } }
     });
     await notify(tx, {
@@ -3288,12 +4136,31 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
 });
 
 export const rejectAdvertisementOffer = handle('advertisements.offerReject', async (req, res) => {
+  // Le refus appartient au chauffeur proprietaire de l'annonce. Sans ce
+  // controle, n'importe quel compte authentifie pouvait refuser l'offre d'un
+  // tiers en connaissant son identifiant.
+  const advertisement = await findOwnedAdvertisement(req.user, req.params.advertisementId);
+
   const offer = await prisma.$transaction(async (tx) => {
+    const current = await tx.advertisementOffer.findFirst({
+      where: { id: req.params.offerId, advertisementId: advertisement.id },
+      include: { client: true }
+    });
+    if (!current) throw new NotFoundError('Offre introuvable pour cette annonce');
+    if (current.status === 'accepted') {
+      throw new ConflictError(
+        'Cette offre est deja acceptee : annulez le colis pour revenir en arriere'
+      );
+    }
+    // Rejouer le refus renvoie l'etat courant sans redeclencher de notification.
+    if (current.status === 'rejected') return current;
+
     const updated = await tx.advertisementOffer.update({
-      where: { id: req.params.offerId },
+      where: { id: current.id },
       data: { status: 'rejected', responseMessage: req.body.responseMessage, respondedAt: new Date() },
       include: { client: true }
     });
+
     await notify(tx, {
       userId: updated.clientId,
       senderId: req.user.id,
@@ -3303,17 +4170,89 @@ export const rejectAdvertisementOffer = handle('advertisements.offerReject', asy
       body: `Votre offre pour l'annonce a ete refusee.`,
       data: { advertisementId: updated.advertisementId, offerId: updated.id }
     });
+
+    await audit(tx, req, {
+      action: 'advertisement.offer.reject',
+      entityType: 'advertisement_offer',
+      entityId: updated.id,
+      beforeData: { status: current.status },
+      afterData: { status: 'rejected' }
+    });
+
     return updated;
   });
   return ok(res, { message: 'Offre traitee', data: { offer: serializeAdvertisementOffer(offer) } });
 });
 
 export const negotiateAdvertisementOffer = handle('advertisements.offerNegotiate', async (req, res) => {
-  const offer = await prisma.advertisementOffer.update({
-    where: { id: req.params.offerId },
-    data: { price: decimal(req.body.price, '0'), responseMessage: req.body.message },
-    include: { client: true, parcel: { include: { media: true } } }
+  const price = positiveDecimal(req.body.price, 'price');
+  if (price === null || Number(price) <= 0) {
+    throw new ValidationError([{ path: 'price', message: 'Prix superieur a zero requis' }]);
+  }
+
+  const offer = await prisma.$transaction(async (tx) => {
+    const current = await tx.advertisementOffer.findFirst({
+      where: { id: req.params.offerId, advertisementId: req.params.advertisementId },
+      include: { advertisement: { select: { driverId: true, status: true } } }
+    });
+    if (!current) throw new NotFoundError('Offre introuvable pour cette annonce');
+
+    // La negociation va dans les deux sens : le chauffeur propose un contre-prix,
+    // le client revise le sien. Le widget de discussion appelle cette route pour
+    // les deux roles. Seuls ces deux comptes — et le super admin — y ont droit :
+    // aucun controle n'existait auparavant.
+    const isDriver = current.advertisement.driverId === req.user.id;
+    const isClient = current.clientId === req.user.id;
+    if (!isDriver && !isClient && req.user.role !== 'super_admin') {
+      throw new ForbiddenError('Negociation non autorisee');
+    }
+
+    if (current.status === 'accepted') {
+      throw new ConflictError('Cette offre est deja acceptee : son prix est fige');
+    }
+    if (current.status === 'rejected') {
+      throw new ConflictError('Cette offre a ete refusee : elle ne peut plus etre negociee');
+    }
+    if (current.advertisement.status !== 'open') {
+      throw new ConflictError('Cette annonce n\'est plus ouverte a la negociation');
+    }
+
+    const updated = await tx.advertisementOffer.update({
+      where: { id: current.id },
+      data: {
+        price,
+        responseMessage: req.body.message,
+        // Le statut restait a `pending` apres un contre-prix : rien ne
+        // distinguait une offre initiale d'une offre deja negociee.
+        status: 'countered',
+        respondedAt: new Date()
+      },
+      include: { client: true, parcel: { include: { media: true } } }
+    });
+
+    // On avertit la partie d'en face, jamais l'auteur du contre-prix.
+    await notify(tx, {
+      userId: isDriver ? current.clientId : current.advertisement.driverId,
+      senderId: req.user.id,
+      senderName: req.user.fullName,
+      type: 'ad_offer_countered',
+      title: 'Contre-proposition de prix',
+      body: `${req.user.fullName} propose ${Number(price)} FCFA.`,
+      data: { advertisementId: req.params.advertisementId, offerId: updated.id, price: Number(price) },
+      priority: 'high'
+    });
+
+    await audit(tx, req, {
+      action: 'advertisement.offer.negotiate',
+      entityType: 'advertisement_offer',
+      entityId: updated.id,
+      beforeData: { status: current.status, price: String(current.price) },
+      afterData: { status: 'countered', price: String(price) }
+    });
+
+    return updated;
   });
+
   return ok(res, { message: 'Prix negocie', data: { offer: serializeAdvertisementOffer(offer) } });
 });
 
@@ -3414,6 +4353,148 @@ export const garageStats = handle('garage.stats', async (req, res) => {
 });
 
 // ============================================================
+// RAPPORTS - Agregation par periode
+// ============================================================
+
+/**
+ * Perimetre d'une zone : un colis compte des qu'il part d'elle ou y arrive.
+ * Le rapport d'un admin de zone ne doit jamais retomber sur des chiffres
+ * plateforme — c'est ce que faisaient les anciennes implementations.
+ */
+function garageScopeWhere(garageId) {
+  if (!garageId) return { id: '00000000-0000-0000-0000-000000000000' };
+  return { OR: [{ departureGarageId: garageId }, { arrivalGarageId: garageId }] };
+}
+
+function isoDate(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+/** Minuit local du jour demande (defaut : aujourd'hui) et minuit du lendemain. */
+function dayRange(value) {
+  const parsed = value ? new Date(value) : new Date();
+  const day = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+  const from = new Date(day.getFullYear(), day.getMonth(), day.getDate());
+  const to = new Date(from);
+  to.setDate(to.getDate() + 1);
+  return { from, to, bucket: 'hour', date: isoDate(from) };
+}
+
+function monthRange(yearValue, monthValue) {
+  const now = new Date();
+  const year = Number(yearValue) || now.getFullYear();
+  // Les clients envoient le mois en base 1 ; `Date` l'attend en base 0.
+  const month = Number(monthValue) || now.getMonth() + 1;
+  const from = new Date(year, month - 1, 1);
+  const to = new Date(year, month, 1);
+  return { from, to, bucket: 'day', year, month };
+}
+
+/** Clé de regroupement de la série temporelle (heure du jour ou date ISO). */
+function bucketKey(date, bucket) {
+  const value = new Date(date);
+  if (bucket === 'hour') return String(value.getHours()).padStart(2, '0');
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+}
+
+function emptySeries(from, to, bucket) {
+  const keys = [];
+  if (bucket === 'hour') {
+    for (let hour = 0; hour < 24; hour += 1) keys.push(String(hour).padStart(2, '0'));
+  } else {
+    const cursor = new Date(from);
+    while (cursor < to) {
+      keys.push(bucketKey(cursor, 'day'));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+  }
+  return keys.map((key) => ({ key, created: 0, delivered: 0, revenue: 0 }));
+}
+
+/**
+ * Rapport d'activite sur une periode : totaux, repartition par statut, serie
+ * temporelle et top chauffeurs. `scope` restreint le perimetre (zone ou
+ * plateforme entiere).
+ */
+async function buildPeriodReport({ scope, from, to, bucket }) {
+  const createdWhere = { ...scope, deletedAt: null, createdAt: { gte: from, lt: to } };
+  const deliveredWhere = { ...scope, deletedAt: null, status: 'delivered', deliveryDate: { gte: from, lt: to } };
+
+  const [created, delivered, cancelled, grouped, payments, topDrivers] = await Promise.all([
+    prisma.parcel.findMany({ where: createdWhere, select: { createdAt: true } }),
+    prisma.parcel.findMany({
+      where: deliveredWhere,
+      select: { deliveryDate: true, totalAmount: true, price: true, driverId: true }
+    }),
+    prisma.parcel.count({ where: { ...scope, deletedAt: null, status: 'cancelled', updatedAt: { gte: from, lt: to } } }),
+    prisma.parcel.groupBy({ by: ['status'], where: createdWhere, _count: { status: true } }),
+    prisma.payment.aggregate({
+      where: {
+        ...(Object.keys(scope).length ? { parcel: scope } : {}),
+        status: 'completed',
+        createdAt: { gte: from, lt: to }
+      },
+      _sum: { amount: true }
+    }),
+    prisma.parcel.groupBy({
+      by: ['driverId'],
+      where: { ...deliveredWhere, driverId: { not: null } },
+      _count: { driverId: true },
+      orderBy: { _count: { driverId: 'desc' } },
+      take: 5
+    })
+  ]);
+
+  const series = emptySeries(from, to, bucket);
+  const index = new Map(series.map((point) => [point.key, point]));
+
+  for (const parcel of created) {
+    const point = index.get(bucketKey(parcel.createdAt, bucket));
+    if (point) point.created += 1;
+  }
+  for (const parcel of delivered) {
+    const point = index.get(bucketKey(parcel.deliveryDate, bucket));
+    if (!point) continue;
+    point.delivered += 1;
+    point.revenue += Number(parcel.totalAmount ?? parcel.price ?? 0);
+  }
+
+  const driverNames = topDrivers.length
+    ? await prisma.user.findMany({
+        where: { id: { in: topDrivers.map((row) => row.driverId) } },
+        select: { id: true, fullName: true }
+      })
+    : [];
+  const nameById = new Map(driverNames.map((driver) => [driver.id, driver.fullName]));
+
+  const totalCreated = created.length;
+  const totalDelivered = delivered.length;
+
+  return {
+    from: from.toISOString(),
+    to: to.toISOString(),
+    bucket,
+    totals: {
+      created: totalCreated,
+      delivered: totalDelivered,
+      cancelled,
+      // Taux calcule sur les livraisons effectuees dans la periode, rapportees
+      // aux colis qui y sont nes : c'est la lecture attendue d'un rapport.
+      deliveryRate: totalCreated ? Math.round((totalDelivered / totalCreated) * 100) : 0,
+      revenue: Number(payments._sum.amount || 0),
+      deliveredAmount: delivered.reduce((sum, parcel) => sum + Number(parcel.totalAmount ?? parcel.price ?? 0), 0)
+    },
+    parcelsByStatus: Object.fromEntries(grouped.map((row) => [row.status, row._count.status])),
+    series,
+    topDrivers: topDrivers.map((row) => ({
+      driverId: row.driverId,
+      fullName: nameById.get(row.driverId) ?? null,
+      delivered: row._count.driverId
+    }))
+  };
+}
+
+// ============================================================
 // STATS - Statistiques globales
 // ============================================================
 
@@ -3476,11 +4557,18 @@ export const driverStats = handle('driver.stats', async (req, res) => {
 // ============================================================
 
 export const garageDailyReport = handle('garage.reportDaily', async (req, res) => {
-  return ok(res, { message: 'Rapport journalier', data: { report: { date: req.query.date, stats: await globalStats() } } });
+  const range = dayRange(req.query.date);
+  const report = await buildPeriodReport({ scope: garageScopeWhere(req.user.garageId), ...range });
+  return ok(res, { message: 'Rapport journalier', data: { report: { date: range.date, ...report } } });
 });
 
 export const garageMonthlyReport = handle('garage.reportMonthly', async (req, res) => {
-  return ok(res, { message: 'Rapport mensuel', data: { report: { year: req.query.year, month: req.query.month, stats: await globalStats() } } });
+  const range = monthRange(req.query.year, req.query.month);
+  const report = await buildPeriodReport({ scope: garageScopeWhere(req.user.garageId), ...range });
+  return ok(res, {
+    message: 'Rapport mensuel',
+    data: { report: { year: range.year, month: range.month, ...report } }
+  });
 });
 
 export const garageExport = handle('garage.export', async (req, res) => {
@@ -3489,11 +4577,18 @@ export const garageExport = handle('garage.export', async (req, res) => {
 });
 
 export const superAdminDailyReport = handle('super.reportDaily', async (req, res) => {
-  return ok(res, { message: 'Rapport journalier', data: { report: { date: req.query.date, stats: await globalStats() } } });
+  const range = dayRange(req.query.date);
+  const report = await buildPeriodReport({ scope: {}, ...range });
+  return ok(res, { message: 'Rapport journalier', data: { report: { date: range.date, ...report } } });
 });
 
 export const superAdminMonthlyReport = handle('super.reportMonthly', async (req, res) => {
-  return ok(res, { message: 'Rapport mensuel', data: { report: { year: req.query.year, month: req.query.month, stats: await globalStats() } } });
+  const range = monthRange(req.query.year, req.query.month);
+  const report = await buildPeriodReport({ scope: {}, ...range });
+  return ok(res, {
+    message: 'Rapport mensuel',
+    data: { report: { year: range.year, month: range.month, ...report } }
+  });
 });
 
 export const superAdminExport = handle('super.export', async (req, res) => {
@@ -3576,8 +4671,49 @@ export const superAdminUpdateUser = handle('super.userUpdate', async (req, res) 
   return ok(res, { message: 'Utilisateur mis a jour', data: { user: serializeUser(updated) } });
 });
 
+const ASSIGNABLE_ROLES = [
+  'client',
+  'driver',
+  'admin',
+  'super_admin',
+  'support',
+  'support_technique',
+  'support_commercial'
+];
+
 export const superAdminUpdateUserRole = handle('super.userRole', async (req, res) => {
-  const user = await prisma.user.update({ where: { id: req.params.userId }, data: { role: req.body.role }, include: { garage: true } });
+  const role = req.body.role;
+  if (!ASSIGNABLE_ROLES.includes(role)) {
+    throw new ValidationError([{ path: 'body.role', message: 'Role inconnu' }]);
+  }
+  // Se retirer soi-meme ses droits ferme la porte de l'interieur : un dernier
+  // super admin degrade ne pourrait plus la rouvrir.
+  if (req.params.userId === req.user.id && role !== req.user.role) {
+    throw new ForbiddenError('Impossible de modifier son propre role');
+  }
+
+  const existing = await prisma.user.findUnique({ where: { id: req.params.userId } });
+  if (!existing || existing.status === 'deleted') throw new NotFoundError('Utilisateur introuvable');
+
+  const user = await prisma.$transaction(async (tx) => {
+    const updated = await tx.user.update({
+      where: { id: existing.id },
+      data: { role },
+      include: { garage: true }
+    });
+
+    // Un changement de role redistribue des droits : il doit laisser une trace.
+    await audit(tx, req, {
+      action: 'user.role.update',
+      entityType: 'user',
+      entityId: updated.id,
+      beforeData: { role: existing.role },
+      afterData: { role: updated.role }
+    });
+
+    return updated;
+  });
+
   return ok(res, { message: 'Role mis a jour', data: { user: serializeUser(user) } });
 });
 
@@ -3721,19 +4857,72 @@ export const superAdminUpdateParcel = handle('super.parcelUpdate', async (req, r
 // AUDIT LOGS - Journaux d'audit
 // ============================================================
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Un identifiant non-UUID ferait remonter une erreur Prisma en 500 alors que la
+// faute vient du filtre : on la traite comme une erreur de validation.
+function auditUuidFilter(value, path) {
+  if (value === undefined || value === '') return undefined;
+  if (!UUID_PATTERN.test(String(value))) {
+    throw new ValidationError([{ path, message: 'Identifiant invalide' }], 'Filtre d audit invalide');
+  }
+  return String(value);
+}
+
+function auditDateFilter(from, to) {
+  const range = cleanUndefined({
+    gte: from ? new Date(from) : undefined,
+    lte: to ? new Date(to) : undefined
+  });
+  if (Object.values(range).some((date) => Number.isNaN(date.getTime()))) {
+    throw new ValidationError([{ path: 'query.from', message: 'Date ISO invalide' }], 'Filtre d audit invalide');
+  }
+  return Object.keys(range).length ? range : undefined;
+}
+
 export const auditLogs = handle('super.auditLogs', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
+  const search = String(req.query.search || '').trim();
+
   const where = cleanUndefined({
-    actorId: req.query.actorId,
-    action: req.query.action,
-    entityType: req.query.entityType,
-    entityId: req.query.entityId
+    actorId: auditUuidFilter(req.query.actorId, 'query.actorId'),
+    actorRole: req.query.actorRole || undefined,
+    action: req.query.action || undefined,
+    entityType: req.query.entityType || undefined,
+    entityId: auditUuidFilter(req.query.entityId, 'query.entityId'),
+    createdAt: auditDateFilter(req.query.from, req.query.to),
+    // La recherche libre porte sur le nom de l'action et le type d'entite :
+    // ce sont les deux colonnes lisibles par un humain dans la liste.
+    OR: search
+      ? [
+        { action: { contains: search, mode: 'insensitive' } },
+        { entityType: { contains: search, mode: 'insensitive' } }
+      ]
+      : undefined
   });
+
   const [total, auditLogsRows] = await Promise.all([
     prisma.auditLog.count({ where }),
-    prisma.auditLog.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take: limit })
+    prisma.auditLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit,
+      // Sans l'acteur, l'ecran n'affiche qu'un UUID : le nom est charge ici
+      // plutot que par un appel par ligne cote client.
+      include: { actor: { select: { id: true, fullName: true, phone: true, role: true } } }
+    })
   ]);
-  return ok(res, { message: 'Audit logs', data: { auditLogs: auditLogsRows.map(serializeAuditLog) }, meta: paginationMeta({ page, limit, total }) });
+
+  // `beforeData` / `afterData` transportent des valeurs metier completes
+  // (montants, coordonnees). Le support voit qui a fait quoi, sans le detail.
+  const detailed = req.user.role === 'super_admin';
+
+  return ok(res, {
+    message: 'Audit logs',
+    data: { auditLogs: auditLogsRows.map((row) => serializeAuditLog(row, { detailed })) },
+    meta: paginationMeta({ page, limit, total })
+  });
 });
 
 // ============================================================
@@ -3771,37 +4960,58 @@ export const updateSystemConfig = handle('super.configUpdate', async (req, res) 
 // BACKUP - Sauvegardes
 // ============================================================
 
-export const createBackup = handle('super.backupCreate', async (req, res) => {
-  const backup = await prisma.backup.create({ data: { status: 'completed', requestedBy: req.user.id, fileUrl: `local://${Date.now()}-${req.body.storage || 'local'}`, completedAt: new Date() } });
-  return ok(res, { status: 201, message: 'Backup cree', data: { backup } });
-});
-
-export const listBackups = handle('super.backups', async (_req, res) => {
-  const backups = await prisma.backup.findMany({ orderBy: { createdAt: 'desc' } });
-  return ok(res, { message: 'Backups', data: { backups } });
-});
-
-export const restoreBackup = handle('super.restore', async (req, res) => {
-  if (req.body.confirmation !== 'RESTORE') throw new ValidationError([{ path: 'body.confirmation', message: 'Confirmation RESTORE requise' }]);
-  return ok(res, { message: 'Restauration lancee', data: { restore: { status: 'running', backupId: req.body.backupId } } });
-});
+// Les sauvegardes vivent desormais dans `modules/backups` : elles pilotent
+// `pg_dump` / `pg_restore` et n'ont plus leur place dans ce controleur.
 
 // ============================================================
 // WEBHOOKS - Webhooks
 // ============================================================
 
+/**
+ * Le secret signe les livraisons sortantes : il est ecrit une fois et ne
+ * ressort jamais des lectures, seule sa presence est exposee.
+ */
+function serializeWebhook(webhook) {
+  if (!webhook) return null;
+  return {
+    id: webhook.id,
+    url: webhook.url,
+    events: webhook.events,
+    hasSecret: Boolean(webhook.secret),
+    isActive: webhook.isActive,
+    createdAt: webhook.createdAt,
+    updatedAt: webhook.updatedAt
+  };
+}
+
 export const listWebhooks = handle('webhooks.list', async (_req, res) => {
   const webhooks = await prisma.webhook.findMany({ orderBy: { createdAt: 'desc' } });
-  return ok(res, { message: 'Webhooks', data: { webhooks } });
+  return ok(res, { message: 'Webhooks', data: { webhooks: webhooks.map(serializeWebhook) } });
 });
 
 export const createWebhook = handle('webhooks.create', async (req, res) => {
-  const webhook = await prisma.webhook.create({ data: { url: req.body.url, events: req.body.events || [], secret: req.body.secret, createdBy: req.user.id } });
-  return ok(res, { status: 201, message: 'Webhook cree', data: { webhook } });
+  const url = typeof req.body.url === 'string' ? req.body.url.trim() : '';
+  // Une URL invalide ne serait decouverte qu'a la premiere livraison, cote
+  // worker, sans retour a l'administrateur : on la refuse a l'ecriture.
+  if (!/^https?:\/\/\S+$/i.test(url)) {
+    throw new ValidationError([{ path: 'body.url', message: 'URL http(s) valide requise' }]);
+  }
+  const events = Array.isArray(req.body.events) ? req.body.events.filter((event) => typeof event === 'string') : [];
+  if (events.length === 0) {
+    throw new ValidationError([{ path: 'body.events', message: 'Au moins un evenement est requis' }]);
+  }
+
+  const webhook = await prisma.webhook.create({
+    data: { url, events, secret: req.body.secret || null, createdBy: req.user.id }
+  });
+  return ok(res, { status: 201, message: 'Webhook cree', data: { webhook: serializeWebhook(webhook) } });
 });
 
 export const deleteWebhook = handle('webhooks.delete', async (req, res) => {
-  await prisma.webhook.delete({ where: { id: req.params.webhookId } });
+  // `delete` sur un identifiant deja retire leve une P2025 rendue en 500 :
+  // `deleteMany` rend l'appel rejouable apres une coupure reseau.
+  const removed = await prisma.webhook.deleteMany({ where: { id: req.params.webhookId } });
+  if (removed.count === 0) throw new NotFoundError('Webhook introuvable');
   return ok(res, { message: 'Webhook supprime' });
 });
 

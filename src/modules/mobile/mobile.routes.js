@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { authenticate, optionalAuthenticate } from '../../middlewares/auth.middleware.js';
 import { requireRoles } from '../../middlewares/rbac.middleware.js';
 import * as adminAssistanceController from '../admin-assistance.controller.js';
+import * as backupController from '../backups/backup.controller.js';
 import * as adminExpenseController from '../admin-expense.controller.js';
 import * as adminFinanceController from '../admin-finance.controller.js';
 import * as adminIdentityController from '../admin-identity.controller.js';
@@ -20,6 +21,9 @@ mobileRouter.put('/client/profile', authenticate, requireRoles('client'), mobile
 mobileRouter.get('/client/parcels/my-parcels', authenticate, requireRoles('client'), mobileController.clientParcels);
 mobileRouter.post('/client/parcels/create', authenticate, requireRoles('client'), mobileController.createParcel);
 mobileRouter.get('/client/parcels/:parcelId', authenticate, requireRoles('client'), mobileController.getParcelDetail);
+// Correction du colis par son expediteur, tant qu'aucun chauffeur ne s'est
+// engage dessus. Les gardes metier vivent dans le controleur.
+mobileRouter.put('/client/parcels/:parcelId', authenticate, requireRoles('client'), mobileController.updateParcel);
 mobileRouter.get('/client/parcels/:parcelId/delivery-code', authenticate, requireRoles('client'), mobileController.clientDeliveryCode);
 mobileRouter.post('/client/parcels/:parcelId/cancel', authenticate, requireRoles('client'), mobileController.cancelParcel);
 mobileRouter.post('/client/parcels/:parcelId/bids/:bidId/accept', authenticate, requireRoles('client'), mobileController.acceptBid);
@@ -119,6 +123,7 @@ mobileRouter.get('/garage-admin/stats', authenticate, requireRoles('admin'), mob
 mobileRouter.get('/garage-admin/parcels', authenticate, requireRoles('admin'), mobileController.garageParcels);
 mobileRouter.post('/garage-admin/parcels/create', authenticate, requireRoles('admin'), mobileController.createParcel);
 mobileRouter.get('/garage-admin/parcels/:parcelId', authenticate, requireRoles('admin'), mobileController.getParcelDetail);
+mobileRouter.put('/garage-admin/parcels/:parcelId', authenticate, requireRoles('admin'), mobileController.updateParcel);
 mobileRouter.put('/garage-admin/parcels/:parcelId/status', authenticate, requireRoles('admin'), mobileController.updateParcelStatus);
 mobileRouter.put('/garage-admin/parcels/:parcelId/assign-driver', authenticate, requireRoles('admin'), mobileController.assignDriver);
 mobileRouter.post('/garage-admin/parcels/bulk-assign', authenticate, requireRoles('admin'), mobileController.bulkAssignDriver);
@@ -159,7 +164,9 @@ mobileRouter.delete('/super-admin/parcels/:parcelId', authenticate, requireRoles
 mobileRouter.get('/super-admin/reports/daily', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminDailyReport);
 mobileRouter.get('/super-admin/reports/monthly', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminMonthlyReport);
 mobileRouter.get('/super-admin/export', authenticate, requireRoles('super_admin', 'support'), mobileController.superAdminExport);
-mobileRouter.get('/super-admin/audit-logs', authenticate, requireRoles('super_admin', 'support'), mobileController.auditLogs);
+// Le support technique suit la tracabilite des actions ; le controleur masque
+// les instantanes avant/apres pour tout role autre que super_admin.
+mobileRouter.get('/super-admin/audit-logs', authenticate, requireRoles('super_admin', 'support', 'support_technique'), mobileController.auditLogs);
 mobileRouter.get('/super-admin/payments/cash-declarations', authenticate, requireRoles('super_admin', 'support'), mobileController.pendingCashDeclarations);
 mobileRouter.post('/super-admin/payments/:paymentId/validate-cash', authenticate, requireRoles('super_admin', 'support'), mobileController.validateCashDeclaration);
 mobileRouter.post('/super-admin/payments/:paymentId/reject-cash', authenticate, requireRoles('super_admin', 'support'), mobileController.rejectCashDeclaration);
@@ -168,9 +175,13 @@ mobileRouter.post('/super-admin/payments/:paymentId/reject-cash', authenticate, 
 mobileRouter.get('/public/broadcasts', optionalAuthenticate, mobileController.getPublicBroadcasts);
 mobileRouter.get('/super-admin/config', authenticate, requireRoles('super_admin', 'support'), mobileController.getSystemConfig);
 mobileRouter.put('/super-admin/config', authenticate, requireRoles('super_admin', 'support'), mobileController.updateSystemConfig);
-mobileRouter.post('/super-admin/backup', authenticate, requireRoles('super_admin', 'support'), mobileController.createBackup);
-mobileRouter.get('/super-admin/backups', authenticate, requireRoles('super_admin', 'support'), mobileController.listBackups);
-mobileRouter.post('/super-admin/restore', authenticate, requireRoles('super_admin', 'support'), mobileController.restoreBackup);
+// Sauvegardes PostgreSQL (module `backups`). Un dump contient l'intégralité des
+// données personnelles : le télécharger et le restaurer restent réservés au
+// super administrateur, le support ne garde que la lecture de l'historique.
+mobileRouter.post('/super-admin/backup', authenticate, requireRoles('super_admin'), backupController.createBackup);
+mobileRouter.get('/super-admin/backups', authenticate, requireRoles('super_admin', 'support'), backupController.listBackups);
+mobileRouter.get('/super-admin/backups/:backupId/download', authenticate, requireRoles('super_admin'), backupController.downloadBackup);
+mobileRouter.post('/super-admin/restore', authenticate, requireRoles('super_admin'), backupController.restoreBackup);
 mobileRouter.get('/super-admin/system/health', authenticate, requireRoles('super_admin', 'support'), mobileController.systemHealth);
 
 mobileRouter.post('/vehicles', authenticate, requireRoles('admin', 'super_admin'), mobileController.createVehicle);
@@ -226,6 +237,10 @@ mobileRouter.post('/messages', authenticate, mobileController.sendMessage);
 mobileRouter.get('/messages/conversations', authenticate, mobileController.conversations);
 mobileRouter.get('/messages/thread', authenticate, mobileController.messageThread);
 mobileRouter.patch('/messages/:messageId/read', authenticate, mobileController.readMessage);
+// Edition reservee a l'auteur ; suppression logique ouverte en plus a la
+// moderation (super admin / support). Le controleur porte les deux gardes.
+mobileRouter.patch('/messages/:messageId', authenticate, mobileController.updateMessage);
+mobileRouter.delete('/messages/:messageId', authenticate, mobileController.deleteMessage);
 
 mobileRouter.post('/support/messages', authenticate, mobileController.createSupportMessage);
 mobileRouter.get('/support/messages', authenticate, mobileController.listSupportMessages);

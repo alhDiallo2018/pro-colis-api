@@ -7,7 +7,10 @@ RUN npm install
 FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
-RUN apk add --no-cache openssl
+# `postgresql16-client` fournit pg_dump / pg_restore aux routes de sauvegarde.
+# La version majeure suit celle du service `postgres` du compose : un client
+# plus ancien que le serveur refuse de lire son catalogue.
+RUN apk add --no-cache openssl postgresql16-client
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npx prisma generate

@@ -36,6 +36,20 @@ const envSchema = z.object({
   // Si "true", un chauffeur doit avoir son identité vérifiée (isVerified) pour
   // enchérir / publier une annonce. Mettre à "true" quand la revue KYC est prête.
   REQUIRE_DRIVER_VERIFICATION: z.string().default('false').transform((v) => v === 'true'),
+  // --- Sauvegardes PostgreSQL ---
+  // Répertoire des dumps. Doit pointer sur un volume persistant, sinon les
+  // sauvegardes disparaissent avec le conteneur.
+  BACKUP_DIR: z.string().default('backups'),
+  // Nombre de dumps conservés : au-delà, les plus anciens sont purgés après
+  // chaque sauvegarde réussie.
+  BACKUP_RETENTION: z.coerce.number().int().min(1).max(365).default(7),
+  // Une restauration écrase la base entière : elle exige un opt-in explicite du
+  // déploiement, en plus de la confirmation envoyée par l'appelant.
+  BACKUP_ALLOW_RESTORE: z.string().default('false').transform((v) => v === 'true'),
+  // Chemins des binaires clients PostgreSQL, surchargeables quand ils ne sont
+  // pas dans le PATH (poste de développement, image sans postgresql-client).
+  PG_DUMP_BIN: z.string().default('pg_dump'),
+  PG_RESTORE_BIN: z.string().default('pg_restore'),
   BREVO_API_KEY: z.string().optional(),
   BREVO_SENDER_EMAIL: z.string().email().optional(),
   BREVO_SENDER_NAME: z.string().optional(),
