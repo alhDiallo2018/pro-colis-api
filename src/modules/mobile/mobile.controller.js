@@ -145,27 +145,117 @@ async function getConfigValue(key, fallback) {
 }
 
 async function notifyAdmins(tx, type, title, body, data = {}) {
+  // ✅ Récupérer TOUS les admins ET supports (technique et commercial)
   const admins = await tx.user.findMany({
-    where: { role: 'super_admin', status: 'active' },
+    where: {
+      role: { 
+        in: [
+          'super_admin', 
+          'admin', 
+          'support_technique', 
+          'support_commercial',
+          'support'  // Gardé pour compatibilité
+        ] 
+      },
+      status: 'active'
+    },
     select: { id: true, email: true, phone: true }
   });
+  
+  // Si aucun admin/support trouvé, on ne fait rien
+  if (admins.length === 0) return;
+
+  // Créer les notifications pour chaque admin/support
   const notifs = admins.map((a) =>
-    tx.notification.create({ data: { userId: a.id, type, title, body, data } })
+    tx.notification.create({ 
+      data: { 
+        userId: a.id, 
+        type, 
+        title, 
+        body, 
+        data 
+      } 
+    })
   );
   await Promise.all(notifs);
 
+  // Envoyer les emails/SMS si Brevo est configuré
   if (isBrevoConfigured()) {
     for (const admin of admins) {
       if (admin.email) {
-        sendNotificationEmail({ email: admin.email, subject: title, message: body }).catch(() => { });
+        sendNotificationEmail({ 
+          email: admin.email, 
+          subject: title, 
+          message: body 
+        }).catch(() => {});
       }
       if (admin.phone) {
-        const smsContent = body.length > 300 ? `[Admin] ${title}: ${body.substring(0, 300)}...` : `[Admin] ${title}: ${body}`;
-        sendNotificationSms({ phone: admin.phone, message: smsContent, tag: type }).catch(() => { });
+        const smsContent = body.length > 300 
+          ? `[Admin] ${title}: ${body.substring(0, 300)}...` 
+          : `[Admin] ${title}: ${body}`;
+        sendNotificationSms({ 
+          phone: admin.phone, 
+          message: smsContent, 
+          tag: type 
+        }).catch(() => {});
       }
     }
   }
 }
+
+async function notifySupportTeam(tx, title, body, data = {}, senderId, senderName) {
+  // Récupérer TOUS les utilisateurs support
+  const supportUsers = await tx.user.findMany({
+    where: {
+      role: { 
+        in: ['support_technique', 'support_commercial', 'super_admin', 'admin', 'support'] 
+      },
+      status: 'active'
+    },
+    select: { id: true, email: true, phone: true }
+  });
+
+  if (supportUsers.length === 0) return;
+
+  // Créer une notification pour chaque support
+  const notifs = supportUsers.map((user) =>
+    tx.notification.create({
+      data: {
+        userId: user.id,
+        senderId: senderId || null,
+        senderName: senderName || 'PRO COLIS',
+        type: 'support_message',
+        title,
+        body,
+        data,
+        priority: 'high'
+      }
+    })
+  );
+  await Promise.all(notifs);
+
+  // Envoyer les emails/SMS si configuré
+  if (isBrevoConfigured()) {
+    for (const user of supportUsers) {
+      if (user.email) {
+        sendNotificationEmail({ 
+          email: user.email, 
+          subject: title, 
+          message: body 
+        }).catch(() => {});
+      }
+      if (user.phone) {
+        sendNotificationSms({ 
+          phone: user.phone, 
+          message: body, 
+          tag: 'support' 
+        }).catch(() => {});
+      }
+    }
+  }
+}
+
+
 
 function handle(action, fn) {
   return async (req, res) => {
@@ -3057,9 +3147,157 @@ export const sendMessage = handle('messages.send', async (req, res) => {
     ]);
   }
 
-  // Sans cette lecture, un destinataire inexistant remontait en violation de
-  // cle etrangere Prisma, donc en 500 opaque au lieu d'un 404 exploitable par
-  // les clients.
+  // ✅ Récupérer le destinataire original pour connaître son rôle
+  const originalReceiver = await prisma.user.findFirst({
+    where: { id: receiverId, deletedAt: null },
+    select: { id: true, role: true, fullName: true }
+  });
+
+  if (!originalReceiver) throw new NotFoundError('Destinataire introuvable');
+
+  // ✅ Vérifier si c'est un message support (le destinataire est un support)
+  const isSupportTarget = ['support_technique', 'support_commercial', 'support', 'admin', 'super_admin'].includes(originalReceiver.role);
+  
+  // ✅ Le client peut forcer le type via 'type' ou 'isSupportMessage'
+  const supportType = req.body.type || '';
+  const isSupportMessage = req.body.isSupportMessage === true || 
+                           req.body.isSupport === true ||
+                           supportType === 'support' ||
+                           supportType === 'support_technique' ||
+                           supportType === 'support_commercial' ||
+                           (isSupportTarget && !req.body.isPrivate);
+
+  // ✅ Si c'est un message support
+  if (isSupportMessage) {
+    // ✅ Déterminer le type de support cible
+    let targetRole = supportType;
+    
+    // Si le type n'est pas spécifié, on utilise le rôle du destinataire
+    if (!targetRole || targetRole === '') {
+      if (originalReceiver.role === 'support_technique') {
+        targetRole = 'support_technique';
+      } else if (originalReceiver.role === 'support_commercial') {
+        targetRole = 'support_commercial';
+      } else {
+        // Si le destinataire est admin/super_admin, on envoie à tous
+        targetRole = 'support';
+      }
+    }
+
+    // ✅ Récupérer TOUS les agents du même type de support
+    const roleMap = {
+      'support': ['support_technique', 'support_commercial', 'support'],
+      'support_technique': ['support_technique'],
+      'support_commercial': ['support_commercial']
+    };
+
+    const roles = roleMap[targetRole] || ['support_technique', 'support_commercial', 'support'];
+
+    const supportUsers = await prisma.user.findMany({
+      where: {
+        role: { in: roles },
+        status: 'active'
+      },
+      select: { id: true, email: true, phone: true, fullName: true, role: true }
+    });
+
+    if (supportUsers.length === 0) {
+      throw new NotFoundError(`Aucun support disponible pour le type: ${targetRole}`);
+    }
+
+    // ✅ Créer un message pour CHAQUE agent support
+    const messages = await prisma.$transaction(async (tx) => {
+      const createdMessages = [];
+      for (const user of supportUsers) {
+        const msg = await tx.message.create({
+          data: {
+            senderId: req.user.id,
+            receiverId: user.id,
+            parcelId: req.body.parcelId || null,
+            body: body,
+            audioUrl: req.body.audioUrl || null,
+            photoUrl: req.body.photoUrl || null,
+            videoUrl: req.body.videoUrl || null,
+            isRead: false
+          }
+        });
+        createdMessages.push(msg);
+      }
+      return createdMessages;
+    });
+
+    // ✅ Créer une notification pour CHAQUE agent support
+    await prisma.$transaction(async (tx) => {
+      for (const user of supportUsers) {
+        const sender = req.user;
+        const typeLabel = targetRole === 'support_technique' ? 'technique' 
+                        : targetRole === 'support_commercial' ? 'commercial' 
+                        : 'support';
+        
+        await tx.notification.create({
+          data: {
+            userId: user.id,
+            senderId: sender.id,
+            senderName: sender.fullName || 'PRO COLIS',
+            parcelId: req.body.parcelId || null,
+            type: `support_message_${targetRole}`,
+            title: `Nouveau message ${typeLabel} de ${sender.fullName}`,
+            body: body?.slice(0, 100) || 'Nouveau message support',
+            data: { 
+              messageId: messages.find(m => m.receiverId === user.id)?.id,
+              supportUserId: user.id,
+              parcelId: req.body.parcelId,
+              senderId: sender.id,
+              targetRole: targetRole
+            },
+            priority: 'high'
+          }
+        });
+      }
+    });
+
+    // ✅ Envoyer les emails/SMS à CHAQUE agent support
+    if (isBrevoConfigured()) {
+      const sender = req.user;
+      for (const user of supportUsers) {
+        if (user.email) {
+          sendNotificationEmail({
+            email: user.email,
+            subject: `[SUPPORT] Nouveau message de ${sender.fullName}`,
+            message: body?.slice(0, 500) || 'Nouveau message support'
+          }).catch(() => {});
+        }
+        if (user.phone) {
+          sendNotificationSms({
+            phone: user.phone,
+            message: `[SUPPORT] ${sender.fullName}: ${body?.slice(0, 150) || 'Nouveau message'}`,
+            tag: 'support'
+          }).catch(() => {});
+        }
+      }
+    }
+
+    const typeLabel = targetRole === 'support_technique' ? 'technique' 
+                    : targetRole === 'support_commercial' ? 'commercial' 
+                    : 'support';
+
+    return ok(res, {
+      status: 201,
+      message: `Message ${typeLabel} envoyé à ${supportUsers.length} agent(s)`,
+      data: { 
+        messages: messages.map(serializeMessage),
+        supportUsers: supportUsers.map(u => ({ 
+          id: u.id, 
+          fullName: u.fullName, 
+          role: u.role 
+        })),
+        targetRole: targetRole
+      }
+    });
+  }
+
+  // Sinon, comportement normal (message privé)
+  // ✅ Vérifier que le destinataire existe et est actif
   const receiver = await prisma.user.findFirst({
     where: { id: receiverId, deletedAt: null },
     select: { id: true, status: true }
@@ -3084,10 +3322,6 @@ export const sendMessage = handle('messages.send', async (req, res) => {
     }
   });
 
-  // La notification ne conditionne pas l'envoi : le message est deja ecrit, une
-  // ligne de notification en echec ne doit pas le faire perdre a son auteur.
-  // Les messages de discussion ne partent volontairement pas en e-mail / SMS,
-  // contrairement aux notifications metier qui passent par `notify`.
   try {
     const sender = await prisma.user.findUnique({
       where: { id: req.user.id },
@@ -3109,7 +3343,11 @@ export const sendMessage = handle('messages.send', async (req, res) => {
     /* noop */
   }
 
-  return ok(res, { status: 201, message: 'Message envoye', data: { message: serializeMessage(message) } });
+  return ok(res, { 
+    status: 201, 
+    message: 'Message envoye', 
+    data: { message: serializeMessage(message) } 
+  });
 });
 
 export const updateMessage = handle('messages.update', async (req, res) => {
@@ -5291,12 +5529,14 @@ export const adminSupportConversations = async (req, res) => {
   try {
     console.log('📨 adminSupportConversations - Début');
 
+    const supportRoles = ['admin', 'super_admin', 'support', 'support_technique', 'support_commercial'];
+
     const supportMessages = await prisma.message.findMany({
       where: {
         parcelId: null,
         OR: [
-          { sender: { role: { in: ['admin', 'super_admin', 'support'] } } },
-          { receiver: { role: { in: ['admin', 'super_admin', 'support'] } } }
+          { sender: { role: { in: supportRoles } } },
+          { receiver: { role: { in: supportRoles } } }
         ]
       },
       include: {
@@ -5332,8 +5572,8 @@ export const adminSupportConversations = async (req, res) => {
     const conversationMap = new Map();
 
     for (const msg of supportMessages) {
-      const isSupportSender = ['admin', 'super_admin', 'support'].includes(msg.sender.role);
-      const isSupportReceiver = ['admin', 'super_admin', 'support'].includes(msg.receiver.role);
+      const isSupportSender = supportRoles.includes(msg.sender.role);
+      const isSupportReceiver = supportRoles.includes(msg.receiver.role);
       const isSupport = isSupportSender || isSupportReceiver;
 
       if (!isSupport) continue;
@@ -5360,7 +5600,9 @@ export const adminSupportConversations = async (req, res) => {
             id: supportUser.id,
             fullName: supportUser.fullName,
             profilePhoto: supportUser.profilePhoto,
-            role: supportUser.role
+            role: supportUser.role,
+            email: supportUser.email,
+            phone: supportUser.phone
           },
           lastMessage: msg.body,
           lastMessageDate: msg.createdAt,
@@ -5655,7 +5897,7 @@ export const adminSupportReply = async (req, res) => {
       });
     }
 
-    if (!['admin', 'super_admin', 'support'].includes(support.role)) {
+    if (!['admin', 'super_admin', 'support', 'support_technique', 'support_commercial'].includes(support.role)) {
       return res.status(403).json({
         success: false,
         message: 'L\'utilisateur n\'est pas un support valide',
@@ -5682,6 +5924,18 @@ export const adminSupportReply = async (req, res) => {
       });
     }
 
+    // ✅ Récupérer tous les supports pour les notifier aussi
+    const supportUsers = await prisma.user.findMany({
+      where: {
+        role: { 
+          in: ['admin', 'super_admin', 'support', 'support_technique', 'support_commercial'] 
+        },
+        status: 'active'
+      },
+      select: { id: true, fullName: true, phone: true, email: true }
+    });
+
+    // Créer le message pour le destinataire
     const message = await prisma.message.create({
       data: {
         senderId: supportUserId,
@@ -5711,6 +5965,7 @@ export const adminSupportReply = async (req, res) => {
 
     console.log('✅ Message créé:', message.id);
 
+    // ✅ Notifier le destinataire
     await prisma.notification.create({
       data: {
         userId: receiverId,
@@ -5727,6 +5982,30 @@ export const adminSupportReply = async (req, res) => {
         priority: 'high'
       }
     });
+
+    // ✅ Notifier tous les autres supports de la réponse
+    const supportNotifs = supportUsers
+      .filter(u => u.id !== supportUserId && u.id !== receiverId)
+      .map((user) =>
+        prisma.notification.create({
+          data: {
+            userId: user.id,
+            type: 'support_reply_to_team',
+            title: `Réponse support de ${support.fullName}`,
+            body: body
+              ? `Le support a répondu à ${receiver.fullName}: ${body.substring(0, 100)}${body.length > 100 ? '...' : ''}`
+              : 'Le support a répondu à un utilisateur',
+            data: { 
+              supportUserId, 
+              receiverId, 
+              messageId: message.id,
+              repliedTo: receiver.fullName
+            },
+            priority: 'normal'
+          }
+        })
+      );
+    await Promise.all(supportNotifs);
 
     return res.status(200).json({
       success: true,
