@@ -1,7 +1,7 @@
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import { disconnectPrisma, prisma } from '../src/config/prisma.js';
 import { logger } from '../src/config/logger.js';
+import { disconnectPrisma, prisma } from '../src/config/prisma.js';
 
 const weakPins = new Set([
   '000000',
@@ -88,7 +88,7 @@ async function upsertSuperAdmin(profile) {
 
     if (matchingUsers.length > 1) {
       throw new Error(
-        'Conflit détecté : l’email et le téléphone appartiennent à deux comptes différents'
+        'Conflit détecté : l\'email et le téléphone appartiennent à deux comptes différents'
       );
     }
 
@@ -101,6 +101,7 @@ async function upsertSuperAdmin(profile) {
       );
     }
 
+    // Préparer les données de l'utilisateur
     const userData = {
       email: profile.email,
       phone: profile.phone,
@@ -117,21 +118,43 @@ async function upsertSuperAdmin(profile) {
       deletedAt: null
     };
 
-    const user = existingUser
-      ? await tx.user.update({
-          where: { id: existingUser.id },
-          data: userData
-        })
-      : await tx.user.create({ data: userData });
+    // Créer ou mettre à jour l'utilisateur
+    let user;
+    if (existingUser) {
+      user = await tx.user.update({
+        where: { id: existingUser.id },
+        data: userData
+      });
+    } else {
+      user = await tx.user.create({ 
+        data: {
+          ...userData,
+          // Le schema Prisma génère un UUID automatiquement si on ne le spécifie pas
+          // Mais on peut aussi en générer un manuellement si besoin
+        }
+      });
+    }
 
     // Plusieurs écrans supposent la présence d'un score. L'upsert garantit
     // cette relation sans modifier les éventuels points d'un compte existant.
     await tx.score.upsert({
       where: { userId: user.id },
-      update: { lastUpdated: new Date() },
-      create: { userId: user.id, points: 0, totalEarned: 0 }
+      update: { 
+        points: 0,
+        totalEarned: 0,
+        totalSpent: 0,
+        lastUpdated: new Date() 
+      },
+      create: { 
+        userId: user.id, 
+        points: 0, 
+        totalEarned: 0,
+        totalSpent: 0,
+        lastUpdated: new Date()
+      }
     });
 
+    // Journaliser l'action
     await tx.auditLog.create({
       data: {
         actorId: user.id,
@@ -180,12 +203,21 @@ async function main() {
     },
     'Super-admin seed completed'
   );
+
+  // Afficher les informations de connexion
+  console.log('\n✅ Super-admin créé avec succès !');
+  console.log('📧 Email:', profile.email);
+  console.log('📱 Téléphone:', profile.phone);
+  console.log('🔑 PIN:', profile.pin);
+  console.log('🔒 Mot de passe:', profile.password);
+  console.log('⚠️  Conservez ces identifiants dans un endroit sécurisé.\n');
 }
 
 try {
   await main();
 } catch (error) {
   logger.error({ err: error }, 'Super-admin seed failed');
+  console.error('\n❌ Erreur:', error.message);
   process.exitCode = 1;
 } finally {
   await disconnectPrisma();

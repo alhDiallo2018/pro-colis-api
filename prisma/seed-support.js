@@ -12,8 +12,8 @@
 //
 // Usage : npm run seed:support
 
-import bcrypt from 'bcryptjs';
 import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
 
@@ -340,9 +340,12 @@ async function main() {
     const createdAt = ago(ticket.createdAgo);
     const resolvedAt =
       ticket.resolvedDaysAgo === undefined ? null : withinThisMonth(ticket.resolvedDaysAgo);
+    
     const data = {
+      reference: ticket.reference,
       subject: ticket.subject,
-      category: ticket.category,
+      body: ticket.category ? `Catégorie: ${ticket.category}` : null,
+      category: ticket.category || null,
       channel: ticket.channel,
       priority: ticket.priority,
       status: ticket.status,
@@ -358,7 +361,7 @@ async function main() {
     await prisma.supportTicket.upsert({
       where: { reference: ticket.reference },
       update: data,
-      create: { reference: ticket.reference, ...data }
+      create: data
     });
   }
   console.log(`✔ ${tickets.length} tickets`);
@@ -389,17 +392,18 @@ async function main() {
     await prisma.commercialLead.create({
       data: {
         name: lead.name,
-        city: lead.city,
+        city: lead.city || null,
         kind: lead.kind,
         stage: lead.stage,
         monthlyValue: lead.monthlyValue,
-        contactName: lead.contactName,
-        contactPhone: lead.contactPhone,
+        contactName: lead.contactName || null,
+        contactPhone: lead.contactPhone || null,
         nextFollowUpAt:
           lead.followUpInDays === undefined
             ? null
             : new Date(now.getTime() + lead.followUpInDays * DAY),
         signedAt: lead.signedDaysAgo === undefined ? null : withinThisMonth(lead.signedDaysAgo),
+        notes: null,
         ownerId: comAgent.id
       }
     });
@@ -410,8 +414,16 @@ async function main() {
   // Les 3 contrats signés pèsent 1 180 000 F ; un objectif de 1 500 000 F situe
   // l'agent à ~79 %, donc une jauge lisible plutôt que 0 % ou 100 %.
   await prisma.commercialObjective.upsert({
-    where: { ownerId_period: { ownerId: comAgent.id, period: periodKey } },
-    update: { targetAmount: 1500000, territory: 'Thies · Diourbel · Mbour' },
+    where: { 
+      ownerId_period: { 
+        ownerId: comAgent.id, 
+        period: periodKey 
+      } 
+    },
+    update: { 
+      targetAmount: 1500000, 
+      territory: 'Thies · Diourbel · Mbour' 
+    },
     create: {
       ownerId: comAgent.id,
       period: periodKey,

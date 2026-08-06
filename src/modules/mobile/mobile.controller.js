@@ -51,8 +51,6 @@ async function syncDriverVehicle(client, user, body) {
     orderBy: { createdAt: 'desc' }
   });
 
-  // La plaque est unique : refuser explicitement plutot que de laisser
-  // l'erreur Prisma faire echouer toute l'operation sans message clair.
   if (plateNumber) {
     const clash = await client.vehicle.findFirst({
       where: { plateNumber, deletedAt: null, NOT: { driverId: user.id } }
@@ -75,7 +73,6 @@ async function syncDriverVehicle(client, user, body) {
     return;
   }
 
-  // Creation : plaque et modele sont obligatoires cote schema.
   if (plateNumber && model) {
     await client.vehicle.create({
       data: {
@@ -95,7 +92,12 @@ const parcelInclude = {
   arrivalGarage: true,
   departureZone: true,
   arrivalZone: true,
-  driver: { include: { garage: true } },
+  // ✅ CORRECTION : driver remplacé par assignedDriver
+  assignedDriver: { 
+    include: { 
+      garage: true 
+    } 
+  },
   bids: { 
     include: { 
       driver: true,
@@ -106,7 +108,10 @@ const parcelInclude = {
     orderBy: { createdAt: 'desc' } 
   },
   events: { orderBy: { createdAt: 'asc' } },
-  media: { orderBy: { createdAt: 'asc' } }
+  media: { orderBy: { createdAt: 'asc' } },
+  // ✅ NOUVEAU : Inclure les relations de proposition
+  proposedDriver: { select: { id: true, fullName: true, phone: true, profilePhoto: true } },
+  // assignedDriver déjà inclus ci-dessus avec garage
 };
 
 // Les files cash affichent aussi le trajet du colis. Charger uniquement les
@@ -145,7 +150,6 @@ async function getConfigValue(key, fallback) {
 }
 
 async function notifyAdmins(tx, type, title, body, data = {}) {
-  // ✅ Récupérer TOUS les admins ET supports (technique et commercial)
   const admins = await tx.user.findMany({
     where: {
       role: { 
@@ -154,7 +158,7 @@ async function notifyAdmins(tx, type, title, body, data = {}) {
           'admin', 
           'support_technique', 
           'support_commercial',
-          'support'  // Gardé pour compatibilité
+          'support'
         ] 
       },
       status: 'active'
@@ -162,10 +166,8 @@ async function notifyAdmins(tx, type, title, body, data = {}) {
     select: { id: true, email: true, phone: true }
   });
   
-  // Si aucun admin/support trouvé, on ne fait rien
   if (admins.length === 0) return;
 
-  // Créer les notifications pour chaque admin/support
   const notifs = admins.map((a) =>
     tx.notification.create({ 
       data: { 
@@ -179,7 +181,6 @@ async function notifyAdmins(tx, type, title, body, data = {}) {
   );
   await Promise.all(notifs);
 
-  // Envoyer les emails/SMS si Brevo est configuré
   if (isBrevoConfigured()) {
     for (const admin of admins) {
       if (admin.email) {
@@ -204,7 +205,6 @@ async function notifyAdmins(tx, type, title, body, data = {}) {
 }
 
 async function notifySupportTeam(tx, title, body, data = {}, senderId, senderName) {
-  // Récupérer TOUS les utilisateurs support
   const supportUsers = await tx.user.findMany({
     where: {
       role: { 
@@ -217,7 +217,6 @@ async function notifySupportTeam(tx, title, body, data = {}, senderId, senderNam
 
   if (supportUsers.length === 0) return;
 
-  // Créer une notification pour chaque support
   const notifs = supportUsers.map((user) =>
     tx.notification.create({
       data: {
@@ -234,7 +233,6 @@ async function notifySupportTeam(tx, title, body, data = {}, senderId, senderNam
   );
   await Promise.all(notifs);
 
-  // Envoyer les emails/SMS si configuré
   if (isBrevoConfigured()) {
     for (const user of supportUsers) {
       if (user.email) {
@@ -254,8 +252,6 @@ async function notifySupportTeam(tx, title, body, data = {}, senderId, senderNam
     }
   }
 }
-
-
 
 function handle(action, fn) {
   return async (req, res) => {
@@ -291,38 +287,34 @@ function handle(action, fn) {
 
 function parcelAccessWhere(user, parcelId) {
   if (user.role === 'super_admin') return { id: parcelId };
-  // `support` est le compte partage historique, co-equivalent de super_admin
-  // sur toutes les routes /super-admin/*.
   if (user.role === 'support') return { id: parcelId };
-  // Le support instruit tickets et reclamations : il lit n'importe quel colis.
-  // L'ecriture reste refusee, aucune route de modification n'etant exposee
-  // sous les prefixes /support-technique et /support-commercial.
   if (user.role === 'support_technique' || user.role === 'support_commercial') {
     return { id: parcelId };
   }
   if (user.role === 'client') return { id: parcelId, senderId: user.id };
-  if (user.role === 'driver') return { id: parcelId, driverId: user.id };
+  if (user.role === 'driver') {
+    return {
+      id: parcelId,
+      OR: [
+        { assignedDriverId: user.id },
+        { driverId: user.id },
+        { proposedDriverId: user.id }
+      ]
+    };
+  }
   if (user.role === 'admin') {
     return {
       id: parcelId,
       OR: [{ departureGarageId: user.garageId }, { arrivalGarageId: user.garageId }]
     };
   }
-  // Refus par defaut : un role non traite ne doit pas heriter d'un acces large.
   return { id: parcelId, senderId: '__none__' };
 }
 
-/**
- * Étend uniquement la lecture client aux colis dont son téléphone est celui
- * du destinataire. Les mutations continuent d'utiliser `parcelAccessWhere`,
- * afin qu'un destinataire ne puisse ni annuler ni modifier l'envoi.
- */
 function parcelReadAccessWhere(user, parcelId) {
   if (user.role !== 'client') return parcelAccessWhere(user, parcelId);
 
   const ownership = [{ senderId: user.id }];
-  // Ne jamais ajouter un téléphone vide : Prisma pourrait réduire un filtre
-  // `undefined` à un objet vide dans le OR et élargir involontairement l'accès.
   if (user.phone) ownership.push({ receiverPhone: user.phone });
 
   return {
@@ -349,10 +341,6 @@ async function findReadableParcel(user, parcelId) {
   return parcel;
 }
 
-// ============================================================
-// ✅ NOUVELLE FONCTION : Récupère un colis pour un chauffeur
-// avec accès aux colis en statut 'free' où il a fait une offre
-// ============================================================
 async function findAccessibleParcelForDriver(user, parcelId) {
   const parcel = await prisma.parcel.findFirst({
     where: {
@@ -364,20 +352,15 @@ async function findAccessibleParcelForDriver(user, parcelId) {
 
   if (!parcel) throw new NotFoundError('Colis introuvable');
 
-  // ✅ Vérifier si le chauffeur a accès à ce colis
-  const isAssigned = parcel.driverId === user.id;
+  const isAssigned = parcel.assignedDriverId === user.id || parcel.driverId === user.id;
+  const isProposed = parcel.proposedDriverId === user.id && ['pending', 'countered'].includes(parcel.proposalStatus);
   const hasBid = parcel.bids?.some(bid => bid.driverId === user.id);
   const isFree = parcel.status === 'free';
 
-  // ✅ ACCÈS AUTORISÉ SI :
-  // 1. Le chauffeur est assigné au colis
-  // 2. Le chauffeur a fait une offre sur le colis
-  // 3. Le colis est en statut "free" (libre pour tous)
-  if (isAssigned || hasBid || isFree) {
+  if (isAssigned || isProposed || hasBid || isFree) {
     return parcel;
   }
 
-  // ❌ ACCÈS REFUSÉ
   throw new NotFoundError('Colis introuvable');
 }
 
@@ -423,10 +406,6 @@ async function notify(tx, { userId, parcelId, bidId, senderId, senderName = 'PRO
   return notification;
 }
 
-/**
- * Gating KYC : si REQUIRE_DRIVER_VERIFICATION est actif, le chauffeur doit avoir
- * son identité vérifiée (isVerified) pour enchérir / publier une annonce.
- */
 async function assertDriverVerified(req) {
   if (!env.REQUIRE_DRIVER_VERIFICATION) return;
   const me = await prisma.user.findUnique({ where: { id: req.user.id }, select: { isVerified: true } });
@@ -441,6 +420,8 @@ function statusDescription(status) {
   return {
     pending: 'Colis cree',
     free: 'Colis ouvert aux offres chauffeurs',
+    proposal_sent: 'Proposition envoyée au chauffeur',
+    negotiating: 'Négociation en cours',
     confirmed: 'Colis confirme',
     picked_up: 'Colis ramasse',
     in_transit: 'Colis en transit',
@@ -452,7 +433,6 @@ function statusDescription(status) {
 }
 
 async function changeParcelStatus(req, parcel, status, extra = {}) {
-  // La transition de statut touche plusieurs tables : colis, evenement, audit et notifications.
   return prisma.$transaction(async (tx) => {
     const updated = await tx.parcel.update({
       where: { id: parcel.id },
@@ -464,17 +444,13 @@ async function changeParcelStatus(req, parcel, status, extra = {}) {
         cancellationReason: status === 'cancelled' ? extra.reason : undefined,
         cancelledAt: status === 'cancelled' ? new Date() : undefined,
         signatureUrl: extra.signatureUrl,
-        driverId: extra.driverId
+        assignedDriverId: extra.driverId || undefined,
+        driverId: extra.driverId || undefined
       }),
       include: parcelInclude
     });
 
-    // Compteurs du chauffeur : ils alimentent le profil et les listes admin.
-    // Sans cette mise a jour ils restent a 0 a vie, ce qui affiche « 0
-    // livraison » a un chauffeur qui en a effectue plusieurs.
-    // La garde sur `parcel.status !== status` evite le double comptage si la
-    // meme transition est rejouee.
-    const driverId = updated.driverId;
+    const driverId = updated.assignedDriverId || updated.driverId;
     if (driverId && parcel.status !== status) {
       if (status === 'delivered') {
         await tx.user.update({
@@ -530,8 +506,6 @@ async function changeParcelStatus(req, parcel, status, extra = {}) {
       data: { trackingNumber: updated.trackingNumber, status }
     });
 
-    // P1 : lors d'une assignation (extra.driverId fourni), notifier aussi le
-    // chauffeur assigné — l'acceptation d'enchère notifie déjà de son côté.
     if (extra.driverId) {
       await notify(tx, {
         userId: extra.driverId,
@@ -644,7 +618,7 @@ export const updatePin = handle('users.updatePin', async (req, res) => {
 export const userStats = handle('users.stats', async (req, res) => {
   const parcelWhere =
     req.user.role === 'driver'
-      ? { driverId: req.user.id, deletedAt: null }
+      ? { OR: [{ driverId: req.user.id }, { assignedDriverId: req.user.id }], deletedAt: null }
       : req.user.role === 'admin'
         ? { OR: [{ departureGarageId: req.user.garageId }, { arrivalGarageId: req.user.garageId }], deletedAt: null }
         : { senderId: req.user.id, deletedAt: null };
@@ -679,19 +653,11 @@ export const userStats = handle('users.stats', async (req, res) => {
 // PARCELS
 // ============================================================
 
-// Valeurs des enums Prisma reprises ici pour refuser une saisie invalide par un
-// 422 explicite. Sans ce controle, une valeur inconnue partait jusqu'a Prisma et
-// remontait en 500 opaque.
 const PARCEL_TYPES = ['document', 'package', 'fragile', 'perishable', 'valuable'];
 const PAYMENT_METHODS = ['wave', 'freemMoney', 'orange_money', 'card', 'cash'];
 const PAYMENT_CHANNELS = ['cash', 'platform'];
 const CASH_COLLECTION_POINTS = ['sender_pickup', 'receiver_delivery'];
 
-// Champs qu'un expediteur peut corriger sur un colis pas encore engage. La liste
-// est explicite : `status`, `driverId`, `totalAmount`, `trackingNumber`,
-// `negotiatedPrice` ou `senderId` n'y figurent pas — ils relevent du cycle de vie
-// et non de la saisie. Un `data: req.body` laisserait au contraire le client
-// reecrire n'importe quelle colonne de la table.
 const PARCEL_EDITABLE_TEXT_FIELDS = [
   'senderName',
   'senderPhone',
@@ -719,12 +685,8 @@ const PARCEL_EDITABLE_ENUM_FIELDS = {
   cashCollectionPoint: CASH_COLLECTION_POINTS
 };
 
-// Obligatoires a la creation : une modification peut les corriger, jamais les
-// vider — la colonne est NOT NULL cote base.
 const PARCEL_REQUIRED_FIELDS = ['receiverName', 'receiverPhone', 'description', 'weight'];
 
-// Modifier l'un de ces champs change l'offre que les chauffeurs ont chiffree :
-// ceux qui ont une enchere en cours doivent pouvoir la revoir.
 const PARCEL_BID_SENSITIVE_FIELDS = [
   'weight',
   'length',
@@ -741,8 +703,7 @@ const PARCEL_BID_SENSITIVE_FIELDS = [
   'arrivalGarageId'
 ];
 
-// Un colis n'est modifiable que tant qu'aucun chauffeur ne s'est engage dessus.
-const PARCEL_EDITABLE_STATUSES = ['pending', 'free'];
+const PARCEL_EDITABLE_STATUSES = ['pending', 'free', 'proposal_sent', 'negotiating'];
 
 function pickAuditFields(source, fields) {
   return Object.fromEntries(
@@ -751,18 +712,11 @@ function pickAuditFields(source, fields) {
       if (value === null || value === undefined) return [field, null];
       if (typeof value === 'boolean') return [field, value];
       if (Array.isArray(value)) return [field, value.map(String)];
-      // Les Decimal Prisma et les dates sont normalises en texte pour rester
-      // lisibles dans le journal d'audit.
       return [field, String(value)];
     })
   );
 }
 
-/**
- * Traduit le corps de requete en donnees Prisma, champ par champ. Une chaine
- * vidée devient `null` : c'est ainsi qu'un client efface une adresse ou une note
- * facultative. Les champs obligatoires sont verifies ensuite.
- */
 function buildParcelUpdateData(body) {
   const data = {};
 
@@ -840,6 +794,9 @@ function buildParcelData(user, body) {
   const isDriver = user.role === 'driver';
   const isFree = Boolean(body.isFreeForBidding);
   const baseAmount = body.totalAmount ?? body.proposedPrice ?? body.price ?? 0;
+  
+  const isDirectProposal = Boolean(body.driverId) && user.role === 'client';
+  const isDriverCreating = isDriver && body.senderId;
 
   return cleanUndefined({
     trackingNumber: generateTrackingNumber(),
@@ -857,14 +814,22 @@ function buildParcelData(user, body) {
     width: decimal(body.width),
     height: decimal(body.height),
     type: body.type || 'package',
-    status: body.status || (isDriver ? 'confirmed' : isFree ? 'free' : 'pending'),
-    // Le mobile envoie des zones ; les garages restent alimentés quand le
-    // client les fournit encore (écrans garage-admin non migrés).
+    
+    status: isDirectProposal ? 'proposal_sent' : (isDriver ? 'confirmed' : isFree ? 'free' : 'pending'),
+    
     departureGarageId: body.departureGarageId || user.garageId || null,
     arrivalGarageId: body.arrivalGarageId || null,
     departureZoneId: body.departureZoneId || null,
     arrivalZoneId: body.arrivalZoneId || null,
-    driverId: body.driverId || (isDriver ? user.id : null),
+    
+    proposedDriverId: isDirectProposal ? body.driverId : null,
+    assignedDriverId: isDriverCreating ? user.id : null,
+    driverId: isDriverCreating ? user.id : null,
+    
+    proposalStatus: isDirectProposal ? 'pending' : null,
+    proposalPrice: isDirectProposal ? decimal(baseAmount) : null,
+    proposalExpiresAt: isDirectProposal ? new Date(Date.now() + 15 * 60 * 1000) : null,
+    
     price: decimal(body.price),
     proposedPrice: decimal(body.proposedPrice),
     totalAmount: decimal(baseAmount, '0'),
@@ -888,9 +853,6 @@ export const createParcel = handle('parcel.create', async (req, res) => {
     throw new ValidationError([{ path: 'body', message: 'Champs colis obligatoires manquants' }]);
   }
 
-  // Les deux référentiels cohabitent : on exige un lieu de départ, sans imposer
-  // lequel. Sans ce garde-fou, un colis serait créé sans origine du tout depuis
-  // que `departure_garage_id` est nullable.
   if (!req.body.departureZoneId && !req.body.departureGarageId && !req.user.garageId) {
     throw new ValidationError([
       { path: 'departureZoneId', message: 'Zone de départ requise' }
@@ -910,7 +872,10 @@ export const createParcel = handle('parcel.create', async (req, res) => {
         description: statusDescription(parcel.status),
         userId: req.user.id,
         userName: req.user.fullName,
-        userRole: req.user.role
+        userRole: req.user.role,
+        metadata: parcel.proposedDriverId 
+          ? { proposedDriverId: parcel.proposedDriverId, proposalStatus: 'pending' }
+          : {}
       }
     });
 
@@ -918,33 +883,64 @@ export const createParcel = handle('parcel.create', async (req, res) => {
       action: 'parcel.create',
       entityType: 'parcel',
       entityId: parcel.id,
-      afterData: { status: parcel.status, trackingNumber: parcel.trackingNumber }
+      afterData: { 
+        status: parcel.status, 
+        trackingNumber: parcel.trackingNumber,
+        proposedDriverId: parcel.proposedDriverId
+      }
     });
+
+    if (parcel.proposedDriverId) {
+      const driver = await tx.user.findUnique({
+        where: { id: parcel.proposedDriverId },
+        select: { id: true, fullName: true, phone: true, email: true }
+      });
+      
+      if (driver) {
+        await notify(tx, {
+          userId: driver.id,
+          parcelId: parcel.id,
+          senderId: req.user.id,
+          senderName: req.user.fullName,
+          type: 'driver_proposal',
+          title: 'Nouvelle proposition de colis',
+          body: `${req.user.fullName} vous propose un colis de ${parcel.proposalPrice || parcel.totalAmount || 0} FCFA.`,
+          data: { 
+            parcelId: parcel.id, 
+            trackingNumber: parcel.trackingNumber,
+            price: Number(parcel.proposalPrice || parcel.totalAmount || 0),
+            proposalId: parcel.id
+          },
+          priority: 'high'
+        });
+
+        await notifyAdmins(tx, 'driver_proposal_created',
+          `Proposition directe : ${parcel.trackingNumber}`,
+          `${req.user.fullName} a proposé un colis à ${driver.fullName}`,
+          { parcelId: parcel.id, driverId: driver.id }
+        );
+      }
+    }
 
     return parcel;
   });
 
-  return ok(res, { status: 201, message: 'Colis cree', data: { parcel: serializeParcel(result) } });
+  return ok(res, { 
+    status: 201, 
+    message: result.proposedDriverId ? 'Proposition envoyée au chauffeur' : 'Colis créé', 
+    data: { parcel: serializeParcel(result) } 
+  });
 });
 
-/**
- * Correction d'un colis par son expediteur. `findAccessibleParcel` restreint
- * deja l'acces au createur (un destinataire lit le colis mais ne le modifie
- * pas) ; les gardes ci-dessous refusent la modification des qu'un engagement
- * existe — chauffeur assigne, offre acceptee ou paiement entame.
- */
 export const updateParcel = handle('parcel.update', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
 
   if (!PARCEL_EDITABLE_STATUSES.includes(parcel.status)) {
     throw new ConflictError('Ce colis est deja engage : son contenu n\'est plus modifiable');
   }
-  if (parcel.driverId) {
+  if (parcel.assignedDriverId || parcel.driverId) {
     throw new ConflictError('Un chauffeur est deja assigne a ce colis');
   }
-  // Le statut devrait suffire, mais une enchere acceptee ou un prix negocie
-  // restent les seuls signaux fiables qu'un accord de prix existe deja : un
-  // colis reste techniquement en `pending` entre l'acceptation et la confirmation.
   const hasAcceptedBid = (parcel.bids || []).some((bid) => bid.status === 'accepted');
   if (hasAcceptedBid || parcel.selectedBidId || parcel.negotiatedPrice) {
     throw new ConflictError('Une offre a deja ete acceptee pour ce colis');
@@ -962,16 +958,12 @@ export const updateParcel = handle('parcel.update', async (req, res) => {
     throw new ValidationError([{ path: 'body', message: 'Aucun champ modifiable fourni' }]);
   }
 
-  // Le lieu de depart reste obligatoire apres fusion, comme a la creation :
-  // sinon une modification laisserait un colis sans origine.
   const departureZoneId = 'departureZoneId' in data ? data.departureZoneId : parcel.departureZoneId;
   const departureGarageId = 'departureGarageId' in data ? data.departureGarageId : parcel.departureGarageId;
   if (!departureZoneId && !departureGarageId) {
     throw new ValidationError([{ path: 'departureZoneId', message: 'Zone de depart requise' }]);
   }
 
-  // Tant qu'aucun prix n'est negocie — ce que les gardes ci-dessus garantissent —
-  // le montant total suit le prix demande, comme a la creation.
   if (data.price !== undefined || data.proposedPrice !== undefined) {
     const proposed = 'proposedPrice' in data ? data.proposedPrice : parcel.proposedPrice;
     const price = 'price' in data ? data.price : parcel.price;
@@ -992,8 +984,6 @@ export const updateParcel = handle('parcel.update', async (req, res) => {
       include: parcelInclude
     });
 
-    // La modification apparait dans la chronologie du colis : le destinataire et
-    // le support doivent pouvoir constater qu'une correction a eu lieu.
     const event = await tx.parcelEvent.create({
       data: {
         parcelId: parcel.id,
@@ -1014,9 +1004,6 @@ export const updateParcel = handle('parcel.update', async (req, res) => {
       afterData: pickAuditFields(updated, changedFields)
     });
 
-    // Les chauffeurs ayant une enchere en cours ont chiffre l'ancienne annonce.
-    // Sans avertissement, leur offre porterait sur un colis qui n'est plus celui
-    // qu'ils ont evalue.
     const materialChanges = changedFields.filter((field) => PARCEL_BID_SENSITIVE_FIELDS.includes(field));
     if (materialChanges.length) {
       const pendingBids = (parcel.bids || []).filter((bid) =>
@@ -1051,17 +1038,15 @@ export const updateParcel = handle('parcel.update', async (req, res) => {
 });
 
 // ============================================================
-// ✅ CLIENT PARCELS - CORRIGÉ avec normalisation téléphone/email
+// CLIENT PARCELS
 // ============================================================
+
 export const clientParcels = handle('client.parcels', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
 
   let ownership;
 
   if (req.query.filter === 'received') {
-    // ✅ CORRECTION : Pour les colis reçus, on cherche par téléphone/email
-    // Sans exclure ceux que l'utilisateur a envoyés (car il peut être à la fois
-    // expéditeur et destinataire)
     const phoneVariants = req.user.phone ? phoneSearchVariants(req.user.phone) : [];
     const emailVariants = req.user.email 
       ? [req.user.email.toLowerCase(), req.user.email.toUpperCase()]
@@ -1073,11 +1058,9 @@ export const clientParcels = handle('client.parcels', async (req, res) => {
         ...(emailVariants.length > 0 ? [{ receiverEmail: { in: emailVariants } }] : [])
       ]
     };
-    // ✅ On ne filtre PAS sur senderId - un colis peut avoir le même expéditeur ET destinataire
   } else if (req.query.filter === 'sent') {
     ownership = { senderId: req.user.id };
   } else {
-    // Tous les colis : envoyés OU reçus
     const phoneVariants = req.user.phone ? phoneSearchVariants(req.user.phone) : [];
     const emailVariants = req.user.email 
       ? [req.user.email.toLowerCase(), req.user.email.toUpperCase()]
@@ -1118,12 +1101,32 @@ export const clientParcels = handle('client.parcels', async (req, res) => {
 
 export const driverParcels = handle('driver.parcels', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const where = cleanUndefined({ driverId: req.user.id, status: req.query.status, deletedAt: null });
+  
+  const where = cleanUndefined({ 
+    OR: [
+      { assignedDriverId: req.user.id },
+      { driverId: req.user.id }
+    ],
+    status: req.query.status,
+    deletedAt: null 
+  });
+  
   const [total, parcels] = await Promise.all([
     prisma.parcel.count({ where }),
-    prisma.parcel.findMany({ where, include: parcelInclude, orderBy: { createdAt: 'desc' }, skip, take: limit })
+    prisma.parcel.findMany({ 
+      where, 
+      include: parcelInclude, 
+      orderBy: { createdAt: 'desc' }, 
+      skip, 
+      take: limit 
+    })
   ]);
-  return ok(res, { message: 'Colis chauffeur', data: { parcels: parcels.map(serializeParcel) }, meta: paginationMeta({ page, limit, total }) });
+  
+  return ok(res, { 
+    message: 'Colis chauffeur', 
+    data: { parcels: parcels.map(serializeParcel) }, 
+    meta: paginationMeta({ page, limit, total }) 
+  });
 });
 
 export const garageParcels = handle('garage.parcels', async (req, res) => {
@@ -1164,17 +1167,18 @@ export const cancelParcel = handle('parcel.cancel', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'cancelled', { reason: req.body.reason || 'Annulation' });
 
-  if (parcel.driverId) {
+  const driverId = parcel.assignedDriverId || parcel.driverId;
+  if (driverId) {
     await prisma.$transaction(async (tx) => {
       const commitmentFee = await getCommitmentFee(tx);
       if (commitmentFee > 0) {
         await tx.score.upsert({
-          where: { userId: parcel.driverId },
+          where: { userId: driverId },
           update: { points: { increment: commitmentFee }, lastUpdated: new Date() },
-          create: { userId: parcel.driverId, points: commitmentFee }
+          create: { userId: driverId, points: commitmentFee }
         });
         await tx.scoreTransaction.create({
-          data: { userId: parcel.driverId, amount: commitmentFee, type: 'commitment_refund', source: 'system', parcelId: parcel.id, description: 'Remboursement engagement (colis annule)' }
+          data: { userId: driverId, amount: commitmentFee, type: 'commitment_refund', source: 'system', parcelId: parcel.id, description: 'Remboursement engagement (colis annule)' }
         });
       }
     });
@@ -1189,30 +1193,302 @@ export const updateParcelStatus = handle('parcel.updateStatus', async (req, res)
   return ok(res, { message: 'Statut mis a jour', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
-export const assignDriver = handle('parcel.assignDriver', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
-  const driver = await prisma.user.findFirst({ where: { id: req.body.driverId, role: 'driver', status: 'active' } });
-  if (!driver) throw new NotFoundError('Chauffeur introuvable');
-  const result = await changeParcelStatus(req, parcel, 'confirmed', { driverId: driver.id, description: 'Chauffeur assigne' });
-  return ok(res, { message: 'Chauffeur assigne', data: { parcel: serializeParcel(result.parcel) } });
-});
+// ============================================================
+// ✅ PROPOSITIONS DIRECTES (NOUVEAU FLUX B)
+// ============================================================
 
-export const bulkAssignDriver = handle('parcel.bulkAssign', async (req, res) => {
-  const failed = [];
-  let assigned = 0;
-  for (const parcelId of req.body.parcelIds || []) {
-    try {
-      const parcel = await findAccessibleParcel(req.user, parcelId);
-      await changeParcelStatus(req, parcel, 'confirmed', { driverId: req.body.driverId, description: req.body.message || 'Chauffeur assigne' });
-      assigned += 1;
-    } catch (error) {
-      failed.push({ parcelId, message: error.publicMessage || error.message });
-    }
+/**
+ * Chauffeur répond à une proposition directe
+ * POST /driver/proposals/:parcelId/respond
+ */
+export const respondToProposal = handle('proposal.respond', async (req, res) => {
+  const { parcelId } = req.params;
+  const { action, price, message } = req.body;
+
+  if (!['accept', 'reject', 'counter'].includes(action)) {
+    throw new ValidationError([{ path: 'action', message: 'Action invalide (accept, reject, counter)' }]);
   }
-  return ok(res, { message: 'Colis assignes', data: { assigned, failed } });
+
+  const result = await prisma.$transaction(async (tx) => {
+    const parcel = await tx.parcel.findUnique({
+      where: { id: parcelId },
+      include: { sender: true }
+    });
+
+    if (!parcel) throw new NotFoundError('Colis introuvable');
+    if (parcel.proposedDriverId !== req.user.id) {
+      throw new ForbiddenError('Cette proposition ne vous est pas destinée');
+    }
+    if (parcel.proposalStatus !== 'pending') {
+      throw new ConflictError('Cette proposition a déjà été traitée');
+    }
+
+    let updatedParcel;
+
+    if (action === 'accept') {
+      updatedParcel = await tx.parcel.update({
+        where: { id: parcelId },
+        data: {
+          proposalStatus: 'accepted',
+          status: 'confirmed',
+          assignedDriverId: req.user.id,
+          driverId: req.user.id,
+          price: parcel.proposalPrice || parcel.price,
+          totalAmount: parcel.proposalPrice || parcel.totalAmount,
+          negotiatedPrice: parcel.proposalPrice || parcel.price
+        },
+        include: parcelInclude
+      });
+
+      await tx.parcelEvent.create({
+        data: {
+          parcelId: parcel.id,
+          status: 'confirmed',
+          description: 'Proposition acceptée par le chauffeur',
+          userId: req.user.id,
+          userName: req.user.fullName,
+          userRole: req.user.role
+        }
+      });
+
+      await notify(tx, {
+        userId: parcel.senderId,
+        parcelId: parcel.id,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'proposal_accepted',
+        title: 'Proposition acceptée',
+        body: `${req.user.fullName} a accepté votre proposition de ${parcel.proposalPrice || parcel.price} FCFA.`,
+        data: { parcelId, driverId: req.user.id, price: Number(parcel.proposalPrice || parcel.price) },
+        priority: 'high'
+      });
+
+    } else if (action === 'reject') {
+      updatedParcel = await tx.parcel.update({
+        where: { id: parcelId },
+        data: {
+          proposalStatus: 'rejected',
+          proposedDriverId: null,
+          status: 'pending'
+        },
+        include: parcelInclude
+      });
+
+      await notify(tx, {
+        userId: parcel.senderId,
+        parcelId: parcel.id,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'proposal_rejected',
+        title: 'Proposition refusée',
+        body: `${req.user.fullName} a refusé votre proposition.`,
+        data: { parcelId, reason: message || 'Refusé par le chauffeur' },
+        priority: 'high'
+      });
+
+    } else if (action === 'counter') {
+      if (!price || Number(price) <= 0) {
+        throw new ValidationError([{ path: 'price', message: 'Un prix valide est requis pour la contre-offre' }]);
+      }
+
+      updatedParcel = await tx.parcel.update({
+        where: { id: parcelId },
+        data: {
+          proposalStatus: 'countered',
+          status: 'negotiating',
+          proposalPrice: decimal(price, '0'),
+          lastCounterPrice: decimal(price, '0'),
+          negotiationCount: { increment: 1 }
+        },
+        include: parcelInclude
+      });
+
+      await tx.negotiationMessage.create({
+        data: {
+          parcelId: parcel.id,
+          fromUserId: req.user.id,
+          fromUserRole: 'driver',
+          price: decimal(price, '0'),
+          message: message || `Contre-offre à ${price} FCFA`,
+          isCounterOffer: true
+        }
+      });
+
+      await notify(tx, {
+        userId: parcel.senderId,
+        parcelId: parcel.id,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'proposal_countered',
+        title: 'Contre-offre reçue',
+        body: `${req.user.fullName} propose ${price} FCFA.`,
+        data: { parcelId, price: Number(price) },
+        priority: 'high'
+      });
+    }
+
+    await audit(tx, req, {
+      action: `proposal.${action}`,
+      entityType: 'parcel',
+      entityId: parcel.id,
+      beforeData: { proposalStatus: parcel.proposalStatus, proposedDriverId: parcel.proposedDriverId },
+      afterData: { proposalStatus: updatedParcel.proposalStatus, assignedDriverId: updatedParcel.assignedDriverId }
+    });
+
+    return updatedParcel;
+  });
+
+  const statusMap = {
+    'accept': 'Proposition acceptée',
+    'reject': 'Proposition refusée',
+    'counter': 'Contre-offre envoyée'
+  };
+
+  return ok(res, {
+    message: statusMap[action],
+    data: { parcel: serializeParcel(result) }
+  });
 });
 
-// --- Delivery OTP ---
+/**
+ * Client répond à une contre-offre
+ * POST /client/proposals/:parcelId/respond-counter
+ */
+export const respondToCounterProposal = handle('proposal.respondCounter', async (req, res) => {
+  const { parcelId } = req.params;
+  const { action, price, message } = req.body;
+
+  if (!['accept', 'counter'].includes(action)) {
+    throw new ValidationError([{ path: 'action', message: 'Action invalide (accept, counter)' }]);
+  }
+
+  const result = await prisma.$transaction(async (tx) => {
+    const parcel = await tx.parcel.findUnique({
+      where: { id: parcelId },
+      include: { sender: true }
+    });
+
+    if (!parcel) throw new NotFoundError('Colis introuvable');
+    if (parcel.senderId !== req.user.id) {
+      throw new ForbiddenError('Vous n\'êtes pas le propriétaire de ce colis');
+    }
+    if (parcel.proposalStatus !== 'countered') {
+      throw new ConflictError('Cette proposition n\'est pas en état de contre-offre');
+    }
+
+    let updatedParcel;
+
+    if (action === 'accept') {
+      updatedParcel = await tx.parcel.update({
+        where: { id: parcelId },
+        data: {
+          proposalStatus: 'accepted',
+          status: 'confirmed',
+          assignedDriverId: parcel.proposedDriverId,
+          driverId: parcel.proposedDriverId,
+          price: parcel.proposalPrice,
+          totalAmount: parcel.proposalPrice,
+          negotiatedPrice: parcel.proposalPrice
+        },
+        include: parcelInclude
+      });
+
+      await notify(tx, {
+        userId: parcel.proposedDriverId,
+        parcelId: parcel.id,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'proposal_accepted',
+        title: 'Contre-offre acceptée',
+        body: `${req.user.fullName} a accepté votre contre-offre de ${parcel.proposalPrice} FCFA.`,
+        data: { parcelId, price: Number(parcel.proposalPrice) },
+        priority: 'high'
+      });
+
+    } else if (action === 'counter') {
+      if (!price || Number(price) <= 0) {
+        throw new ValidationError([{ path: 'price', message: 'Un prix valide est requis' }]);
+      }
+
+      updatedParcel = await tx.parcel.update({
+        where: { id: parcelId },
+        data: {
+          proposalStatus: 'pending',
+          proposalPrice: decimal(price, '0'),
+          lastCounterPrice: decimal(price, '0'),
+          negotiationCount: { increment: 1 }
+        },
+        include: parcelInclude
+      });
+
+      await tx.negotiationMessage.create({
+        data: {
+          parcelId: parcel.id,
+          fromUserId: req.user.id,
+          fromUserRole: 'client',
+          price: decimal(price, '0'),
+          message: message || `Contre-offre à ${price} FCFA`,
+          isCounterOffer: true
+        }
+      });
+
+      await notify(tx, {
+        userId: parcel.proposedDriverId,
+        parcelId: parcel.id,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'proposal_countered',
+        title: 'Nouvelle contre-offre',
+        body: `${req.user.fullName} propose ${price} FCFA.`,
+        data: { parcelId, price: Number(price) },
+        priority: 'high'
+      });
+    }
+
+    return updatedParcel;
+  });
+
+  return ok(res, {
+    message: action === 'accept' ? 'Contre-offre acceptée' : 'Contre-offre envoyée',
+    data: { parcel: serializeParcel(result) }
+  });
+});
+
+/**
+ * Récupérer les propositions d'un chauffeur
+ * GET /driver/proposals
+ */
+export const getDriverProposals = handle('proposal.list', async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+
+  const where = {
+    proposedDriverId: req.user.id,
+    deletedAt: null,
+    proposalStatus: { in: ['pending', 'countered'] }
+  };
+
+  const [total, parcels] = await Promise.all([
+    prisma.parcel.count({ where }),
+    prisma.parcel.findMany({
+      where,
+      include: parcelInclude,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    })
+  ]);
+
+  return ok(res, {
+    message: 'Propositions reçues',
+    data: { parcels: parcels.map(serializeParcel) },
+    meta: paginationMeta({ page, limit, total })
+  });
+});
+
+// ============================================================
+// DRIVER - Actions sur colis assignés
+// ============================================================
+
 function generateDeliveryCode() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
@@ -1239,6 +1515,12 @@ export const clientDeliveryCode = handle('parcel.deliveryCode', async (req, res)
 
 export const driverConfirm = handle('driver.confirm', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
+  
+  // ✅ Vérifier que le chauffeur est bien assigné
+  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
+  }
+  
   const result = await changeParcelStatus(req, parcel, 'confirmed', {
     ...req.body,
     description: 'Prise en charge confirmee par le chauffeur'
@@ -1248,24 +1530,44 @@ export const driverConfirm = handle('driver.confirm', async (req, res) => {
 
 export const driverPickup = handle('driver.pickup', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
+  
+  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
+  }
+  
   const result = await changeParcelStatus(req, parcel, 'picked_up', req.body);
   return ok(res, { message: 'Colis ramasse', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
 export const driverTransit = handle('driver.transit', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
+  
+  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
+  }
+  
   const result = await changeParcelStatus(req, parcel, 'in_transit', req.body);
   return ok(res, { message: 'Colis en transit', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
 export const driverArrived = handle('driver.arrived', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
+  
+  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
+  }
+  
   const result = await changeParcelStatus(req, parcel, 'arrived', req.body);
   return ok(res, { message: 'Colis arrive a la zone', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
 
 export const driverOutForDelivery = handle('driver.outForDelivery', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
+  
+  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
+  }
+  
   const result = await changeParcelStatus(req, parcel, 'out_for_delivery', req.body);
   const { code, phone } = await getOrCreateDeliveryCode(parcel.id, parcel.receiverPhone);
   if (isBrevoConfigured() && phone) {
@@ -1276,6 +1578,10 @@ export const driverOutForDelivery = handle('driver.outForDelivery', async (req, 
 
 export const driverDeliver = handle('driver.deliver', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
+
+  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
+  }
 
   const {
     otp,
@@ -1288,7 +1594,6 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
     locationLng = null
   } = req.body;
 
-  // Vérifier le code OTP
   const otpRow = await prisma.otpCode.findFirst({
     where: { type: `delivery:${parcel.id}`, isUsed: false }
   });
@@ -1310,7 +1615,6 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
     data: { isUsed: true }
   });
 
-  // Mettre à jour le statut
   const result = await changeParcelStatus(req, parcel, 'delivered', {
     signature,
     proofImage,
@@ -1518,15 +1822,6 @@ export const deliveryProof = handle('parcel.proof', async (req, res) => {
   return ok(res, { message: 'Preuve livraison', data: { proof: { signatureUrl: parcel.signatureUrl, photoUrls: serializeParcel(parcel).photoUrls } } });
 });
 
-/**
- * Bareme de l'estimation, lu dans `SystemConfig`.
- *
- * Ces quatre cles sont editables par le super administrateur (groupe
- * « Tarification » de l'ecran de configuration, web et mobile). Elles etaient
- * codees en dur ici : un administrateur pouvait changer le tarif sans qu'aucune
- * estimation ne bouge. Les valeurs de repli reprennent les anciennes
- * constantes, pour qu'une base sans ces cles se comporte comme avant.
- */
 async function pricingConfig() {
   const [baseFee, pricePerKg, urgentFee, insuranceFee] = await Promise.all([
     getConfigValue('pricing.baseFee', 1000),
@@ -1608,7 +1903,14 @@ export const acceptBid = handle('bid.accept', async (req, res) => {
     });
     const updatedParcel = await tx.parcel.update({
       where: { id: parcel.id },
-      data: { status: 'confirmed', driverId: bid.driverId, selectedBidId: bid.id, negotiatedPrice: bid.price, totalAmount: bid.price },
+      data: { 
+        status: 'confirmed', 
+        assignedDriverId: bid.driverId,
+        driverId: bid.driverId, 
+        selectedBidId: bid.id, 
+        negotiatedPrice: bid.price, 
+        totalAmount: bid.price 
+      },
       include: parcelInclude
     });
     await tx.parcelEvent.create({
@@ -1716,10 +2018,6 @@ export const driverBidsSent = handle('bid.driverSent', async (req, res) => {
 // NEGOCIATION - Contre-offres
 // ============================================================
 
-/**
- * Récupère les détails de négociation d'une offre
- * GET /client/bids/:bidId/negotiation
- */
 export const getBidNegotiation = handle('bid.negotiation.get', async (req, res) => {
   const { bidId } = req.params;
 
@@ -1775,8 +2073,6 @@ export const getBidNegotiation = handle('bid.negotiation.get', async (req, res) 
     throw new NotFoundError('Offre introuvable ou non autorisée');
   }
 
-  const isClient = req.user.role === 'client';
-
   return ok(res, {
     message: 'Détails de la négociation',
     data: {
@@ -1825,10 +2121,6 @@ export const getBidNegotiation = handle('bid.negotiation.get', async (req, res) 
   });
 });
 
-/**
- * Client: Envoyer une contre-offre
- * POST /client/bids/:bidId/counter
- */
 export const clientCounterBid = handle('bid.counter', async (req, res) => {
   const { bidId } = req.params;
   const { price, message } = req.body;
@@ -1905,17 +2197,10 @@ export const clientCounterBid = handle('bid.counter', async (req, res) => {
   });
 });
 
-/**
- * Driver: Répondre à une contre-offre
- * POST /driver/bids/:bidId/respond-counter
- */
 export const driverRespondCounter = handle('bid.respondCounter', async (req, res) => {
   const { bidId } = req.params;
   const { action, price, message } = req.body;
 
-  // Les premiers builds envoyaient { action: "accept" | "counter" } alors
-  // que la nouvelle API attendait { accept: boolean }. Normaliser ici garde
-  // les deux plateformes compatibles pendant leur mise a jour.
   if (action !== undefined && !['accept', 'counter'].includes(action)) {
     throw new ValidationError([{ path: 'action', message: 'Action invalide (accept ou counter)' }]);
   }
@@ -1955,6 +2240,7 @@ export const driverRespondCounter = handle('bid.respondCounter', async (req, res
         where: { id: bid.parcelId },
         data: {
           status: 'confirmed',
+          assignedDriverId: req.user.id,
           driverId: req.user.id,
           selectedBidId: bidId,
           negotiatedPrice: bid.price,
@@ -2041,10 +2327,6 @@ export const driverRespondCounter = handle('bid.respondCounter', async (req, res
   });
 });
 
-/**
- * Client: Accepter une offre (après négociation)
- * POST /client/bids/:bidId/accept
- */
 export const clientAcceptBid = handle('bid.clientAccept', async (req, res) => {
   const { bidId } = req.params;
 
@@ -2082,6 +2364,7 @@ export const clientAcceptBid = handle('bid.clientAccept', async (req, res) => {
       where: { id: bid.parcelId },
       data: {
         status: 'confirmed',
+        assignedDriverId: bid.driverId,
         driverId: bid.driverId,
         selectedBidId: bidId,
         negotiatedPrice: bid.price,
@@ -2553,18 +2836,19 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
     })
   ]);
 
-  if (isDelivered && parcel.driverId && parcelPrice > 0) {
+  const driverId = parcel.assignedDriverId || parcel.driverId;
+  if (isDelivered && driverId && parcelPrice > 0) {
     const commission = await calculateCommission(parcelPrice);
 
     await prisma.$transaction(async (tx) => {
       const wallet = await tx.wallet.upsert({
-        where: { userId: parcel.driverId },
+        where: { userId: driverId },
         update: { balance: { increment: parcelPrice }, totalDeposited: { increment: parcelPrice }, lastActivityAt: new Date(), lastDepositAt: new Date() },
-        create: { userId: parcel.driverId, balance: parcelPrice, totalDeposited: parcelPrice, lastDepositAt: new Date(), lastActivityAt: new Date() }
+        create: { userId: driverId, balance: parcelPrice, totalDeposited: parcelPrice, lastDepositAt: new Date(), lastActivityAt: new Date() }
       });
       await tx.walletTransaction.create({
         data: {
-          walletUserId: parcel.driverId,
+          walletUserId: driverId,
           type: 'deposit',
           amount: parcelPrice,
           balanceBefore: Number(wallet.balance) - parcelPrice,
@@ -2581,7 +2865,7 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
         try {
           deductionResult = await deductCashCommission({
             parcelId,
-            driverId: parcel.driverId,
+            driverId,
             commission,
             tx,
             req
@@ -2603,7 +2887,7 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
 
       await tx.notification.create({
         data: {
-          userId: parcel.driverId,
+          userId: driverId,
           type: 'delivery_paid',
           title: 'Paiement recu (especes)',
           body: notifBody,
@@ -2616,13 +2900,13 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
           type: 'admin_driver_credited',
           title: `Especes - ${parcel.trackingNumber}`,
           body: `Chauffeur: +${driverNet} FCFA nets. Commission: ${commission} FCFA (Wallet: ${deductionResult.walletDeducted}, Points: ${deductionResult.pointsDeducted}).`,
-          data: { parcelId, driverId: parcel.driverId, earning: driverNet, commission, ...deductionResult }
+          data: { parcelId, driverId, earning: driverNet, commission, ...deductionResult }
         }
       });
     });
   }
 
-  return ok(res, { message: 'Paiement especes confirme', data: { driverCredited: isDelivered && !!parcel.driverId } });
+  return ok(res, { message: 'Paiement especes confirme', data: { driverCredited: isDelivered && !!driverId } });
 });
 
 // ============================================================
@@ -2648,8 +2932,6 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
     create: { userId: req.user.id }
   });
 
-  // Charger l'historique separement garde l'upsert simple et permet une vraie
-  // pagination sans renvoyer un portefeuille volumineux au mobile.
   const where = { walletUserId: req.user.id };
   const [total, transactionRows] = await Promise.all([
     prisma.walletTransaction.count({ where }),
@@ -2688,8 +2970,6 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
     message: 'Portefeuille',
     data: {
       wallet: serializedWallet,
-      // Champ a plat conserve pour ApiService.getWallet, tandis que la copie
-      // imbriquee permet aux autres consommateurs d'utiliser wallet seul.
       transactions
     },
     meta: paginationMeta({ page, limit, total })
@@ -3051,19 +3331,9 @@ export const favoriteGarages = handle('favorites.garages', async (req, res) => {
 // MESSAGES - Messages
 // ============================================================
 
-// Un message reste modifiable un quart d'heure. Au-dela, le destinataire a eu
-// le temps de le lire et d'agir dessus : le reecrire fausserait l'echange.
 const MESSAGE_EDIT_WINDOW_MS = 15 * 60 * 1000;
 const MESSAGE_BODY_MAX_LENGTH = 4000;
-
-// Les propositions de prix circulent dans le fil de discussion sous ce prefixe
-// (widget de negociation cote mobile). Elles engagent une negociation
-// commerciale : leur auteur ne peut donc ni les reecrire ni les effacer, sinon
-// l'historique d'un accord deviendrait incoherent. Seule la moderation peut les
-// supprimer.
 const PRICE_PROPOSAL_PREFIX = '__PRIX__';
-
-// Roles autorises a supprimer le message d'un tiers, au titre de la moderation.
 const MESSAGE_MODERATOR_ROLES = ['super_admin', 'support'];
 
 function isPriceProposal(message) {
@@ -3083,8 +3353,6 @@ function serializeMessage(m) {
     videoUrl: m.videoUrl,
     isRead: m.isRead,
     createdAt: m.createdAt,
-    // `createdAt` reste la date d'envoi : les clients affichent le marqueur
-    // « modifie » a partir de `editedAt`, sans reordonner le fil.
     editedAt: m.editedAt || null,
     isEdited: Boolean(m.editedAt)
   };
@@ -3098,13 +3366,6 @@ function messagePreview(message) {
   return (message.body || '').slice(0, 80) || 'Nouveau message';
 }
 
-/**
- * Rattacher un message a un colis le fait apparaitre dans le fil de ce colis.
- * On exige donc un lien reel avec le colis, sans reprendre le filtre strict de
- * lecture : un chauffeur qui a seulement enchéri sur un colis libre doit
- * pouvoir en discuter avec le client, exactement comme il peut en consulter le
- * detail.
- */
 async function assertParcelConversationAccess(user, parcelId) {
   if (user.role === 'driver') {
     await findAccessibleParcelForDriver(user, parcelId);
@@ -3113,11 +3374,6 @@ async function assertParcelConversationAccess(user, parcelId) {
   await findReadableParcel(user, parcelId);
 }
 
-/**
- * Charge un message encore vivant et verifie que l'utilisateur en est bien
- * l'auteur. L'edition n'est jamais deleguee a la moderation : reecrire les mots
- * d'un tiers n'est pas une operation legitime.
- */
 async function findEditableMessage(user, messageId) {
   const message = await prisma.message.findUnique({ where: { id: messageId } });
   if (!message || message.deletedAt) throw new NotFoundError('Message introuvable');
@@ -3147,7 +3403,6 @@ export const sendMessage = handle('messages.send', async (req, res) => {
     ]);
   }
 
-  // ✅ Récupérer le destinataire original pour connaître son rôle
   const originalReceiver = await prisma.user.findFirst({
     where: { id: receiverId, deletedAt: null },
     select: { id: true, role: true, fullName: true }
@@ -3155,10 +3410,7 @@ export const sendMessage = handle('messages.send', async (req, res) => {
 
   if (!originalReceiver) throw new NotFoundError('Destinataire introuvable');
 
-  // ✅ Vérifier si c'est un message support (le destinataire est un support)
   const isSupportTarget = ['support_technique', 'support_commercial', 'support', 'admin', 'super_admin'].includes(originalReceiver.role);
-  
-  // ✅ Le client peut forcer le type via 'type' ou 'isSupportMessage'
   const supportType = req.body.type || '';
   const isSupportMessage = req.body.isSupportMessage === true || 
                            req.body.isSupport === true ||
@@ -3167,24 +3419,19 @@ export const sendMessage = handle('messages.send', async (req, res) => {
                            supportType === 'support_commercial' ||
                            (isSupportTarget && !req.body.isPrivate);
 
-  // ✅ Si c'est un message support
   if (isSupportMessage) {
-    // ✅ Déterminer le type de support cible
     let targetRole = supportType;
     
-    // Si le type n'est pas spécifié, on utilise le rôle du destinataire
     if (!targetRole || targetRole === '') {
       if (originalReceiver.role === 'support_technique') {
         targetRole = 'support_technique';
       } else if (originalReceiver.role === 'support_commercial') {
         targetRole = 'support_commercial';
       } else {
-        // Si le destinataire est admin/super_admin, on envoie à tous
         targetRole = 'support';
       }
     }
 
-    // ✅ Récupérer TOUS les agents du même type de support
     const roleMap = {
       'support': ['support_technique', 'support_commercial', 'support'],
       'support_technique': ['support_technique'],
@@ -3205,7 +3452,6 @@ export const sendMessage = handle('messages.send', async (req, res) => {
       throw new NotFoundError(`Aucun support disponible pour le type: ${targetRole}`);
     }
 
-    // ✅ Créer un message pour CHAQUE agent support
     const messages = await prisma.$transaction(async (tx) => {
       const createdMessages = [];
       for (const user of supportUsers) {
@@ -3226,7 +3472,6 @@ export const sendMessage = handle('messages.send', async (req, res) => {
       return createdMessages;
     });
 
-    // ✅ Créer une notification pour CHAQUE agent support
     await prisma.$transaction(async (tx) => {
       for (const user of supportUsers) {
         const sender = req.user;
@@ -3256,7 +3501,6 @@ export const sendMessage = handle('messages.send', async (req, res) => {
       }
     });
 
-    // ✅ Envoyer les emails/SMS à CHAQUE agent support
     if (isBrevoConfigured()) {
       const sender = req.user;
       for (const user of supportUsers) {
@@ -3296,8 +3540,6 @@ export const sendMessage = handle('messages.send', async (req, res) => {
     });
   }
 
-  // Sinon, comportement normal (message privé)
-  // ✅ Vérifier que le destinataire existe et est actif
   const receiver = await prisma.user.findFirst({
     where: { id: receiverId, deletedAt: null },
     select: { id: true, status: true }
@@ -3371,7 +3613,6 @@ export const updateMessage = handle('messages.update', async (req, res) => {
       { path: 'body', message: `Message limite a ${MESSAGE_BODY_MAX_LENGTH} caracteres` }
     ]);
   }
-  // Une edition qui ne change rien ne doit pas poser de marqueur « modifie ».
   if (body === existing.body) {
     return ok(res, { message: 'Message inchange', data: { message: serializeMessage(existing) } });
   }
@@ -3382,8 +3623,6 @@ export const updateMessage = handle('messages.update', async (req, res) => {
       data: { body, editedAt: new Date() }
     });
 
-    // Le contenu des echanges est verse aux litiges de livraison : la version
-    // precedente doit rester consultable meme apres reecriture.
     await audit(tx, req, {
       action: 'message.update',
       entityType: 'message',
@@ -3410,8 +3649,6 @@ export const deleteMessage = handle('messages.delete', async (req, res) => {
   if (isAuthor && !isModerator && isPriceProposal(existing)) {
     throw new ConflictError('Une proposition de prix ne peut pas etre supprimee');
   }
-  // Rejouer la suppression renvoie l'etat courant : le mobile peut relancer la
-  // requete apres une coupure reseau sans traiter un 404 trompeur.
   if (existing.deletedAt) {
     return ok(res, { message: 'Message deja supprime' });
   }
@@ -3422,8 +3659,6 @@ export const deleteMessage = handle('messages.delete', async (req, res) => {
       data: { deletedAt: new Date() }
     });
 
-    // Un message supprime avant lecture laissait une notification qui ouvrait un
-    // fil vide. On retire donc la pastille non lue qui le designe.
     if (!existing.isRead) {
       await tx.notification.deleteMany({
         where: {
@@ -3454,7 +3689,6 @@ export const messageThread = handle('messages.thread', async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
 
   const where = {
-    // Un message supprime par son auteur disparait du fil des deux cotes.
     deletedAt: null,
     OR: [
       { senderId: req.user.id, receiverId: peerId },
@@ -3467,8 +3701,6 @@ export const messageThread = handle('messages.thread', async (req, res) => {
     where.parcelId = parcelId;
   }
 
-  // Marquer puis relire dans une transaction garantit que le web et le
-  // mobile recoivent immédiatement le même état de lecture.
   const [, messages] = await prisma.$transaction([
     prisma.message.updateMany({
       where: {
@@ -3506,9 +3738,6 @@ export const conversations = handle('messages.conversations', async (req, res) =
     take: 500
   });
 
-  // Un seul contrat agrege alimente desormais les listes web et mobile.
-  // La cle pair + colis evite de melanger deux negociations avec la meme
-  // personne, tandis que unreadCount ne compte jamais les messages emis.
   const conversationMap = new Map();
   for (const message of messages) {
     const isIncoming = message.receiverId === req.user.id;
@@ -3523,7 +3752,6 @@ export const conversations = handle('messages.conversations', async (req, res) =
 
     conversationMap.set(key, {
       ...serializeMessage(message),
-      // Un message emis n'est jamais "non lu" pour son auteur dans la liste.
       isRead: isIncoming ? message.isRead : true,
       unreadCount: isIncoming && !message.isRead ? 1 : 0,
       trackingNumber: message.parcel?.trackingNumber || null,
@@ -3538,9 +3766,6 @@ export const conversations = handle('messages.conversations', async (req, res) =
 });
 
 export const readMessage = handle('messages.read', async (req, res) => {
-  // Seul le destinataire marque un message comme lu. Le filtre servait deja de
-  // garde d'autorisation, mais son resultat etait ignore : un identifiant
-  // inconnu ou le message d'un tiers renvoyait un succes trompeur.
   const marked = await prisma.message.updateMany({
     where: { id: req.params.messageId, receiverId: req.user.id, deletedAt: null },
     data: { isRead: true, readAt: new Date() }
@@ -3550,7 +3775,6 @@ export const readMessage = handle('messages.read', async (req, res) => {
       where: { id: req.params.messageId, receiverId: req.user.id, deletedAt: null },
       select: { id: true }
     });
-    // Le message existe et m'est bien adresse : il etait simplement deja lu.
     if (!exists) throw new NotFoundError('Message introuvable');
   }
   return ok(res, { message: 'Message lu' });
@@ -3743,10 +3967,6 @@ export const identityStatus = handle('identity.status', async (req, res) => {
 // ADVERTISEMENTS - Annonces
 // ============================================================
 
-// Champs qu'un chauffeur peut corriger sur son annonce. Le `data: req.body` qui
-// precedait laissait passer n'importe quelle colonne — `driverId`, `status`,
-// `createdAt` compris — et n'appliquait aucune conversion : une date ou un poids
-// transmis en texte partaient tels quels vers Prisma.
 const ADVERTISEMENT_EDITABLE_TEXT_FIELDS = ['departureCity', 'arrivalCity', 'description', 'audioUrl'];
 const ADVERTISEMENT_EDITABLE_DECIMAL_FIELDS = ['availableWeight', 'proposedPrice'];
 const ADVERTISEMENT_EDITABLE_ID_FIELDS = [
@@ -3756,18 +3976,10 @@ const ADVERTISEMENT_EDITABLE_ID_FIELDS = [
   'arrivalZoneId'
 ];
 
-// Une annonce fermee ou annulee est une trace : elle n'est plus modifiable.
 const ADVERTISEMENT_EDITABLE_STATUSES = ['open'];
-// Offres encore en jeu : a avertir ou a refuser selon l'action sur l'annonce.
 const ADVERTISEMENT_LIVE_OFFER_STATUSES = ['pending', 'countered'];
-// Statuts de colis encore rattachables a une offre de trajet.
 const PARCEL_OFFERABLE_STATUSES = ['pending', 'free'];
 
-/**
- * Charge une annonce et verifie que l'appelant en est le chauffeur proprietaire.
- * Les routes annonces etaient montees avec `authenticate` seul : fermeture, refus
- * et negociation d'offre s'executaient sans aucun controle de propriete.
- */
 async function findOwnedAdvertisement(user, advertisementId, include) {
   const advertisement = await prisma.advertisement.findUnique({
     where: { id: advertisementId },
@@ -3780,8 +3992,6 @@ async function findOwnedAdvertisement(user, advertisementId, include) {
   return advertisement;
 }
 
-// Publier un trajet dont le depart est passe reviendrait a annoncer un vehicule
-// deja parti : les clients y deposeraient des offres inexploitables.
 function parseFutureDate(value, path) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
@@ -3793,8 +4003,6 @@ function parseFutureDate(value, path) {
   return date;
 }
 
-// `decimal` accepte n'importe quelle entree ; ce garde-fou refuse en plus une
-// valeur non numerique ou negative avant qu'elle n'atteigne la base.
 function positiveDecimal(value, path) {
   const parsed = decimal(value);
   if (parsed === null) return null;
@@ -3804,8 +4012,6 @@ function positiveDecimal(value, path) {
   return parsed;
 }
 
-// Une annonce doit garder une origine et une destination, quel que soit le
-// referentiel utilise : les zones et les villes libres cohabitent encore.
 function assertAdvertisementRoute(source) {
   if (!source.departureZoneId && !source.departureGarageId && !source.departureCity) {
     throw new ValidationError([{ path: 'departureZoneId', message: 'Lieu de depart requis' }]);
@@ -3888,9 +4094,6 @@ export const updateAdvertisement = handle('advertisements.update', async (req, r
   if (!ADVERTISEMENT_EDITABLE_STATUSES.includes(advertisement.status)) {
     throw new ConflictError('Une annonce fermee ou annulee n\'est plus modifiable');
   }
-  // Une offre acceptee vaut engagement sur le trajet publie : en changer la date
-  // ou l'itineraire apres coup tromperait le client dont le colis est deja pris
-  // en charge.
   if (advertisement.offers.some((offer) => offer.status === 'accepted')) {
     throw new ConflictError('Une offre a deja ete acceptee sur cette annonce');
   }
@@ -3917,8 +4120,6 @@ export const updateAdvertisement = handle('advertisements.update', async (req, r
     throw new ValidationError([{ path: 'body', message: 'Aucun champ modifiable fourni' }]);
   }
 
-  // Le trajet doit rester complet apres fusion : une modification ne peut pas
-  // laisser l'annonce sans origine ni sans destination.
   assertAdvertisementRoute({ ...advertisement, ...data });
 
   const changedFields = Object.keys(data).filter(
@@ -3946,8 +4147,6 @@ export const updateAdvertisement = handle('advertisements.update', async (req, r
       afterData: pickAuditFields(result, changedFields)
     });
 
-    // Les clients qui ont une offre en cours l'ont calee sur le trajet publie :
-    // ils doivent savoir que la date, le prix ou l'itineraire a bouge.
     const liveOffers = advertisement.offers.filter((offer) =>
       ADVERTISEMENT_LIVE_OFFER_STATUSES.includes(offer.status)
     );
@@ -3973,9 +4172,6 @@ export const updateAdvertisement = handle('advertisements.update', async (req, r
 export const deleteAdvertisement = handle('advertisements.delete', async (req, res) => {
   const advertisement = await findOwnedAdvertisement(req.user, req.params.advertisementId, { offers: true });
 
-  // La suppression efface les offres en cascade, donc la trace d'un accord et le
-  // lien vers le colis engage. On la refuse dans ce cas : fermer l'annonce est
-  // l'operation qui conserve l'historique.
   if (advertisement.offers.some((offer) => offer.status === 'accepted')) {
     throw new ConflictError(
       'Une offre acceptee est rattachee a cette annonce : fermez-la au lieu de la supprimer'
@@ -3986,8 +4182,6 @@ export const deleteAdvertisement = handle('advertisements.delete', async (req, r
     const liveOffers = advertisement.offers.filter((offer) =>
       ADVERTISEMENT_LIVE_OFFER_STATUSES.includes(offer.status)
     );
-    // Les offres partent en cascade : sans ce message, le client verrait son
-    // offre disparaitre sans explication.
     for (const offer of liveOffers) {
       await notify(tx, {
         userId: offer.clientId,
@@ -4023,8 +4217,6 @@ export const closeAdvertisement = handle('advertisements.close', async (req, res
     offers: true
   });
 
-  // Rejouer la fermeture renvoie l'etat courant : le mobile peut relancer
-  // l'appel apres une coupure reseau sans traiter un conflit.
   if (advertisement.status !== 'open') {
     return ok(res, {
       message: 'Annonce deja fermee',
@@ -4035,10 +4227,6 @@ export const closeAdvertisement = handle('advertisements.close', async (req, res
   const reason = req.body.reason ? String(req.body.reason).trim() : null;
 
   const closed = await prisma.$transaction(async (tx) => {
-    // Une annonce fermee ne peut plus rien accepter : laisser des offres en
-    // attente ferait patienter les clients indefiniment. Ce refus precede la
-    // mise a jour de l'annonce pour que son `include: { offers }` renvoie l'etat
-    // final — sinon la reponse porterait encore les offres en attente.
     const liveOffers = advertisement.offers.filter((offer) =>
       ADVERTISEMENT_LIVE_OFFER_STATUSES.includes(offer.status)
     );
@@ -4068,8 +4256,6 @@ export const closeAdvertisement = handle('advertisements.close', async (req, res
       where: { id: advertisement.id },
       data: {
         status: 'closed',
-        // `metadata` etait ecrase par `{ reason }`, ce qui perdait tout ce que
-        // l'annonce portait deja.
         metadata: {
           ...(advertisement.metadata && typeof advertisement.metadata === 'object'
             ? advertisement.metadata
@@ -4113,24 +4299,18 @@ export const createAdvertisementOffer = handle('advertisements.offerCreate', asy
     throw new ValidationError([{ path: 'price', message: 'Prix superieur a zero requis' }]);
   }
 
-  // Le colis reste facultatif : l'ecran d'offre propose explicitement de
-  // negocier avant d'avoir cree le colis. Quand il est fourni, il doit
-  // appartenir au client et etre encore disponible, sinon l'acceptation
-  // echouerait plus tard cote chauffeur.
   const parcelId = req.body.parcelId || null;
   if (parcelId) {
     const parcel = await prisma.parcel.findFirst({
       where: { id: parcelId, senderId: req.user.id, deletedAt: null },
-      select: { id: true, status: true, driverId: true }
+      select: { id: true, status: true, assignedDriverId: true, driverId: true }
     });
     if (!parcel) throw new NotFoundError('Colis introuvable');
-    if (parcel.driverId) throw new ConflictError('Ce colis est deja assigne a un chauffeur');
+    if (parcel.assignedDriverId || parcel.driverId) throw new ConflictError('Ce colis est deja assigne a un chauffeur');
     if (!PARCEL_OFFERABLE_STATUSES.includes(parcel.status)) {
       throw new ConflictError('Ce colis n\'est plus disponible pour une offre de trajet');
     }
 
-    // Deux offres vivantes du meme client sur la meme annonce pour le meme colis
-    // laisseraient le chauffeur sans savoir laquelle traiter.
     const duplicate = await prisma.advertisementOffer.findFirst({
       where: {
         advertisementId: ad.id,
@@ -4181,9 +4361,6 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
     });
     if (!advertisement) throw new NotFoundError('Annonce introuvable');
 
-    // Seul le chauffeur proprietaire de l'annonce (ou un super admin) peut
-    // engager le colis. Le controle est fait dans la transaction pour eviter
-    // qu'une modification concurrente contourne l'autorisation.
     if (req.user.role !== 'super_admin' && advertisement.driverId !== req.user.id) {
       throw new ForbiddenError('Vous ne pouvez accepter que les offres de vos propres annonces');
     }
@@ -4218,7 +4395,7 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
     if (advertisement.status !== 'open' && currentOffer.status !== 'accepted') {
       throw new ConflictError('Cette annonce n\'accepte plus de nouvelles offres');
     }
-    if (parcel.driverId && parcel.driverId !== advertisement.driverId) {
+    if (parcel.assignedDriverId || parcel.driverId && parcel.driverId !== advertisement.driverId) {
       throw new ConflictError('Ce colis est deja assigne a un autre chauffeur');
     }
     const competingAcceptance = await tx.advertisementOffer.findFirst({
@@ -4233,38 +4410,33 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
       throw new ConflictError('Une autre offre est deja acceptee pour ce colis');
     }
 
-    // Un retry apres succes doit rester idempotent : il renvoie l'etat courant
-    // sans dupliquer evenement, notification ou audit.
     const alreadyApplied =
       currentOffer.status === 'accepted' &&
-      parcel.driverId === advertisement.driverId &&
+      (parcel.assignedDriverId === advertisement.driverId || parcel.driverId === advertisement.driverId) &&
       !['pending', 'free'].includes(parcel.status);
     if (alreadyApplied) {
       return { offer: currentOffer, parcel, event: null };
     }
 
-    // Une acceptation initiale ou la reparation d'une ancienne acceptation
-    // partielle ne peut partir que d'un colis encore disponible. Cela empeche
-    // une offre tardive de faire regresser un colis deja collecte ou en route.
     if (!['pending', 'free'].includes(parcel.status)) {
       throw new ConflictError('Le statut actuel du colis ne permet plus cette acceptation');
     }
 
     const respondedAt = new Date();
-    // La condition est reevaluee par PostgreSQL au moment de l'UPDATE. Deux
-    // chauffeurs concurrents ne peuvent donc pas tous deux revendiquer le meme
-    // colis apres avoir lu simultanement son ancien etat disponible.
     const parcelClaim = await tx.parcel.updateMany({
       where: {
         id: parcel.id,
         senderId: currentOffer.clientId,
         status: { in: ['pending', 'free'] },
         OR: [
+          { assignedDriverId: null },
           { driverId: null },
+          { assignedDriverId: advertisement.driverId },
           { driverId: advertisement.driverId }
         ]
       },
       data: {
+        assignedDriverId: advertisement.driverId,
         driverId: advertisement.driverId,
         status: 'confirmed',
         negotiatedPrice: currentOffer.price,
@@ -4311,8 +4483,6 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
       }
     });
 
-    // Un colis ne peut pas rester negociable sur plusieurs trajets une fois
-    // qu'un chauffeur est assigne.
     await tx.advertisementOffer.updateMany({
       where: {
         parcelId: parcel.id,
@@ -4374,9 +4544,6 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
 });
 
 export const rejectAdvertisementOffer = handle('advertisements.offerReject', async (req, res) => {
-  // Le refus appartient au chauffeur proprietaire de l'annonce. Sans ce
-  // controle, n'importe quel compte authentifie pouvait refuser l'offre d'un
-  // tiers en connaissant son identifiant.
   const advertisement = await findOwnedAdvertisement(req.user, req.params.advertisementId);
 
   const offer = await prisma.$transaction(async (tx) => {
@@ -4390,7 +4557,6 @@ export const rejectAdvertisementOffer = handle('advertisements.offerReject', asy
         'Cette offre est deja acceptee : annulez le colis pour revenir en arriere'
       );
     }
-    // Rejouer le refus renvoie l'etat courant sans redeclencher de notification.
     if (current.status === 'rejected') return current;
 
     const updated = await tx.advertisementOffer.update({
@@ -4435,10 +4601,6 @@ export const negotiateAdvertisementOffer = handle('advertisements.offerNegotiate
     });
     if (!current) throw new NotFoundError('Offre introuvable pour cette annonce');
 
-    // La negociation va dans les deux sens : le chauffeur propose un contre-prix,
-    // le client revise le sien. Le widget de discussion appelle cette route pour
-    // les deux roles. Seuls ces deux comptes — et le super admin — y ont droit :
-    // aucun controle n'existait auparavant.
     const isDriver = current.advertisement.driverId === req.user.id;
     const isClient = current.clientId === req.user.id;
     if (!isDriver && !isClient && req.user.role !== 'super_admin') {
@@ -4460,15 +4622,12 @@ export const negotiateAdvertisementOffer = handle('advertisements.offerNegotiate
       data: {
         price,
         responseMessage: req.body.message,
-        // Le statut restait a `pending` apres un contre-prix : rien ne
-        // distinguait une offre initiale d'une offre deja negociee.
         status: 'countered',
         respondedAt: new Date()
       },
       include: { client: true, parcel: { include: { media: true } } }
     });
 
-    // On avertit la partie d'en face, jamais l'auteur du contre-prix.
     await notify(tx, {
       userId: isDriver ? current.clientId : current.advertisement.driverId,
       senderId: req.user.id,
@@ -4594,11 +4753,6 @@ export const garageStats = handle('garage.stats', async (req, res) => {
 // RAPPORTS - Agregation par periode
 // ============================================================
 
-/**
- * Perimetre d'une zone : un colis compte des qu'il part d'elle ou y arrive.
- * Le rapport d'un admin de zone ne doit jamais retomber sur des chiffres
- * plateforme — c'est ce que faisaient les anciennes implementations.
- */
 function garageScopeWhere(garageId) {
   if (!garageId) return { id: '00000000-0000-0000-0000-000000000000' };
   return { OR: [{ departureGarageId: garageId }, { arrivalGarageId: garageId }] };
@@ -4608,7 +4762,6 @@ function isoDate(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
-/** Minuit local du jour demande (defaut : aujourd'hui) et minuit du lendemain. */
 function dayRange(value) {
   const parsed = value ? new Date(value) : new Date();
   const day = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
@@ -4621,14 +4774,12 @@ function dayRange(value) {
 function monthRange(yearValue, monthValue) {
   const now = new Date();
   const year = Number(yearValue) || now.getFullYear();
-  // Les clients envoient le mois en base 1 ; `Date` l'attend en base 0.
   const month = Number(monthValue) || now.getMonth() + 1;
   const from = new Date(year, month - 1, 1);
   const to = new Date(year, month, 1);
   return { from, to, bucket: 'day', year, month };
 }
 
-/** Clé de regroupement de la série temporelle (heure du jour ou date ISO). */
 function bucketKey(date, bucket) {
   const value = new Date(date);
   if (bucket === 'hour') return String(value.getHours()).padStart(2, '0');
@@ -4649,11 +4800,6 @@ function emptySeries(from, to, bucket) {
   return keys.map((key) => ({ key, created: 0, delivered: 0, revenue: 0 }));
 }
 
-/**
- * Rapport d'activite sur une periode : totaux, repartition par statut, serie
- * temporelle et top chauffeurs. `scope` restreint le perimetre (zone ou
- * plateforme entiere).
- */
 async function buildPeriodReport({ scope, from, to, bucket }) {
   const createdWhere = { ...scope, deletedAt: null, createdAt: { gte: from, lt: to } };
   const deliveredWhere = { ...scope, deletedAt: null, status: 'delivered', deliveryDate: { gte: from, lt: to } };
@@ -4716,8 +4862,6 @@ async function buildPeriodReport({ scope, from, to, bucket }) {
       created: totalCreated,
       delivered: totalDelivered,
       cancelled,
-      // Taux calcule sur les livraisons effectuees dans la periode, rapportees
-      // aux colis qui y sont nes : c'est la lecture attendue d'un rapport.
       deliveryRate: totalCreated ? Math.round((totalDelivered / totalCreated) * 100) : 0,
       revenue: Number(payments._sum.amount || 0),
       deliveredAmount: delivered.reduce((sum, parcel) => sum + Number(parcel.totalAmount ?? parcel.price ?? 0), 0)
@@ -4744,8 +4888,6 @@ async function globalStats() {
       prisma.user.count({ where: { role: 'driver', status: 'active' } }),
       prisma.user.count({ where: { role: 'client', status: 'active' } }),
       prisma.garage.count({ where: { deletedAt: null } }),
-      // Le référentiel de lieux est désormais `zones` ; `totalGarages` compte
-      // encore la table héritée et reste exposé pour l'app mobile.
       prisma.zone.count(),
       prisma.vehicle.count({ where: { deletedAt: null } }),
       prisma.parcel.count({ where: { deletedAt: null } }),
@@ -4778,16 +4920,62 @@ export const superAdminStats = handle('super.stats', async (_req, res) => {
   return ok(res, { message: 'Stats globales', data: { stats: await globalStats() } });
 });
 
+// ============================================================
+// STATS - Statistiques globales
+// ============================================================
+
+// ... (le reste du code)
+
 export const driverStats = handle('driver.stats', async (req, res) => {
+  // ✅ On utilise req.user.id directement, pas besoin de driverId
+  const driverId = req.user.id;
+
   const [assignedParcels, activeParcels, completedDeliveries, score, pendingBids, openAdvertisements] = await Promise.all([
-    prisma.parcel.count({ where: { driverId: req.user.id } }),
-    prisma.parcel.count({ where: { driverId: req.user.id, status: { in: ACTIVE_PARCEL_STATUSES } } }),
-    prisma.parcel.count({ where: { driverId: req.user.id, status: 'delivered' } }),
-    prisma.score.findUnique({ where: { userId: req.user.id } }),
-    prisma.bid.count({ where: { driverId: req.user.id, status: 'pending' } }),
-    prisma.advertisement.count({ where: { driverId: req.user.id, status: 'open' } })
+    prisma.parcel.count({ where: { OR: [{ driverId: driverId }, { assignedDriverId: driverId }] } }),
+    prisma.parcel.count({ where: { OR: [{ driverId: driverId }, { assignedDriverId: driverId }], status: { in: ACTIVE_PARCEL_STATUSES } } }),
+    prisma.parcel.count({ where: { OR: [{ driverId: driverId }, { assignedDriverId: driverId }], status: 'delivered' } }),
+    prisma.score.findUnique({ where: { userId: driverId } }),
+    prisma.bid.count({ where: { driverId: driverId, status: 'pending' } }),
+    prisma.advertisement.count({ where: { driverId: driverId, status: 'open' } })
   ]);
-  return ok(res, { message: 'Stats chauffeur', data: { stats: { assignedParcels, activeParcels, completedDeliveries, rating: Number(req.user.rating || 0), scoreBalance: score?.points || 0, pendingBids, openAdvertisements } } });
+
+  // Récupérer le véhicule du chauffeur
+  const vehicle = await prisma.vehicle.findFirst({
+    where: { driverId: driverId, deletedAt: null },
+    orderBy: { createdAt: 'desc' }
+  });
+
+  // Récupérer les offres reçues (propositions directes)
+  const proposals = await prisma.parcel.count({
+    where: {
+      proposedDriverId: driverId,
+      proposalStatus: { in: ['pending', 'countered'] },
+      deletedAt: null
+    }
+  });
+
+  return ok(res, {
+    message: 'Stats chauffeur',
+    data: {
+      stats: {
+        assignedParcels,
+        activeParcels,
+        completedDeliveries,
+        rating: Number(req.user.rating || 0),
+        scoreBalance: score?.points || 0,
+        pendingBids,
+        openAdvertisements,
+        proposals,
+        vehicle: vehicle ? {
+          id: vehicle.id,
+          plateNumber: vehicle.plateNumber,
+          model: vehicle.model,
+          type: vehicle.type,
+          capacity: vehicle.capacity
+        } : null
+      }
+    }
+  });
 });
 
 // ============================================================
@@ -4924,8 +5112,6 @@ export const superAdminUpdateUserRole = handle('super.userRole', async (req, res
   if (!ASSIGNABLE_ROLES.includes(role)) {
     throw new ValidationError([{ path: 'body.role', message: 'Role inconnu' }]);
   }
-  // Se retirer soi-meme ses droits ferme la porte de l'interieur : un dernier
-  // super admin degrade ne pourrait plus la rouvrir.
   if (req.params.userId === req.user.id && role !== req.user.role) {
     throw new ForbiddenError('Impossible de modifier son propre role');
   }
@@ -4940,7 +5126,6 @@ export const superAdminUpdateUserRole = handle('super.userRole', async (req, res
       include: { garage: true }
     });
 
-    // Un changement de role redistribue des droits : il doit laisser une trace.
     await audit(tx, req, {
       action: 'user.role.update',
       entityType: 'user',
@@ -5082,7 +5267,7 @@ export const superAdminDeleteGarage = handle('super.garageDelete', async (req, r
 // ============================================================
 
 export const superAdminUpdateParcel = handle('super.parcelUpdate', async (req, res) => {
-  const allowed = ['receiverAddress', 'receiverName', 'receiverPhone', 'notes', 'price', 'totalAmount', 'driverId', 'arrivalGarageId', 'departureGarageId'];
+  const allowed = ['receiverAddress', 'receiverName', 'receiverPhone', 'notes', 'price', 'totalAmount', 'arrivalGarageId', 'departureGarageId'];
   const parcel = await prisma.parcel.update({
     where: { id: req.params.parcelId },
     data: cleanUndefined(Object.fromEntries(allowed.map((key) => [key, req.body[key]]))),
@@ -5097,8 +5282,6 @@ export const superAdminUpdateParcel = handle('super.parcelUpdate', async (req, r
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Un identifiant non-UUID ferait remonter une erreur Prisma en 500 alors que la
-// faute vient du filtre : on la traite comme une erreur de validation.
 function auditUuidFilter(value, path) {
   if (value === undefined || value === '') return undefined;
   if (!UUID_PATTERN.test(String(value))) {
@@ -5129,8 +5312,6 @@ export const auditLogs = handle('super.auditLogs', async (req, res) => {
     entityType: req.query.entityType || undefined,
     entityId: auditUuidFilter(req.query.entityId, 'query.entityId'),
     createdAt: auditDateFilter(req.query.from, req.query.to),
-    // La recherche libre porte sur le nom de l'action et le type d'entite :
-    // ce sont les deux colonnes lisibles par un humain dans la liste.
     OR: search
       ? [
         { action: { contains: search, mode: 'insensitive' } },
@@ -5146,14 +5327,10 @@ export const auditLogs = handle('super.auditLogs', async (req, res) => {
       orderBy: { createdAt: 'desc' },
       skip,
       take: limit,
-      // Sans l'acteur, l'ecran n'affiche qu'un UUID : le nom est charge ici
-      // plutot que par un appel par ligne cote client.
       include: { actor: { select: { id: true, fullName: true, phone: true, role: true } } }
     })
   ]);
 
-  // `beforeData` / `afterData` transportent des valeurs metier completes
-  // (montants, coordonnees). Le support voit qui a fait quoi, sans le detail.
   const detailed = req.user.role === 'super_admin';
 
   return ok(res, {
@@ -5195,20 +5372,9 @@ export const updateSystemConfig = handle('super.configUpdate', async (req, res) 
 });
 
 // ============================================================
-// BACKUP - Sauvegardes
-// ============================================================
-
-// Les sauvegardes vivent desormais dans `modules/backups` : elles pilotent
-// `pg_dump` / `pg_restore` et n'ont plus leur place dans ce controleur.
-
-// ============================================================
 // WEBHOOKS - Webhooks
 // ============================================================
 
-/**
- * Le secret signe les livraisons sortantes : il est ecrit une fois et ne
- * ressort jamais des lectures, seule sa presence est exposee.
- */
 function serializeWebhook(webhook) {
   if (!webhook) return null;
   return {
@@ -5229,8 +5395,6 @@ export const listWebhooks = handle('webhooks.list', async (_req, res) => {
 
 export const createWebhook = handle('webhooks.create', async (req, res) => {
   const url = typeof req.body.url === 'string' ? req.body.url.trim() : '';
-  // Une URL invalide ne serait decouverte qu'a la premiere livraison, cote
-  // worker, sans retour a l'administrateur : on la refuse a l'ecriture.
   if (!/^https?:\/\/\S+$/i.test(url)) {
     throw new ValidationError([{ path: 'body.url', message: 'URL http(s) valide requise' }]);
   }
@@ -5246,8 +5410,6 @@ export const createWebhook = handle('webhooks.create', async (req, res) => {
 });
 
 export const deleteWebhook = handle('webhooks.delete', async (req, res) => {
-  // `delete` sur un identifiant deja retire leve une P2025 rendue en 500 :
-  // `deleteMany` rend l'appel rejouable apres une coupure reseau.
   const removed = await prisma.webhook.deleteMany({ where: { id: req.params.webhookId } });
   if (removed.count === 0) throw new NotFoundError('Webhook introuvable');
   return ok(res, { message: 'Webhook supprime' });
@@ -5924,7 +6086,6 @@ export const adminSupportReply = async (req, res) => {
       });
     }
 
-    // ✅ Récupérer tous les supports pour les notifier aussi
     const supportUsers = await prisma.user.findMany({
       where: {
         role: { 
@@ -5935,7 +6096,6 @@ export const adminSupportReply = async (req, res) => {
       select: { id: true, fullName: true, phone: true, email: true }
     });
 
-    // Créer le message pour le destinataire
     const message = await prisma.message.create({
       data: {
         senderId: supportUserId,
@@ -5965,7 +6125,6 @@ export const adminSupportReply = async (req, res) => {
 
     console.log('✅ Message créé:', message.id);
 
-    // ✅ Notifier le destinataire
     await prisma.notification.create({
       data: {
         userId: receiverId,
@@ -5983,7 +6142,6 @@ export const adminSupportReply = async (req, res) => {
       }
     });
 
-    // ✅ Notifier tous les autres supports de la réponse
     const supportNotifs = supportUsers
       .filter(u => u.id !== supportUserId && u.id !== receiverId)
       .map((user) =>
@@ -6065,7 +6223,7 @@ export const getParcelFromAdvertisement = handle('advertisements.getParcel', asy
   if (req.user.role === 'client' && parcel.senderId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas autorisé à voir ce colis');
   }
-  if (req.user.role === 'driver' && parcel.driverId !== req.user.id) {
+  if (req.user.role === 'driver' && parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas autorisé à voir ce colis');
   }
 

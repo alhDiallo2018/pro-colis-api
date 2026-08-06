@@ -1,5 +1,5 @@
-import bcrypt from 'bcryptjs';
 import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
 
@@ -91,8 +91,8 @@ function daysAgo(days) {
 async function upsertScore(tx, userId, points = 0) {
   await tx.score.upsert({
     where: { userId },
-    update: { points, totalEarned: points, lastUpdated: new Date() },
-    create: { userId, points, totalEarned: points }
+    update: { points, totalEarned: points, totalSpent: 0, lastUpdated: new Date() },
+    create: { userId, points, totalEarned: points, totalSpent: 0 }
   });
 }
 
@@ -105,8 +105,8 @@ async function seedGarages() {
       region: 'Dakar',
       address: 'Route de Rufisque',
       phone: '+221338000000',
-      latitude: '14.7167',
-      longitude: '-17.4677',
+      latitude: 14.7167,
+      longitude: -17.4677,
       isActive: true
     },
     create: {
@@ -116,8 +116,8 @@ async function seedGarages() {
       region: 'Dakar',
       address: 'Route de Rufisque',
       phone: '+221338000000',
-      latitude: '14.7167',
-      longitude: '-17.4677',
+      latitude: 14.7167,
+      longitude: -17.4677,
       isActive: true
     }
   });
@@ -130,8 +130,8 @@ async function seedGarages() {
       region: 'Thies',
       address: 'Avenue Caen',
       phone: '+221339000000',
-      latitude: '14.7910',
-      longitude: '-16.9359',
+      latitude: 14.7910,
+      longitude: -16.9359,
       isActive: true
     },
     create: {
@@ -141,8 +141,8 @@ async function seedGarages() {
       region: 'Thies',
       address: 'Avenue Caen',
       phone: '+221339000000',
-      latitude: '14.7910',
-      longitude: '-16.9359',
+      latitude: 14.7910,
+      longitude: -16.9359,
       isActive: true
     }
   });
@@ -157,7 +157,6 @@ async function seedUsers(garage) {
     const passwordHash = await bcrypt.hash(profile.password, 12);
     const pinHash = await bcrypt.hash(profile.pin, 12);
 
-    // User, score and audit rows are kept together so repeated seeds stay coherent.
     users[profile.role] = await prisma.$transaction(async (tx) => {
       const user = await tx.user.upsert({
         where: { phone: profile.phone },
@@ -209,6 +208,7 @@ async function seedUsers(garage) {
 }
 
 async function seedProfileUsage({ customer, driver, garages }) {
+  // Vehicle
   await prisma.vehicle.upsert({
     where: { id: ids.vehicle },
     update: {
@@ -232,6 +232,7 @@ async function seedProfileUsage({ customer, driver, garages }) {
     }
   });
 
+  // Addresses
   await prisma.address.upsert({
     where: { id: ids.addressHome },
     update: {
@@ -240,8 +241,8 @@ async function seedProfileUsage({ customer, driver, garages }) {
       address: 'Plateau, Dakar',
       city: 'Dakar',
       region: 'Dakar',
-      latitude: '14.6670',
-      longitude: '-17.4350',
+      latitude: 14.6670,
+      longitude: -17.4350,
       isDefault: true
     },
     create: {
@@ -251,8 +252,8 @@ async function seedProfileUsage({ customer, driver, garages }) {
       address: 'Plateau, Dakar',
       city: 'Dakar',
       region: 'Dakar',
-      latitude: '14.6670',
-      longitude: '-17.4350',
+      latitude: 14.6670,
+      longitude: -17.4350,
       isDefault: true
     }
   });
@@ -265,8 +266,8 @@ async function seedProfileUsage({ customer, driver, garages }) {
       address: 'Almadies, Dakar',
       city: 'Dakar',
       region: 'Dakar',
-      latitude: '14.7422',
-      longitude: '-17.5211',
+      latitude: 14.7422,
+      longitude: -17.5211,
       isDefault: false
     },
     create: {
@@ -276,25 +277,29 @@ async function seedProfileUsage({ customer, driver, garages }) {
       address: 'Almadies, Dakar',
       city: 'Dakar',
       region: 'Dakar',
-      latitude: '14.7422',
-      longitude: '-17.5211',
+      latitude: 14.7422,
+      longitude: -17.5211,
       isDefault: false
     }
   });
 
-  // These parcels simulate the main screens: delivered history, free bidding and active delivery.
+  // Parcel 1: Delivered
   await prisma.parcel.upsert({
     where: { id: ids.parcelDelivered },
     update: {
       status: 'delivered',
-      driverId: driver.id,
+      assignedDriver: {
+        connect: { id: driver.id }
+      },
       paymentStatus: 'completed',
       deliveryDate: daysAgo(1)
     },
     create: {
       id: ids.parcelDelivered,
       trackingNumber: 'PC-20260628-SEED01',
-      senderId: customer.id,
+      sender: {
+        connect: { id: customer.id }
+      },
       senderName: customer.fullName,
       senderPhone: customer.phone,
       senderEmail: customer.email,
@@ -303,15 +308,21 @@ async function seedProfileUsage({ customer, driver, garages }) {
       receiverEmail: 'mamadou@example.test',
       receiverAddress: 'Thies centre',
       description: 'Documents administratifs',
-      weight: '1.20',
+      weight: 1.20,
       type: 'document',
       status: 'delivered',
-      departureGarageId: garages.dakar.id,
-      arrivalGarageId: garages.thies.id,
-      driverId: driver.id,
-      price: '2500.00',
-      deliveryFees: '500.00',
-      totalAmount: '3000.00',
+      departureGarage: {
+        connect: { id: garages.dakar.id }
+      },
+      arrivalGarage: {
+        connect: { id: garages.thies.id }
+      },
+      assignedDriver: {
+        connect: { id: driver.id }
+      },
+      price: 2500.00,
+      deliveryFees: 500.00,
+      totalAmount: 3000.00,
       paymentMethod: 'wave',
       paymentPhoneNumber: customer.phone,
       paymentStatus: 'completed',
@@ -319,10 +330,13 @@ async function seedProfileUsage({ customer, driver, garages }) {
       pickupDate: daysAgo(3),
       deliveryDate: daysAgo(1),
       estimatedDeliveryDate: daysAgo(1),
-      createdBy: customer.id
+      creator: {
+        connect: { id: customer.id }
+      }
     }
   });
 
+  // Parcel 2: Free for bidding
   await prisma.parcel.upsert({
     where: { id: ids.parcelFree },
     update: {
@@ -333,7 +347,9 @@ async function seedProfileUsage({ customer, driver, garages }) {
     create: {
       id: ids.parcelFree,
       trackingNumber: 'PC-20260628-SEED02',
-      senderId: customer.id,
+      sender: {
+        connect: { id: customer.id }
+      },
       senderName: customer.fullName,
       senderPhone: customer.phone,
       senderEmail: customer.email,
@@ -341,60 +357,80 @@ async function seedProfileUsage({ customer, driver, garages }) {
       receiverPhone: '+221770000404',
       receiverAddress: 'Mbour',
       description: 'Petit colis fragile',
-      weight: '3.50',
+      weight: 3.50,
       type: 'fragile',
       status: 'free',
-      departureGarageId: garages.dakar.id,
-      arrivalGarageId: garages.thies.id,
-      proposedPrice: '4500.00',
-      totalAmount: '4500.00',
+      departureGarage: {
+        connect: { id: garages.dakar.id }
+      },
+      arrivalGarage: {
+        connect: { id: garages.thies.id }
+      },
+      proposedPrice: 4500.00,
+      totalAmount: 4500.00,
       isInsured: true,
-      insuranceAmount: '1000.00',
+      insuranceAmount: 1000.00,
       isFreeForBidding: true,
       notes: 'Le client attend des offres chauffeur',
-      createdBy: customer.id
+      creator: {
+        connect: { id: customer.id }
+      }
     }
   });
 
+  // Parcel 3: In transit
   await prisma.parcel.upsert({
     where: { id: ids.parcelTransit },
     update: {
       status: 'in_transit',
-      driverId: driver.id
+      assignedDriver: {
+        connect: { id: driver.id }
+      }
     },
     create: {
       id: ids.parcelTransit,
       trackingNumber: 'PC-20260628-SEED03',
-      senderId: customer.id,
+      sender: {
+        connect: { id: customer.id }
+      },
       senderName: customer.fullName,
       senderPhone: customer.phone,
       receiverName: 'Cheikh Ba',
       receiverPhone: '+221770000505',
       receiverAddress: 'Touba',
       description: 'Vetements et accessoires',
-      weight: '7.00',
+      weight: 7.00,
       type: 'package',
       status: 'in_transit',
-      departureGarageId: garages.dakar.id,
-      arrivalGarageId: garages.thies.id,
-      driverId: driver.id,
-      price: '6000.00',
-      deliveryFees: '1000.00',
-      totalAmount: '7000.00',
+      departureGarage: {
+        connect: { id: garages.dakar.id }
+      },
+      arrivalGarage: {
+        connect: { id: garages.thies.id }
+      },
+      assignedDriver: {
+        connect: { id: driver.id }
+      },
+      price: 6000.00,
+      deliveryFees: 1000.00,
+      totalAmount: 7000.00,
       paymentMethod: 'cash',
       paymentStatus: 'pending',
       pickupDate: daysAgo(1),
       estimatedDeliveryDate: new Date(),
-      createdBy: customer.id
+      creator: {
+        connect: { id: customer.id }
+      }
     }
   });
 
+  // Bid
   await prisma.bid.upsert({
     where: { id: ids.bidFree },
     update: {
       parcelId: ids.parcelFree,
       driverId: driver.id,
-      price: '4200.00',
+      price: 4200.00,
       message: 'Je peux prendre ce colis aujourd hui.',
       status: 'pending'
     },
@@ -402,12 +438,13 @@ async function seedProfileUsage({ customer, driver, garages }) {
       id: ids.bidFree,
       parcelId: ids.parcelFree,
       driverId: driver.id,
-      price: '4200.00',
+      price: 4200.00,
       message: 'Je peux prendre ce colis aujourd hui.',
       status: 'pending'
     }
   });
 
+  // Parcel Events
   const eventRows = [
     {
       id: '12121212-1212-4121-8121-121212121211',
@@ -469,12 +506,13 @@ async function seedProfileUsage({ customer, driver, garages }) {
     skipDuplicates: true
   });
 
+  // Payment
   await prisma.payment.upsert({
     where: { id: ids.paymentDelivered },
     update: {
       userId: customer.id,
       parcelId: ids.parcelDelivered,
-      amount: '3000.00',
+      amount: 3000.00,
       status: 'completed',
       completedAt: daysAgo(1)
     },
@@ -482,7 +520,7 @@ async function seedProfileUsage({ customer, driver, garages }) {
       id: ids.paymentDelivered,
       userId: customer.id,
       parcelId: ids.parcelDelivered,
-      amount: '3000.00',
+      amount: 3000.00,
       method: 'wave',
       status: 'completed',
       transactionId: 'WAVE-SEED-0001',
@@ -494,13 +532,14 @@ async function seedProfileUsage({ customer, driver, garages }) {
     }
   });
 
+  // Advertisement
   await prisma.advertisement.upsert({
     where: { id: ids.advertisement },
     update: {
       driverId: driver.id,
       status: 'open',
-      availableWeight: '120.00',
-      proposedPrice: '5000.00'
+      availableWeight: 120.00,
+      proposedPrice: 5000.00
     },
     create: {
       id: ids.advertisement,
@@ -510,21 +549,22 @@ async function seedProfileUsage({ customer, driver, garages }) {
       departureCity: 'Dakar',
       arrivalCity: 'Thies',
       departureAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      availableWeight: '120.00',
-      proposedPrice: '5000.00',
+      availableWeight: 120.00,
+      proposedPrice: 5000.00,
       description: 'Trajet disponible demain matin pour colis moyens.',
       status: 'open',
       metadata: { vehiclePlate: 'DK-2026-PC' }
     }
   });
 
+  // Advertisement Offer
   await prisma.advertisementOffer.upsert({
     where: { id: ids.advertisementOffer },
     update: {
       advertisementId: ids.advertisement,
       clientId: customer.id,
       parcelId: ids.parcelFree,
-      price: '4800.00',
+      price: 4800.00,
       status: 'pending'
     },
     create: {
@@ -532,31 +572,33 @@ async function seedProfileUsage({ customer, driver, garages }) {
       advertisementId: ids.advertisement,
       clientId: customer.id,
       parcelId: ids.parcelFree,
-      price: '4800.00',
+      price: 4800.00,
       message: 'Pouvez-vous prendre le colis fragile ?',
       status: 'pending'
     }
   });
 
+  // Driver Location
   await prisma.driverLocation.upsert({
     where: { id: ids.driverLocation },
     update: {
       driverId: driver.id,
       parcelId: ids.parcelTransit,
-      latitude: '14.7800',
-      longitude: '-17.1000',
-      accuracy: '12.50'
+      latitude: 14.7800,
+      longitude: -17.1000,
+      accuracy: 12.50
     },
     create: {
       id: ids.driverLocation,
       driverId: driver.id,
       parcelId: ids.parcelTransit,
-      latitude: '14.7800',
-      longitude: '-17.1000',
-      accuracy: '12.50'
+      latitude: 14.7800,
+      longitude: -17.1000,
+      accuracy: 12.50
     }
   });
 
+  // Rating
   await prisma.rating.upsert({
     where: { id: ids.ratingDelivered },
     update: {
@@ -576,6 +618,7 @@ async function seedProfileUsage({ customer, driver, garages }) {
     }
   });
 
+  // Support Message
   await prisma.supportMessage.upsert({
     where: { id: ids.supportMessage },
     update: {
@@ -593,6 +636,7 @@ async function seedProfileUsage({ customer, driver, garages }) {
     }
   });
 
+  // Messages
   await prisma.message.upsert({
     where: { id: ids.messageCustomer },
     update: {
@@ -633,6 +677,7 @@ async function seedProfileUsage({ customer, driver, garages }) {
     }
   });
 
+  // Score Transactions
   await prisma.scoreTransaction.createMany({
     data: [
       {
@@ -655,6 +700,7 @@ async function seedProfileUsage({ customer, driver, garages }) {
     skipDuplicates: true
   });
 
+  // Notifications
   await prisma.notification.createMany({
     data: [
       {
@@ -701,6 +747,7 @@ async function seedProfileUsage({ customer, driver, garages }) {
     skipDuplicates: true
   });
 
+  // Audit Logs
   await prisma.auditLog.createMany({
     data: [
       {
@@ -737,9 +784,6 @@ async function seedProfileUsage({ customer, driver, garages }) {
 
 async function seedScoreConfigs() {
   const configs = [
-    // Bareme d'estimation, lu par `estimateParcel`. Seme explicitement pour que
-    // l'ecran de configuration affiche des valeurs reelles plutot que les
-    // defauts implicites du controleur.
     { key: 'pricing.baseFee', value: 1000 },
     { key: 'pricing.pricePerKg', value: 500 },
     { key: 'pricing.urgentFee', value: 1000 },
