@@ -101,6 +101,18 @@ export function serializeBid(bid) {
       }))
     : undefined;
 
+  // Dernier echange de la negociation : les listes affichent le prix courant
+  // avec le commentaire qui l'accompagne, sans charger tout l'historique.
+  const lastEntry = Array.isArray(bid.negotiationMessages) && bid.negotiationMessages.length
+    ? bid.negotiationMessages[bid.negotiationMessages.length - 1]
+    : null;
+
+  // `lastOfferBy` dit qui a pose le dernier prix : seul l'autre camp peut
+  // accepter. Les encheres anterieures a la colonne partent de l'offre
+  // initiale, toujours emise par le chauffeur.
+  const lastOfferBy = bid.lastOfferBy || lastEntry?.fromUserRole || 'driver';
+  const isOpen = bid.status === 'pending' || bid.status === 'countered';
+
   return {
     id: bid.id,
     parcelId: bid.parcelId,
@@ -115,6 +127,12 @@ export function serializeBid(bid) {
     respondedAt: dateToIso(bid.respondedAt),
     createdAt: dateToIso(bid.createdAt),
     updatedAt: dateToIso(bid.updatedAt),
+    lastOfferBy,
+    lastPrice: decimalToString(lastEntry?.price ?? bid.price),
+    lastMessage: lastEntry?.message ?? bid.responseMessage ?? bid.message ?? null,
+    lastMessageAt: dateToIso(lastEntry?.createdAt ?? bid.respondedAt ?? bid.createdAt),
+    canClientAccept: isOpen && lastOfferBy === 'driver',
+    canDriverAccept: isOpen && lastOfferBy === 'client',
     ...(negotiationHistory ? { negotiationHistory } : {})
   };
 }
@@ -198,6 +216,55 @@ export function serializeMedia(media) {
   };
 }
 
+// Proposition directe (le client choisit son chauffeur) : le colis n'est pas
+// assigne tant que le chauffeur n'a pas accepte. On expose l'etat, le dernier
+// prix et le dernier commentaire pour que les deux camps voient la meme chose.
+function serializeParcelProposal(parcel) {
+  if (!parcel.proposalStatus && !parcel.proposedDriverId) {
+    return { proposal: null };
+  }
+
+  const messages = Array.isArray(parcel.negotiationMessages) ? parcel.negotiationMessages : null;
+  const lastEntry = messages && messages.length ? messages[messages.length - 1] : null;
+
+  // Sans colonne renseignee : une proposition en attente vient du client, une
+  // contre-offre du chauffeur.
+  const lastOfferBy =
+    parcel.lastOfferBy || lastEntry?.fromUserRole || (parcel.proposalStatus === 'countered' ? 'driver' : 'client');
+  const isOpen = parcel.proposalStatus === 'pending' || parcel.proposalStatus === 'countered';
+
+  return {
+    proposal: {
+      status: parcel.proposalStatus,
+      driverId: parcel.proposedDriverId,
+      driverName: parcel.proposedDriver?.fullName,
+      price: decimalToString(parcel.proposalPrice),
+      lastCounterPrice: decimalToString(parcel.lastCounterPrice),
+      lastMessage: lastEntry?.message ?? null,
+      lastMessageAt: dateToIso(lastEntry?.createdAt),
+      lastOfferBy,
+      negotiationCount: parcel.negotiationCount ?? 0,
+      canClientAccept: isOpen && lastOfferBy === 'driver',
+      canDriverAccept: isOpen && lastOfferBy === 'client',
+      history: messages
+        ? messages.map((entry) => ({
+            id: entry.id,
+            fromUserId: entry.fromUserId,
+            fromUserRole: entry.fromUserRole,
+            price: decimalToString(entry.price),
+            message: entry.message,
+            createdAt: dateToIso(entry.createdAt)
+          }))
+        : undefined
+    },
+    proposalStatus: parcel.proposalStatus,
+    proposalPrice: decimalToString(parcel.proposalPrice),
+    lastCounterPrice: decimalToString(parcel.lastCounterPrice),
+    negotiationCount: parcel.negotiationCount ?? 0,
+    lastOfferBy
+  };
+}
+
 export function serializeParcel(parcel) {
   if (!parcel) return null;
   return {
@@ -232,10 +299,17 @@ export function serializeParcel(parcel) {
     // antérieurs à la migration n'ont pas tous de zone rattachée.
     departureCity: parcel.departureZone?.city ?? parcel.departureGarage?.city,
     arrivalCity: parcel.arrivalZone?.city ?? parcel.arrivalGarage?.city,
-    driverId: parcel.driverId,
-    driverName: parcel.driver?.fullName,
-    driverPhone: parcel.driver?.phone,
-    driver: serializeUser(parcel.driver),
+    // `driver*` reste le chauffeur retenu : la colonne a ete renommee
+    // assigned_driver_id, mais les clients publies lisent encore `driverId`.
+    driverId: parcel.assignedDriverId,
+    driverName: parcel.assignedDriver?.fullName,
+    driverPhone: parcel.assignedDriver?.phone,
+    driver: serializeUser(parcel.assignedDriver),
+    assignedDriverId: parcel.assignedDriverId,
+    assignedDriver: serializeUser(parcel.assignedDriver),
+    proposedDriverId: parcel.proposedDriverId,
+    proposedDriver: serializeUser(parcel.proposedDriver),
+    proposedDriverName: parcel.proposedDriver?.fullName,
     price: decimalToString(parcel.price),
     proposedPrice: decimalToString(parcel.proposedPrice),
     negotiatedPrice: decimalToString(parcel.negotiatedPrice),
@@ -266,6 +340,7 @@ export function serializeParcel(parcel) {
     cancelledAt: dateToIso(parcel.cancelledAt),
     createdAt: dateToIso(parcel.createdAt),
     updatedAt: dateToIso(parcel.updatedAt),
+    ...serializeParcelProposal(parcel),
     bids: parcel.bids?.map(serializeBid) || [],
     events: parcel.events?.map(serializeParcelEvent) || [],
     media: parcel.media?.map(serializeMedia) || [],

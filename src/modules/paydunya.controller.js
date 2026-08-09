@@ -158,7 +158,7 @@ async function sendNotification(userId, type, title, body, data = {}) {
 
 async function creditDriverForParcel(parcel, token) {
   const parcelPrice = Number(parcel.price || parcel.totalAmount || 0)
-  if (!parcelPrice || !parcel.driverId) return
+  if (!parcelPrice || !parcel.assignedDriverId) return
 
   const commission = await calculateCommission(parcelPrice)
   const driverEarning = Math.max(0, parcelPrice - commission)
@@ -167,13 +167,13 @@ async function creditDriverForParcel(parcel, token) {
 
   await prisma.$transaction(async (tx) => {
     const wallet = await tx.wallet.upsert({
-      where: { userId: parcel.driverId },
+      where: { userId: parcel.assignedDriverId },
       update: { balance: { increment: driverEarning }, totalDeposited: { increment: driverEarning }, lastActivityAt: new Date(), lastDepositAt: new Date() },
-      create: { userId: parcel.driverId, balance: driverEarning, totalDeposited: driverEarning, lastDepositAt: new Date(), lastActivityAt: new Date() }
+      create: { userId: parcel.assignedDriverId, balance: driverEarning, totalDeposited: driverEarning, lastDepositAt: new Date(), lastActivityAt: new Date() }
     })
     await tx.walletTransaction.create({
       data: {
-        walletUserId: parcel.driverId,
+        walletUserId: parcel.assignedDriverId,
         type: 'deposit',
         amount: driverEarning,
         balanceBefore: Number(wallet.balance) - driverEarning,
@@ -186,7 +186,7 @@ async function creditDriverForParcel(parcel, token) {
     })
     await tx.notification.create({
       data: {
-        userId: parcel.driverId,
+        userId: parcel.assignedDriverId,
         type: 'delivery_paid',
         title: 'Paiement recu',
         body: `+${driverEarning} FCFA pour le colis ${parcel.trackingNumber}. Commission: ${commission} FCFA.`,
@@ -201,7 +201,7 @@ async function creditDriverForParcel(parcel, token) {
           type: 'admin_driver_credited',
           title: `PayDunya - ${parcel.trackingNumber}`,
           body: `Chauffeur credite (${driverEarning} FCFA). Commission: ${commission} FCFA.`,
-          data: { parcelId: parcel.id, driverId: parcel.driverId, earning: driverEarning, commission }
+          data: { parcelId: parcel.id, driverId: parcel.assignedDriverId, earning: driverEarning, commission }
         }
       })
     ))
@@ -355,7 +355,7 @@ async function processCompletedPayment(result, token, reqLogger) {
           `Votre paiement de ${amount} FCFA pour le colis a ete confirme.`, { parcelId: cd.parcelId, amount, token })
       }
 
-      if (parcel.status === 'delivered' && parcel.driverId) {
+      if (parcel.status === 'delivered' && parcel.assignedDriverId) {
         await creditDriverForParcel(parcel, token)
       }
 

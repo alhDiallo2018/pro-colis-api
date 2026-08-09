@@ -87,6 +87,15 @@ async function syncDriverVehicle(client, user, body) {
   }
 }
 
+// Qui a pose le dernier prix. Le bouton "Accepter" n'appartient qu'au camp
+// d'en face : on ne valide jamais son propre montant.
+function lastOfferSide(bid) {
+  if (bid?.lastOfferBy) return bid.lastOfferBy;
+  const history = Array.isArray(bid?.negotiationMessages) ? bid.negotiationMessages : [];
+  const last = history.length ? history[history.length - 1] : null;
+  return last?.fromUserRole === 'client' ? 'client' : 'driver';
+}
+
 const parcelInclude = {
   departureGarage: true,
   arrivalGarage: true,
@@ -111,6 +120,9 @@ const parcelInclude = {
   media: { orderBy: { createdAt: 'asc' } },
   // ✅ NOUVEAU : Inclure les relations de proposition
   proposedDriver: { select: { id: true, fullName: true, phone: true, profilePhoto: true } },
+  // Fil de la proposition directe : le dernier prix et son commentaire sont
+  // affiches dans les listes des deux camps.
+  negotiationMessages: { orderBy: { createdAt: 'asc' } },
   // assignedDriver déjà inclus ci-dessus avec garage
 };
 
@@ -297,7 +309,6 @@ function parcelAccessWhere(user, parcelId) {
       id: parcelId,
       OR: [
         { assignedDriverId: user.id },
-        { driverId: user.id },
         { proposedDriverId: user.id }
       ]
     };
@@ -352,7 +363,7 @@ async function findAccessibleParcelForDriver(user, parcelId) {
 
   if (!parcel) throw new NotFoundError('Colis introuvable');
 
-  const isAssigned = parcel.assignedDriverId === user.id || parcel.driverId === user.id;
+  const isAssigned = parcel.assignedDriverId === user.id;
   const isProposed = parcel.proposedDriverId === user.id && ['pending', 'countered'].includes(parcel.proposalStatus);
   const hasBid = parcel.bids?.some(bid => bid.driverId === user.id);
   const isFree = parcel.status === 'free';
@@ -444,13 +455,12 @@ async function changeParcelStatus(req, parcel, status, extra = {}) {
         cancellationReason: status === 'cancelled' ? extra.reason : undefined,
         cancelledAt: status === 'cancelled' ? new Date() : undefined,
         signatureUrl: extra.signatureUrl,
-        assignedDriverId: extra.driverId || undefined,
-        driverId: extra.driverId || undefined
+        assignedDriverId: extra.driverId || undefined
       }),
       include: parcelInclude
     });
 
-    const driverId = updated.assignedDriverId || updated.driverId;
+    const driverId = updated.assignedDriverId;
     if (driverId && parcel.status !== status) {
       if (status === 'delivered') {
         await tx.user.update({
@@ -618,7 +628,7 @@ export const updatePin = handle('users.updatePin', async (req, res) => {
 export const userStats = handle('users.stats', async (req, res) => {
   const parcelWhere =
     req.user.role === 'driver'
-      ? { OR: [{ driverId: req.user.id }, { assignedDriverId: req.user.id }], deletedAt: null }
+      ? { assignedDriverId: req.user.id, deletedAt: null }
       : req.user.role === 'admin'
         ? { OR: [{ departureGarageId: req.user.garageId }, { arrivalGarageId: req.user.garageId }], deletedAt: null }
         : { senderId: req.user.id, deletedAt: null };
@@ -824,11 +834,10 @@ function buildParcelData(user, body) {
     
     proposedDriverId: isDirectProposal ? body.driverId : null,
     assignedDriverId: isDriverCreating ? user.id : null,
-    driverId: isDriverCreating ? user.id : null,
     
     proposalStatus: isDirectProposal ? 'pending' : null,
+    lastOfferBy: isDirectProposal ? 'client' : null,
     proposalPrice: isDirectProposal ? decimal(baseAmount) : null,
-    proposalExpiresAt: isDirectProposal ? new Date(Date.now() + 15 * 60 * 1000) : null,
     
     price: decimal(body.price),
     proposedPrice: decimal(body.proposedPrice),
@@ -938,7 +947,7 @@ export const updateParcel = handle('parcel.update', async (req, res) => {
   if (!PARCEL_EDITABLE_STATUSES.includes(parcel.status)) {
     throw new ConflictError('Ce colis est deja engage : son contenu n\'est plus modifiable');
   }
-  if (parcel.assignedDriverId || parcel.driverId) {
+  if (parcel.assignedDriverId) {
     throw new ConflictError('Un chauffeur est deja assigne a ce colis');
   }
   const hasAcceptedBid = (parcel.bids || []).some((bid) => bid.status === 'accepted');
@@ -1103,10 +1112,7 @@ export const driverParcels = handle('driver.parcels', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
   
   const where = cleanUndefined({ 
-    OR: [
-      { assignedDriverId: req.user.id },
-      { driverId: req.user.id }
-    ],
+    assignedDriverId: req.user.id,
     status: req.query.status,
     deletedAt: null 
   });
@@ -1167,7 +1173,7 @@ export const cancelParcel = handle('parcel.cancel', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
   const result = await changeParcelStatus(req, parcel, 'cancelled', { reason: req.body.reason || 'Annulation' });
 
-  const driverId = parcel.assignedDriverId || parcel.driverId;
+  const driverId = parcel.assignedDriverId;
   if (driverId) {
     await prisma.$transaction(async (tx) => {
       const commitmentFee = await getCommitmentFee(tx);
@@ -1197,6 +1203,13 @@ export const updateParcelStatus = handle('parcel.updateStatus', async (req, res)
 // ✅ PROPOSITIONS DIRECTES (NOUVEAU FLUX B)
 // ============================================================
 
+// Meme regle que pour les encheres : le camp qui vient de poser un prix ne peut
+// pas l'accepter lui-meme.
+function proposalLastOfferSide(parcel) {
+  if (parcel?.lastOfferBy) return parcel.lastOfferBy;
+  return parcel?.proposalStatus === 'countered' ? 'driver' : 'client';
+}
+
 /**
  * Chauffeur répond à une proposition directe
  * POST /driver/proposals/:parcelId/respond
@@ -1222,6 +1235,11 @@ export const respondToProposal = handle('proposal.respond', async (req, res) => 
     if (parcel.proposalStatus !== 'pending') {
       throw new ConflictError('Cette proposition a déjà été traitée');
     }
+    // Le dernier prix vient forcement du client ici ; on refuse d'accepter ou
+    // de recontrer sa propre contre-offre.
+    if (proposalLastOfferSide(parcel) === 'driver') {
+      throw new ConflictError('Votre contre-offre est déjà envoyée : attendez la réponse du client');
+    }
 
     let updatedParcel;
 
@@ -1231,8 +1249,8 @@ export const respondToProposal = handle('proposal.respond', async (req, res) => 
         data: {
           proposalStatus: 'accepted',
           status: 'confirmed',
+          lastOfferBy: 'client',
           assignedDriverId: req.user.id,
-          driverId: req.user.id,
           price: parcel.proposalPrice || parcel.price,
           totalAmount: parcel.proposalPrice || parcel.totalAmount,
           negotiatedPrice: parcel.proposalPrice || parcel.price
@@ -1269,6 +1287,7 @@ export const respondToProposal = handle('proposal.respond', async (req, res) => 
         data: {
           proposalStatus: 'rejected',
           proposedDriverId: null,
+          lastOfferBy: null,
           status: 'pending'
         },
         include: parcelInclude
@@ -1291,18 +1310,8 @@ export const respondToProposal = handle('proposal.respond', async (req, res) => 
         throw new ValidationError([{ path: 'price', message: 'Un prix valide est requis pour la contre-offre' }]);
       }
 
-      updatedParcel = await tx.parcel.update({
-        where: { id: parcelId },
-        data: {
-          proposalStatus: 'countered',
-          status: 'negotiating',
-          proposalPrice: decimal(price, '0'),
-          lastCounterPrice: decimal(price, '0'),
-          negotiationCount: { increment: 1 }
-        },
-        include: parcelInclude
-      });
-
+      // Le message est ecrit avant la relecture du colis : le payload renvoye
+      // porte deja le dernier prix et son commentaire.
       await tx.negotiationMessage.create({
         data: {
           parcelId: parcel.id,
@@ -1312,6 +1321,19 @@ export const respondToProposal = handle('proposal.respond', async (req, res) => 
           message: message || `Contre-offre à ${price} FCFA`,
           isCounterOffer: true
         }
+      });
+
+      updatedParcel = await tx.parcel.update({
+        where: { id: parcelId },
+        data: {
+          proposalStatus: 'countered',
+          status: 'negotiating',
+          lastOfferBy: 'driver',
+          proposalPrice: decimal(price, '0'),
+          lastCounterPrice: decimal(price, '0'),
+          negotiationCount: { increment: 1 }
+        },
+        include: parcelInclude
       });
 
       await notify(tx, {
@@ -1375,6 +1397,9 @@ export const respondToCounterProposal = handle('proposal.respondCounter', async 
     if (parcel.proposalStatus !== 'countered') {
       throw new ConflictError('Cette proposition n\'est pas en état de contre-offre');
     }
+    if (proposalLastOfferSide(parcel) !== 'driver') {
+      throw new ConflictError('Votre contre-offre est déjà envoyée : attendez la réponse du chauffeur');
+    }
 
     let updatedParcel;
 
@@ -1384,8 +1409,8 @@ export const respondToCounterProposal = handle('proposal.respondCounter', async 
         data: {
           proposalStatus: 'accepted',
           status: 'confirmed',
+          lastOfferBy: 'driver',
           assignedDriverId: parcel.proposedDriverId,
-          driverId: parcel.proposedDriverId,
           price: parcel.proposalPrice,
           totalAmount: parcel.proposalPrice,
           negotiatedPrice: parcel.proposalPrice
@@ -1410,17 +1435,6 @@ export const respondToCounterProposal = handle('proposal.respondCounter', async 
         throw new ValidationError([{ path: 'price', message: 'Un prix valide est requis' }]);
       }
 
-      updatedParcel = await tx.parcel.update({
-        where: { id: parcelId },
-        data: {
-          proposalStatus: 'pending',
-          proposalPrice: decimal(price, '0'),
-          lastCounterPrice: decimal(price, '0'),
-          negotiationCount: { increment: 1 }
-        },
-        include: parcelInclude
-      });
-
       await tx.negotiationMessage.create({
         data: {
           parcelId: parcel.id,
@@ -1430,6 +1444,19 @@ export const respondToCounterProposal = handle('proposal.respondCounter', async 
           message: message || `Contre-offre à ${price} FCFA`,
           isCounterOffer: true
         }
+      });
+
+      updatedParcel = await tx.parcel.update({
+        where: { id: parcelId },
+        data: {
+          proposalStatus: 'pending',
+          status: 'negotiating',
+          lastOfferBy: 'client',
+          proposalPrice: decimal(price, '0'),
+          lastCounterPrice: decimal(price, '0'),
+          negotiationCount: { increment: 1 }
+        },
+        include: parcelInclude
       });
 
       await notify(tx, {
@@ -1517,7 +1544,7 @@ export const driverConfirm = handle('driver.confirm', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   
   // ✅ Vérifier que le chauffeur est bien assigné
-  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+  if (parcel.assignedDriverId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
   }
   
@@ -1531,7 +1558,7 @@ export const driverConfirm = handle('driver.confirm', async (req, res) => {
 export const driverPickup = handle('driver.pickup', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   
-  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+  if (parcel.assignedDriverId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
   }
   
@@ -1542,7 +1569,7 @@ export const driverPickup = handle('driver.pickup', async (req, res) => {
 export const driverTransit = handle('driver.transit', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   
-  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+  if (parcel.assignedDriverId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
   }
   
@@ -1553,7 +1580,7 @@ export const driverTransit = handle('driver.transit', async (req, res) => {
 export const driverArrived = handle('driver.arrived', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   
-  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+  if (parcel.assignedDriverId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
   }
   
@@ -1564,7 +1591,7 @@ export const driverArrived = handle('driver.arrived', async (req, res) => {
 export const driverOutForDelivery = handle('driver.outForDelivery', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   
-  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+  if (parcel.assignedDriverId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
   }
   
@@ -1579,7 +1606,7 @@ export const driverOutForDelivery = handle('driver.outForDelivery', async (req, 
 export const driverDeliver = handle('driver.deliver', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
 
-  if (parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+  if (parcel.assignedDriverId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
   }
 
@@ -1794,7 +1821,12 @@ export const publicParcelEvents = handle('public.parcelEvents', async (req, res)
 });
 
 export const publicParcelBids = handle('public.parcelBids', async (req, res) => {
-  const bids = await prisma.bid.findMany({ where: { parcelId: req.params.parcelId }, include: { driver: true }, orderBy: { createdAt: 'desc' } });
+  const bids = await prisma.bid.findMany({
+    where: { parcelId: req.params.parcelId },
+    // L'historique alimente le dernier prix et son commentaire dans la liste.
+    include: { driver: true, negotiationMessages: { orderBy: { createdAt: 'asc' } } },
+    orderBy: { createdAt: 'desc' }
+  });
   return ok(res, { message: 'Offres colis', data: { bids: bids.map(serializeBid) } });
 });
 
@@ -1869,8 +1901,8 @@ export const createBid = handle('bid.create', async (req, res) => {
   const bid = await prisma.$transaction(async (tx) => {
     const created = await tx.bid.upsert({
       where: { parcelId_driverId: { parcelId: parcel.id, driverId: req.user.id } },
-      update: { price: decimal(req.body.price, '0'), message: req.body.message, audioUrl: req.body.audioUrl, status: 'pending' },
-      create: { parcelId: parcel.id, driverId: req.user.id, price: decimal(req.body.price, '0'), message: req.body.message, audioUrl: req.body.audioUrl },
+      update: { price: decimal(req.body.price, '0'), message: req.body.message, audioUrl: req.body.audioUrl, status: 'pending', lastOfferBy: 'driver' },
+      create: { parcelId: parcel.id, driverId: req.user.id, price: decimal(req.body.price, '0'), message: req.body.message, audioUrl: req.body.audioUrl, lastOfferBy: 'driver' },
       include: { driver: true }
     });
     await notify(tx, {
@@ -1893,6 +1925,9 @@ export const acceptBid = handle('bid.accept', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
   const bid = await prisma.bid.findFirst({ where: { id: req.params.bidId, parcelId: parcel.id }, include: { driver: true } });
   if (!bid) throw new NotFoundError('Offre introuvable');
+  if (lastOfferSide(bid) === 'client') {
+    throw new ConflictError('Vous avez fait la dernière proposition : attendez la réponse du chauffeur');
+  }
 
   const result = await prisma.$transaction(async (tx) => {
     await tx.bid.updateMany({ where: { parcelId: parcel.id, id: { not: bid.id } }, data: { status: 'rejected', respondedAt: new Date() } });
@@ -1906,7 +1941,6 @@ export const acceptBid = handle('bid.accept', async (req, res) => {
       data: { 
         status: 'confirmed', 
         assignedDriverId: bid.driverId,
-        driverId: bid.driverId, 
         selectedBidId: bid.id, 
         negotiatedPrice: bid.price, 
         totalAmount: bid.price 
@@ -2040,18 +2074,13 @@ export const getBidNegotiation = handle('bid.negotiation.get', async (req, res) 
         }
       },
       parcel: {
-        select: {
-          id: true,
-          trackingNumber: true,
-          status: true,
-          departureCity: true,
-          arrivalCity: true,
-          price: true,
-          proposedPrice: true,
-          description: true,
-          weight: true,
-          senderId: true,
-          senderName: true
+        // departureCity/arrivalCity appartiennent aux annonces, pas aux colis :
+        // la ville vient de la zone, du garage a defaut.
+        include: {
+          departureZone: true,
+          arrivalZone: true,
+          departureGarage: true,
+          arrivalGarage: true
         }
       },
       negotiationMessages: {
@@ -2072,6 +2101,13 @@ export const getBidNegotiation = handle('bid.negotiation.get', async (req, res) 
   if (!bid) {
     throw new NotFoundError('Offre introuvable ou non autorisée');
   }
+
+  const lastEntry = bid.negotiationMessages.length
+    ? bid.negotiationMessages[bid.negotiationMessages.length - 1]
+    : null;
+  const lastOfferBy = bid.lastOfferBy || lastEntry?.fromUserRole || 'driver';
+  const isOpen = bid.status === 'pending' || bid.status === 'countered';
+  const viewerRole = bid.driverId === req.user.id ? 'driver' : 'client';
 
   return ok(res, {
     message: 'Détails de la négociation',
@@ -2094,12 +2130,12 @@ export const getBidNegotiation = handle('bid.negotiation.get', async (req, res) 
           id: bid.parcel.id,
           trackingNumber: bid.parcel.trackingNumber,
           status: bid.parcel.status,
-          departureCity: bid.parcel.departureCity,
-          arrivalCity: bid.parcel.arrivalCity,
-          price: Number(bid.parcel.price),
-          proposedPrice: Number(bid.parcel.proposedPrice),
+          departureCity: bid.parcel.departureZone?.city ?? bid.parcel.departureGarage?.city ?? null,
+          arrivalCity: bid.parcel.arrivalZone?.city ?? bid.parcel.arrivalGarage?.city ?? null,
+          price: Number(bid.parcel.price ?? 0),
+          proposedPrice: Number(bid.parcel.proposedPrice ?? 0),
           description: bid.parcel.description,
-          weight: Number(bid.parcel.weight),
+          weight: Number(bid.parcel.weight ?? 0),
           senderName: bid.parcel.senderName
         },
         negotiationHistory: bid.negotiationMessages.map(msg => ({
@@ -2115,7 +2151,15 @@ export const getBidNegotiation = handle('bid.negotiation.get', async (req, res) 
             profilePhoto: msg.fromUser.profilePhoto
           } : null
         })),
-        canNegotiate: bid.status === 'pending' || bid.status === 'countered'
+        canNegotiate: bid.status === 'pending' || bid.status === 'countered',
+        lastOfferBy,
+        lastPrice: Number(lastEntry?.price ?? bid.price),
+        lastMessage: lastEntry?.message ?? bid.responseMessage ?? bid.message ?? null,
+        // Seul le camp qui n'a pas pose le dernier prix peut accepter.
+        canAccept: isOpen && lastOfferBy !== viewerRole,
+        canClientAccept: isOpen && lastOfferBy === 'driver',
+        canDriverAccept: isOpen && lastOfferBy === 'client',
+        viewerRole
       }
     }
   });
@@ -2145,6 +2189,9 @@ export const clientCounterBid = handle('bid.counter', async (req, res) => {
     if (bid.status !== 'pending' && bid.status !== 'countered') {
       throw new ConflictError('Cette offre n\'est plus négociable');
     }
+    if (lastOfferSide(bid) === 'client') {
+      throw new ConflictError('Votre contre-offre est déjà envoyée : attendez la réponse du chauffeur');
+    }
 
     const updatedBid = await tx.bid.update({
       where: { id: bidId },
@@ -2152,6 +2199,7 @@ export const clientCounterBid = handle('bid.counter', async (req, res) => {
         price: decimal(price, '0'),
         responseMessage: message || `Contre-offre à ${price} FCFA`,
         status: 'countered',
+        lastOfferBy: 'client',
         respondedAt: new Date()
       },
       include: { driver: true, parcel: true }
@@ -2222,6 +2270,14 @@ export const driverRespondCounter = handle('bid.respondCounter', async (req, res
     if (bid.status !== 'countered') {
       throw new ConflictError('Cette offre n\'est plus négociable');
     }
+    // Le dernier prix fait foi : on n'accepte jamais sa propre proposition.
+    const lastSide = lastOfferSide(bid);
+    if (accept && lastSide !== 'client') {
+      throw new ConflictError('Vous avez fait la dernière proposition : attendez la réponse du client');
+    }
+    if (!accept && lastSide === 'driver') {
+      throw new ConflictError('Votre contre-offre est déjà envoyée : attendez la réponse du client');
+    }
 
     let updatedBid;
 
@@ -2241,7 +2297,6 @@ export const driverRespondCounter = handle('bid.respondCounter', async (req, res
         data: {
           status: 'confirmed',
           assignedDriverId: req.user.id,
-          driverId: req.user.id,
           selectedBidId: bidId,
           negotiatedPrice: bid.price,
           totalAmount: bid.price
@@ -2279,6 +2334,7 @@ export const driverRespondCounter = handle('bid.respondCounter', async (req, res
           price: decimal(price, '0'),
           responseMessage: message || `Contre-offre à ${price} FCFA`,
           status: 'countered',
+          lastOfferBy: 'driver',
           respondedAt: new Date()
         },
         include: { driver: true, parcel: true }
@@ -2350,6 +2406,9 @@ export const clientAcceptBid = handle('bid.clientAccept', async (req, res) => {
     if (bid.status === 'rejected') {
       throw new ConflictError('Cette offre a été rejetée');
     }
+    if (lastOfferSide(bid) === 'client') {
+      throw new ConflictError('Vous avez fait la dernière proposition : attendez la réponse du chauffeur');
+    }
 
     const updatedBid = await tx.bid.update({
       where: { id: bidId },
@@ -2365,7 +2424,6 @@ export const clientAcceptBid = handle('bid.clientAccept', async (req, res) => {
       data: {
         status: 'confirmed',
         assignedDriverId: bid.driverId,
-        driverId: bid.driverId,
         selectedBidId: bidId,
         negotiatedPrice: bid.price,
         totalAmount: bid.price
@@ -2830,13 +2888,13 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
         userId: req.user.id,
         type: 'admin_payment_confirmed',
         title: `Especes confirme : ${parcel.trackingNumber}`,
-        body: `${parcelPrice} FCFA confirmes${isDelivered ? ` — chauffeur ${parcel.driverId} sera credite` : ''}.`,
+        body: `${parcelPrice} FCFA confirmes${isDelivered ? ` — chauffeur ${parcel.assignedDriverId} sera credite` : ''}.`,
         data: { parcelId, amount: parcelPrice, delivered: isDelivered }
       }
     })
   ]);
 
-  const driverId = parcel.assignedDriverId || parcel.driverId;
+  const driverId = parcel.assignedDriverId;
   if (isDelivered && driverId && parcelPrice > 0) {
     const commission = await calculateCommission(parcelPrice);
 
@@ -4303,10 +4361,10 @@ export const createAdvertisementOffer = handle('advertisements.offerCreate', asy
   if (parcelId) {
     const parcel = await prisma.parcel.findFirst({
       where: { id: parcelId, senderId: req.user.id, deletedAt: null },
-      select: { id: true, status: true, assignedDriverId: true, driverId: true }
+      select: { id: true, status: true, assignedDriverId: true }
     });
     if (!parcel) throw new NotFoundError('Colis introuvable');
-    if (parcel.assignedDriverId || parcel.driverId) throw new ConflictError('Ce colis est deja assigne a un chauffeur');
+    if (parcel.assignedDriverId) throw new ConflictError('Ce colis est deja assigne a un chauffeur');
     if (!PARCEL_OFFERABLE_STATUSES.includes(parcel.status)) {
       throw new ConflictError('Ce colis n\'est plus disponible pour une offre de trajet');
     }
@@ -4395,7 +4453,7 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
     if (advertisement.status !== 'open' && currentOffer.status !== 'accepted') {
       throw new ConflictError('Cette annonce n\'accepte plus de nouvelles offres');
     }
-    if (parcel.assignedDriverId || parcel.driverId && parcel.driverId !== advertisement.driverId) {
+    if (parcel.assignedDriverId && parcel.assignedDriverId !== advertisement.driverId) {
       throw new ConflictError('Ce colis est deja assigne a un autre chauffeur');
     }
     const competingAcceptance = await tx.advertisementOffer.findFirst({
@@ -4412,7 +4470,7 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
 
     const alreadyApplied =
       currentOffer.status === 'accepted' &&
-      (parcel.assignedDriverId === advertisement.driverId || parcel.driverId === advertisement.driverId) &&
+      parcel.assignedDriverId === advertisement.driverId &&
       !['pending', 'free'].includes(parcel.status);
     if (alreadyApplied) {
       return { offer: currentOffer, parcel, event: null };
@@ -4430,14 +4488,11 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
         status: { in: ['pending', 'free'] },
         OR: [
           { assignedDriverId: null },
-          { driverId: null },
-          { assignedDriverId: advertisement.driverId },
-          { driverId: advertisement.driverId }
+          { assignedDriverId: advertisement.driverId }
         ]
       },
       data: {
         assignedDriverId: advertisement.driverId,
-        driverId: advertisement.driverId,
         status: 'confirmed',
         negotiatedPrice: currentOffer.price,
         totalAmount: currentOffer.price,
@@ -4503,7 +4558,7 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
       beforeData: {
         offerStatus: currentOffer.status,
         parcelStatus: parcel.status,
-        parcelDriverId: parcel.driverId
+        parcelDriverId: parcel.assignedDriverId
       },
       afterData: {
         offerStatus: 'accepted',
@@ -4808,7 +4863,7 @@ async function buildPeriodReport({ scope, from, to, bucket }) {
     prisma.parcel.findMany({ where: createdWhere, select: { createdAt: true } }),
     prisma.parcel.findMany({
       where: deliveredWhere,
-      select: { deliveryDate: true, totalAmount: true, price: true, driverId: true }
+      select: { deliveryDate: true, totalAmount: true, price: true, assignedDriverId: true }
     }),
     prisma.parcel.count({ where: { ...scope, deletedAt: null, status: 'cancelled', updatedAt: { gte: from, lt: to } } }),
     prisma.parcel.groupBy({ by: ['status'], where: createdWhere, _count: { status: true } }),
@@ -4821,10 +4876,10 @@ async function buildPeriodReport({ scope, from, to, bucket }) {
       _sum: { amount: true }
     }),
     prisma.parcel.groupBy({
-      by: ['driverId'],
-      where: { ...deliveredWhere, driverId: { not: null } },
-      _count: { driverId: true },
-      orderBy: { _count: { driverId: 'desc' } },
+      by: ['assignedDriverId'],
+      where: { ...deliveredWhere, assignedDriverId: { not: null } },
+      _count: { assignedDriverId: true },
+      orderBy: { _count: { assignedDriverId: 'desc' } },
       take: 5
     })
   ]);
@@ -4845,7 +4900,7 @@ async function buildPeriodReport({ scope, from, to, bucket }) {
 
   const driverNames = topDrivers.length
     ? await prisma.user.findMany({
-        where: { id: { in: topDrivers.map((row) => row.driverId) } },
+        where: { id: { in: topDrivers.map((row) => row.assignedDriverId) } },
         select: { id: true, fullName: true }
       })
     : [];
@@ -4869,9 +4924,9 @@ async function buildPeriodReport({ scope, from, to, bucket }) {
     parcelsByStatus: Object.fromEntries(grouped.map((row) => [row.status, row._count.status])),
     series,
     topDrivers: topDrivers.map((row) => ({
-      driverId: row.driverId,
-      fullName: nameById.get(row.driverId) ?? null,
-      delivered: row._count.driverId
+      driverId: row.assignedDriverId,
+      fullName: nameById.get(row.assignedDriverId) ?? null,
+      delivered: row._count.assignedDriverId
     }))
   };
 }
@@ -4931,9 +4986,9 @@ export const driverStats = handle('driver.stats', async (req, res) => {
   const driverId = req.user.id;
 
   const [assignedParcels, activeParcels, completedDeliveries, score, pendingBids, openAdvertisements] = await Promise.all([
-    prisma.parcel.count({ where: { OR: [{ driverId: driverId }, { assignedDriverId: driverId }] } }),
-    prisma.parcel.count({ where: { OR: [{ driverId: driverId }, { assignedDriverId: driverId }], status: { in: ACTIVE_PARCEL_STATUSES } } }),
-    prisma.parcel.count({ where: { OR: [{ driverId: driverId }, { assignedDriverId: driverId }], status: 'delivered' } }),
+    prisma.parcel.count({ where: { assignedDriverId: driverId } }),
+    prisma.parcel.count({ where: { assignedDriverId: driverId, status: { in: ACTIVE_PARCEL_STATUSES } } }),
+    prisma.parcel.count({ where: { assignedDriverId: driverId, status: 'delivered' } }),
     prisma.score.findUnique({ where: { userId: driverId } }),
     prisma.bid.count({ where: { driverId: driverId, status: 'pending' } }),
     prisma.advertisement.count({ where: { driverId: driverId, status: 'open' } })
@@ -5075,7 +5130,7 @@ export const superAdminUserDetail = handle('super.userDetail', async (req, res) 
   const user = await prisma.user.findUnique({ where: { id: req.params.userId }, include: { ...driverInclude, score: true } });
   if (!user) throw new NotFoundError('Utilisateur introuvable');
   const stats = {
-    parcels: await prisma.parcel.count({ where: { OR: [{ senderId: user.id }, { driverId: user.id }] } }),
+    parcels: await prisma.parcel.count({ where: { OR: [{ senderId: user.id }, { assignedDriverId: user.id }] } }),
     payments: await prisma.payment.count({ where: { userId: user.id } })
   };
   return ok(res, { message: 'Detail utilisateur', data: { user: { ...serializeUser(user), score: user.score, garage: serializeGarage(user.garage), stats } } });
@@ -6223,7 +6278,7 @@ export const getParcelFromAdvertisement = handle('advertisements.getParcel', asy
   if (req.user.role === 'client' && parcel.senderId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas autorisé à voir ce colis');
   }
-  if (req.user.role === 'driver' && parcel.assignedDriverId !== req.user.id && parcel.driverId !== req.user.id) {
+  if (req.user.role === 'driver' && parcel.assignedDriverId !== req.user.id) {
     throw new ForbiddenError('Vous n\'êtes pas autorisé à voir ce colis');
   }
 

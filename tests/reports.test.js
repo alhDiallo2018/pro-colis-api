@@ -45,7 +45,7 @@ describe('activity reports', () => {
         weight: '1.00',
         status,
         departureGarageId: garageId,
-        driverId: status === 'delivered' ? driverId : null,
+        assignedDriverId: status === 'delivered' ? driverId : null,
         price: String(amount),
         totalAmount: String(amount),
         deliveryDate: deliveryDate ?? null,

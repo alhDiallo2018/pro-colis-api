@@ -48,7 +48,7 @@ describe('cash payment reconciliation', () => {
         weight: '2.50',
         status,
         departureGarageId: garageId,
-        driverId,
+        assignedDriverId: driverId,
         price: '7500',
         totalAmount: '7500',
         paymentMethod: 'cash',
