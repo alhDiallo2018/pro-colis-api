@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
-    "test": "NODE_ENV=test DATABASE_URL=\"postgresql://procolis:procolis@localhost:15432/procolis_test?schema=public\" node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
+    "test": "NODE_ENV=test node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
     "seed": "node prisma/seed.js",
     "seed:super-admin": "node prisma/seed-super-admin.js",
     "seed:zones-sn": "node prisma/seed-zones-senegal.js",
@@ -16,7 +16,7 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
-    "test:db:setup": "docker compose up -d postgres && docker exec procolis-node-postgres psql -U procolis -d postgres -c 'CREATE DATABASE procolis_test OWNER procolis' || true; DATABASE_URL=\"postgresql://procolis:procolis@localhost:15432/procolis_test?schema=public\" prisma migrate deploy"
+    "test:db:setup": "DATABASE_URL=\"$(node scripts/db-url.mjs procolis_test)\" prisma migrate deploy"
   },
   "dependencies": {
     "@getbrevo/brevo": "^6.0.2",
@@ -46,7 +46,14 @@
     "node": ">=20"
   },
   "jest": {
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "setupFiles": [
+      "<rootDir>/tests/env.setup.js"
+    ],
+    "testPathIgnorePatterns": [
+      "<rootDir>/node_modules/",
+      "<rootDir>/tests/env.setup.js"
+    ]
   },
   "prisma": {
     "seed": "node prisma/seed.js"

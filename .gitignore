@@ -12,3 +12,6 @@ backups/*
 npm-debug.log*
 .DS_Store
 *.json
+
+# Surcharge Docker locale (service postgres conteneurise)
+docker-compose.override.yml
