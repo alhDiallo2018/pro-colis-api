@@ -137,6 +137,44 @@ export async function refresh(req, res) {
   }
 }
 
+export async function logout(req, res) {
+  try {
+    const result = await authService.logout(req.validated.body.refreshToken);
+    return ok(res, { message: 'Session fermee', data: result });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'auth.logout', requestId: req.requestId },
+      'Failed to close session'
+    );
+
+    return fail(res, {
+      status: error.statusCode || 500,
+      message: error.publicMessage || 'Deconnexion impossible',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.details || []
+    });
+  }
+}
+
+export async function logoutAll(req, res) {
+  try {
+    const result = await authService.logoutAllSessions(req.user.id);
+    return ok(res, { message: 'Toutes les sessions ont ete fermees', data: result });
+  } catch (error) {
+    req.log.error(
+      { error, action: 'auth.logoutAll', userId: req.user?.id, requestId: req.requestId },
+      'Failed to close every session'
+    );
+
+    return fail(res, {
+      status: error.statusCode || 500,
+      message: error.publicMessage || 'Deconnexion impossible',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.details || []
+    });
+  }
+}
+
 export function me(req, res) {
   return ok(res, {
     message: 'Utilisateur courant',

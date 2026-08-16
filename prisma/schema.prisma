@@ -709,12 +709,25 @@ model OtpCode {
 model RefreshToken {
   id        String    @id @default(uuid()) @db.Uuid
   userId    String    @map("user_id") @db.Uuid
+  // Identifiant public porte par le JWT : il localise la ligne sans avoir a
+  // comparer le hash de chaque session. Nullable pour les jetons emis avant la
+  // rotation, qui restent valides jusqu'a leur expiration naturelle.
+  jti       String?   @unique @db.Uuid
   tokenHash String    @unique @map("token_hash")
   expiresAt DateTime  @map("expires_at") @db.Timestamptz
+  // Derniere requete authentifiee rattachee a cette session : c'est elle qui
+  // mesure l'inactivite, pas la date d'emission du jeton.
+  lastUsedAt DateTime @default(now()) @map("last_used_at") @db.Timestamptz
   revokedAt DateTime? @map("revoked_at") @db.Timestamptz
+  // Pourquoi la session a ete fermee. Distinguer une revocation par rotation
+  // d'une fermeture pour inactivite evite qu'un simple timeout ne soit pris
+  // pour un rejeu et ne coupe les autres appareils du compte.
+  revokedReason String? @map("revoked_reason")
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@index([userId])
+  @@index([expiresAt])
   @@map("refresh_tokens")
 }
 
@@ -967,6 +980,10 @@ model Message {
   handledBy   User?     @relation("MessageHandledBy", fields: [handledById], references: [id], onDelete: SetNull)
   parcel      Parcel?   @relation(fields: [parcelId], references: [id], onDelete: SetNull)
 
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([parcelId])
+  @@index([createdAt])
   @@map("messages")
 }
 

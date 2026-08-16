@@ -2,6 +2,12 @@ import { app } from './app.js';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
 import { disconnectPrisma } from './config/prisma.js';
+import { attachNotificationPushBridge } from './utils/push.js';
+
+// Toute notification creee part aussi en push vers les appareils du
+// destinataire. Branche ici et pas dans `app.js` : les tests montent l'app sans
+// devoir declencher d'appels reseau.
+attachNotificationPushBridge();
 
 const server = app.listen(env.PORT, () => {
   logger.info({ port: env.PORT }, 'PRO COLIS API started');

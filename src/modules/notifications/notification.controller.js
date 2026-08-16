@@ -1,5 +1,6 @@
 import { prisma } from '../../config/prisma.js';
 import { ok, fail } from '../../utils/api-response.js';
+import { countUnreadForUser } from '../../utils/push.js';
 import { getPagination, paginationMeta } from '../../utils/pagination.js';
 
 export async function listNotifications(req, res) {
@@ -33,13 +34,21 @@ export async function listNotifications(req, res) {
 
 export async function unreadCount(req, res) {
   try {
-    const count = await prisma.notification.count({
-      where: { userId: req.user.id, isRead: false }
-    });
+    // Le badge de l'icone doit compter tout ce qui reste a lire, notifications
+    // et messages confondus : deux compteurs separes donneraient deux chiffres
+    // contradictoires entre l'ecran et l'icone. `count` reste le nombre de
+    // notifications pour les clients deja deployes, `total` porte le badge.
+    const { notifications, messages, total } = await countUnreadForUser(req.user.id);
 
     return ok(res, {
-      message: 'Nombre de notifications non lues',
-      data: { count, unreadCount: count }
+      message: 'Nombre d\'elements non lus',
+      data: {
+        count: notifications,
+        unreadCount: notifications,
+        notifications,
+        messages,
+        total
+      }
     });
   } catch (error) {
     req.log.error(

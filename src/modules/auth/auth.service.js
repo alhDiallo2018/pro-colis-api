@@ -5,6 +5,8 @@ import { ConflictError, UnauthorizedError, ValidationError } from '../../utils/e
 import {
   compareSecret,
   hashSecret,
+  refreshTokenExpiresAt,
+  sessionIdleTimeoutMs,
   signAccessToken,
   signRefreshToken,
   verifyRefreshToken
@@ -28,26 +30,71 @@ const USER_INCLUDE = {
   }
 };
 
-function addDays(date, days) {
-  const nextDate = new Date(date);
-  nextDate.setDate(nextDate.getDate() + days);
-  return nextDate;
-}
 
+/**
+ * Emet un couple access/refresh et ouvre la ligne de session correspondante.
+ *
+ * `expiresAt` est derive de la meme configuration que le JWT (et donc du role) :
+ * l'ancienne version ecrivait 30 jours en dur, si bien qu'une session staff
+ * raccourcie par configuration serait restee ouverte un mois cote base.
+ */
 async function createTokenPair(user) {
-  const accessToken = signAccessToken(user);
-  const refreshToken = signRefreshToken(user);
+  const { token: refreshToken, jti } = signRefreshToken(user);
   const tokenHash = await hashSecret(refreshToken);
+  const now = new Date();
 
   await prisma.refreshToken.create({
     data: {
       userId: user.id,
+      jti,
       tokenHash,
-      expiresAt: addDays(new Date(), 30)
+      expiresAt: refreshTokenExpiresAt(user.role),
+      lastUsedAt: now
     }
   });
 
-  return { accessToken, refreshToken };
+  // L'access token est signe apres la session : il en porte l'identifiant, ce
+  // qui permet a chaque requete de dater l'activite de cette session precise.
+  return { accessToken: signAccessToken(user, jti), refreshToken };
+}
+
+/** Coupe toutes les sessions ouvertes d'un compte. */
+async function revokeAllSessions(userId, reason, client = prisma) {
+  return client.refreshToken.updateMany({
+    where: { userId, revokedAt: null },
+    data: { revokedAt: new Date(), revokedReason: reason }
+  });
+}
+
+/** Une session inactive depuis plus longtemps que le delai configure est morte. */
+export function isSessionIdle(session, now = Date.now()) {
+  return now - session.lastUsedAt.getTime() > sessionIdleTimeoutMs();
+}
+
+/**
+ * Retrouve la ligne de session designee par un refresh token.
+ *
+ * Chemin nominal : le JWT porte un `jti`, une seule ligne est candidate et un
+ * seul `bcrypt.compare` tranche. Chemin de repli : les jetons emis avant la
+ * rotation n'ont pas de `jti`, il faut alors balayer les sessions actives —
+ * elles sont peu nombreuses puisque l'ancien schema n'en creait qu'une par
+ * connexion. Ce repli disparaitra de lui-meme a l'expiration des jetons.
+ */
+async function findSessionForToken(userId, refreshToken, jti) {
+  if (jti) {
+    const session = await prisma.refreshToken.findUnique({ where: { jti } });
+    if (!session || session.userId !== userId) return null;
+    return (await compareSecret(refreshToken, session.tokenHash)) ? session : null;
+  }
+
+  const candidates = await prisma.refreshToken.findMany({
+    where: { userId, jti: null, revokedAt: null, expiresAt: { gt: new Date() } }
+  });
+
+  for (const candidate of candidates) {
+    if (await compareSecret(refreshToken, candidate.tokenHash)) return candidate;
+  }
+  return null;
 }
 
 export async function registerUser(payload) {
@@ -129,6 +176,17 @@ export async function loginWithPin({ identifier, pin }) {
   return { user: serializeUser(updatedUser), ...tokens };
 }
 
+/**
+ * Renouvelle la session en faisant tourner le refresh token.
+ *
+ * Le jeton presente est consomme : il est revoque et remplace. Un jeton vole ne
+ * vaut donc plus un mois d'acces mais une seule utilisation, et sa reutilisation
+ * est detectable — c'est tout l'interet de la rotation.
+ *
+ * Reutilisation d'un jeton deja revoque : soit la victime a continue de s'en
+ * servir apres le vol, soit c'est l'attaquant qui rejoue. Impossible de trancher,
+ * donc on coupe toutes les sessions du compte et on force une reconnexion.
+ */
 export async function refreshAccessToken(refreshToken) {
   const payload = verifyRefreshToken(refreshToken);
   const user = await prisma.user.findUnique({
@@ -140,32 +198,96 @@ export async function refreshAccessToken(refreshToken) {
     throw new UnauthorizedError('Session invalide');
   }
 
-  const storedTokens = await prisma.refreshToken.findMany({
-    where: {
-      userId: user.id,
-      revokedAt: null,
-      expiresAt: { gt: new Date() }
-    }
-  });
+  const session = await findSessionForToken(user.id, refreshToken, payload.jti);
 
-  const matchingToken = await Promise.any(
-    storedTokens.map(async (storedToken) => {
-      const matches = await compareSecret(refreshToken, storedToken.tokenHash);
-      if (!matches) {
-        throw new Error('Token mismatch');
-      }
-      return storedToken;
-    })
-  ).catch(() => null);
-
-  if (!matchingToken) {
+  if (!session) {
     throw new UnauthorizedError('Refresh token invalide');
   }
 
+  // Seule une revocation par rotation signe un rejeu. Une session fermee pour
+  // inactivite ou par deconnexion est un evenement normal : la representer
+  // couperait les autres appareils du compte sans raison.
+  if (session.revokedReason === 'rotated') {
+    await revokeAllSessions(user.id, 'reuse');
+    throw new UnauthorizedError('Session revoquee, reconnexion requise');
+  }
+
+  if (session.revokedAt || session.expiresAt <= new Date()) {
+    throw new UnauthorizedError('Session expiree, reconnexion requise');
+  }
+
+  if (isSessionIdle(session)) {
+    await prisma.refreshToken.update({
+      where: { id: session.id },
+      data: { revokedAt: new Date(), revokedReason: 'idle' }
+    });
+    throw new UnauthorizedError('Session expiree pour inactivite');
+  }
+
+  const { token: nextRefreshToken, jti } = signRefreshToken(user);
+  const accessToken = signAccessToken(user, jti);
+  const tokenHash = await hashSecret(nextRefreshToken);
+  const now = new Date();
+
+  await prisma.$transaction([
+    prisma.refreshToken.update({
+      where: { id: session.id },
+      data: { revokedAt: now, revokedReason: 'rotated' }
+    }),
+    prisma.refreshToken.create({
+      data: {
+        userId: user.id,
+        jti,
+        tokenHash,
+        expiresAt: refreshTokenExpiresAt(user.role),
+        lastUsedAt: now
+      }
+    }),
+    // Les lignes revoquees restent le temps de detecter un rejeu, puis n'ont
+    // plus d'utilite : sans cette purge la table grossit d'une ligne par
+    // renouvellement, soit des centaines par compte et par mois.
+    prisma.refreshToken.deleteMany({
+      where: { userId: user.id, expiresAt: { lt: new Date() } }
+    })
+  ]);
+
   return {
     user: serializeUser(user),
-    accessToken: signAccessToken(user)
+    accessToken,
+    refreshToken: nextRefreshToken
   };
+}
+
+/**
+ * Ferme une session. Detenir le refresh token vaut preuve de possession, aucune
+ * authentification supplementaire n'est exigee : un client dont l'access token
+ * a deja expire doit pouvoir se deconnecter proprement.
+ */
+export async function logout(refreshToken) {
+  let payload;
+  try {
+    payload = verifyRefreshToken(refreshToken);
+  } catch {
+    // Un jeton expire ou illisible ne designe aucune session : il n'y a rien a
+    // fermer, et le dire reviendrait a renseigner un attaquant.
+    return { loggedOut: true };
+  }
+
+  const session = await findSessionForToken(payload.sub, refreshToken, payload.jti);
+  if (session && !session.revokedAt) {
+    await prisma.refreshToken.update({
+      where: { id: session.id },
+      data: { revokedAt: new Date(), revokedReason: 'logout' }
+    });
+  }
+
+  return { loggedOut: true };
+}
+
+/** Ferme toutes les sessions du compte (appareil perdu, doute sur un acces). */
+export async function logoutAllSessions(userId) {
+  const { count } = await revokeAllSessions(userId, 'logout');
+  return { loggedOut: true, sessions: count };
 }
 
 function generateOtpCode() {
@@ -321,7 +443,7 @@ export async function resetPassword({ identifier, otpCode, newPassword, newPin }
     // deja connecte survivrait a la reprise de controle du compte.
     prisma.refreshToken.updateMany({
       where: { userId: user.id, revokedAt: null },
-      data: { revokedAt: new Date() }
+      data: { revokedAt: new Date(), revokedReason: 'reset' }
     })
   ]);
 

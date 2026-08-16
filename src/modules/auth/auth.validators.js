@@ -41,6 +41,14 @@ export const refreshSchema = z.object({
   query: z.object({}).default({})
 });
 
+export const logoutSchema = z.object({
+  body: z.object({
+    refreshToken: z.string().min(20)
+  }),
+  params: z.object({}).default({}),
+  query: z.object({}).default({})
+});
+
 export const sendOtpSchema = z.object({
   body: z.object({
     phone: z.string().min(8).optional(),

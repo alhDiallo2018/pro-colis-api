@@ -346,6 +346,47 @@ mobileRouter.patch('/messages/:messageId', authenticate, mobileController.update
 mobileRouter.delete('/messages/:messageId', authenticate, mobileController.deleteMessage);
 
 // ============================================================
+// MESSAGES - MODERATION
+// ============================================================
+
+// Admin et cellules support accedent a l'integralite des echanges pour traiter
+// un signalement ; la liste des roles vit dans le controleur pour rester
+// alignee avec le controle applique a la suppression.
+const messageModerationRoles = requireRoles(...mobileController.MESSAGE_MODERATOR_ROLES);
+
+mobileRouter.get(
+  '/messages/admin/conversations',
+  authenticate,
+  messageModerationRoles,
+  mobileController.moderationConversations
+);
+mobileRouter.get(
+  '/messages/admin/thread',
+  authenticate,
+  messageModerationRoles,
+  mobileController.moderationThread
+);
+mobileRouter.get(
+  '/messages/admin/messages',
+  authenticate,
+  messageModerationRoles,
+  mobileController.moderationMessages
+);
+// Purge groupee : un signalement porte souvent sur une rafale de messages.
+mobileRouter.post(
+  '/messages/admin/messages/bulk-delete',
+  authenticate,
+  messageModerationRoles,
+  mobileController.moderationDeleteMessages
+);
+mobileRouter.delete(
+  '/messages/admin/messages/:messageId',
+  authenticate,
+  messageModerationRoles,
+  mobileController.moderationDeleteMessage
+);
+
+// ============================================================
 // SUPPORT
 // ============================================================
 

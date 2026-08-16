@@ -3392,7 +3392,16 @@ export const favoriteGarages = handle('favorites.garages', async (req, res) => {
 const MESSAGE_EDIT_WINDOW_MS = 15 * 60 * 1000;
 const MESSAGE_BODY_MAX_LENGTH = 4000;
 const PRICE_PROPOSAL_PREFIX = '__PRIX__';
-const MESSAGE_MODERATOR_ROLES = ['super_admin', 'support'];
+// Roles habilites a lire et purger n'importe quel echange : l'admin et les
+// deux cellules support (technique, commercial) traitent les signalements au
+// meme titre que le super admin.
+export const MESSAGE_MODERATOR_ROLES = [
+  'super_admin',
+  'admin',
+  'support',
+  'support_technique',
+  'support_commercial'
+];
 
 function isPriceProposal(message) {
   return (message.body || '').startsWith(PRICE_PROPOSAL_PREFIX);
@@ -3711,6 +3720,8 @@ export const deleteMessage = handle('messages.delete', async (req, res) => {
     return ok(res, { message: 'Message deja supprime' });
   }
 
+  const reason = moderationReason(req);
+
   await prisma.$transaction(async (tx) => {
     await tx.message.update({
       where: { id: existing.id },
@@ -3733,7 +3744,7 @@ export const deleteMessage = handle('messages.delete', async (req, res) => {
       entityType: 'message',
       entityId: existing.id,
       beforeData: { body: existing.body, senderId: existing.senderId, isRead: existing.isRead },
-      afterData: { deleted: true, moderated: !isAuthor }
+      afterData: { deleted: true, moderated: !isAuthor, reason }
     });
   });
 
@@ -3836,6 +3847,387 @@ export const readMessage = handle('messages.read', async (req, res) => {
     if (!exists) throw new NotFoundError('Message introuvable');
   }
   return ok(res, { message: 'Message lu' });
+});
+
+// ============================================================
+// MESSAGES - Moderation (admin, support, technique, commercial)
+// ============================================================
+
+// Un signalement porte presque toujours sur un message que son auteur vient
+// d'effacer : la moderation lit donc les messages supprimes par defaut, la ou
+// les ecrans client/chauffeur les masquent (`deletedAt: null`).
+const MODERATION_PARTICIPANT_SELECT = {
+  id: true,
+  fullName: true,
+  phone: true,
+  email: true,
+  role: true,
+  profilePhoto: true
+};
+
+const MODERATION_MESSAGE_INCLUDE = {
+  sender: { select: MODERATION_PARTICIPANT_SELECT },
+  receiver: { select: MODERATION_PARTICIPANT_SELECT },
+  parcel: { select: { id: true, trackingNumber: true } }
+};
+
+const MODERATION_REASON_MAX_LENGTH = 500;
+const MODERATION_BULK_MAX = 100;
+
+function serializeModerationMessage(message) {
+  if (!message) return null;
+  return {
+    ...serializeMessage(message),
+    readAt: message.readAt || null,
+    deletedAt: message.deletedAt || null,
+    isDeleted: Boolean(message.deletedAt),
+    isPriceProposal: isPriceProposal(message),
+    preview: messagePreview(message),
+    sender: message.sender || null,
+    receiver: message.receiver || null,
+    parcel: message.parcel
+      ? { id: message.parcel.id, trackingNumber: message.parcel.trackingNumber }
+      : null
+  };
+}
+
+function moderationUuid(value, path) {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (!UUID_PATTERN.test(String(value))) {
+    throw new ValidationError([{ path, message: 'Identifiant invalide' }], 'Filtre de moderation invalide');
+  }
+  return String(value);
+}
+
+function moderationDateFilter(from, to) {
+  const range = cleanUndefined({
+    gte: from ? new Date(from) : undefined,
+    lte: to ? new Date(to) : undefined
+  });
+  if (Object.values(range).some((date) => Number.isNaN(date.getTime()))) {
+    throw new ValidationError([{ path: 'query.from', message: 'Date ISO invalide' }], 'Filtre de moderation invalide');
+  }
+  return Object.keys(range).length ? range : undefined;
+}
+
+function moderationReason(req) {
+  const raw = req.body?.reason ?? req.query?.reason;
+  const reason = typeof raw === 'string' ? raw.trim() : '';
+  if (!reason) return null;
+  if (reason.length > MODERATION_REASON_MAX_LENGTH) {
+    throw new ValidationError([
+      { path: 'body.reason', message: `Motif limite a ${MODERATION_REASON_MAX_LENGTH} caracteres` }
+    ]);
+  }
+  return reason;
+}
+
+// `parcelId=none` cible les discussions hors colis (support, contact direct).
+// Sans le parametre la moderation voit le fil complet, tous colis confondus :
+// un signalement ne dit jamais dans quel fil precis le message a ete poste.
+function moderationParcelScope(rawParcelId) {
+  if (rawParcelId === undefined || rawParcelId === '') return undefined;
+  if (rawParcelId === 'none' || rawParcelId === 'null') return null;
+  return moderationUuid(rawParcelId, 'query.parcelId');
+}
+
+async function moderationUserIdsMatching(search) {
+  // `phoneSearchVariants` rend [''] sur un texte sans chiffre : la clause serait
+  // inutile et masquerait la recherche par nom.
+  const phoneVariants = phoneSearchVariants(search).filter(Boolean);
+
+  const users = await prisma.user.findMany({
+    where: {
+      OR: [
+        { fullName: { contains: search, mode: 'insensitive' } },
+        { email: { contains: search, mode: 'insensitive' } },
+        { phone: { contains: search, mode: 'insensitive' } },
+        ...(phoneVariants.length ? [{ phone: { in: phoneVariants } }] : [])
+      ]
+    },
+    select: { id: true },
+    take: 200
+  });
+  return users.map((user) => user.id);
+}
+
+export const moderationConversations = handle('messages.moderation.conversations', async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const { page, limit, skip } = getPagination(req.query);
+  const includeDeleted = req.query.includeDeleted !== 'false';
+  const parcelScope = moderationParcelScope(req.query.parcelId);
+  const userId = moderationUuid(req.query.userId, 'query.userId');
+  const search = String(req.query.search || '').trim();
+
+  const scopes = [];
+  if (userId) scopes.push({ OR: [{ senderId: userId }, { receiverId: userId }] });
+  if (search) {
+    const matchedIds = await moderationUserIdsMatching(search);
+    if (matchedIds.length === 0) {
+      return ok(res, {
+        message: 'Conversations',
+        data: { conversations: [] },
+        meta: paginationMeta({ page, limit, total: 0 })
+      });
+    }
+    scopes.push({ OR: [{ senderId: { in: matchedIds } }, { receiverId: { in: matchedIds } }] });
+  }
+
+  const where = cleanUndefined({
+    deletedAt: includeDeleted ? undefined : null,
+    parcelId: parcelScope,
+    AND: scopes.length ? scopes : undefined
+  });
+
+  // Le regroupement se fait sur les paires orientees (expediteur, destinataire) :
+  // les deux sens d'un meme fil sont ensuite fusionnes sur une cle triee.
+  const groups = await prisma.message.groupBy({
+    by: ['senderId', 'receiverId', 'parcelId'],
+    where,
+    _count: { _all: true },
+    _max: { createdAt: true }
+  });
+
+  const threads = new Map();
+  for (const group of groups) {
+    const participantIds = [group.senderId, group.receiverId].sort();
+    const key = `${participantIds[0]}::${participantIds[1]}::${group.parcelId || '_'}`;
+    const lastMessageAt = group._max.createdAt;
+    const existing = threads.get(key);
+
+    if (existing) {
+      existing.messageCount += group._count._all;
+      if (lastMessageAt > existing.lastMessageAt) existing.lastMessageAt = lastMessageAt;
+      continue;
+    }
+
+    threads.set(key, {
+      key,
+      participantIds,
+      parcelId: group.parcelId,
+      messageCount: group._count._all,
+      lastMessageAt
+    });
+  }
+
+  const sorted = Array.from(threads.values()).sort(
+    (a, b) => new Date(b.lastMessageAt) - new Date(a.lastMessageAt)
+  );
+  const total = sorted.length;
+
+  const conversations = await Promise.all(
+    sorted.slice(skip, skip + limit).map(async (thread) => {
+      const [left, right] = thread.participantIds;
+      const lastMessage = await prisma.message.findFirst({
+        where: cleanUndefined({
+          deletedAt: includeDeleted ? undefined : null,
+          parcelId: thread.parcelId,
+          OR: [
+            { senderId: left, receiverId: right },
+            { senderId: right, receiverId: left }
+          ]
+        }),
+        orderBy: { createdAt: 'desc' },
+        include: MODERATION_MESSAGE_INCLUDE
+      });
+
+      const participants = lastMessage
+        ? [lastMessage.sender, lastMessage.receiver].sort((a, b) => a.id.localeCompare(b.id))
+        : [];
+
+      return {
+        id: thread.key,
+        parcelId: thread.parcelId,
+        trackingNumber: lastMessage?.parcel?.trackingNumber || null,
+        participants,
+        messageCount: thread.messageCount,
+        lastMessageAt: thread.lastMessageAt,
+        lastMessage: serializeModerationMessage(lastMessage)
+      };
+    })
+  );
+
+  return ok(res, {
+    message: 'Conversations',
+    data: { conversations },
+    meta: paginationMeta({ page, limit, total })
+  });
+});
+
+export const moderationThread = handle('messages.moderation.thread', async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const userId = moderationUuid(req.query.userId, 'query.userId');
+  const peerId = moderationUuid(req.query.peerId, 'query.peerId');
+  if (!userId || !peerId) {
+    throw new ValidationError(
+      [
+        ...(userId ? [] : [{ path: 'query.userId', message: 'userId requis' }]),
+        ...(peerId ? [] : [{ path: 'query.peerId', message: 'peerId requis' }])
+      ],
+      'Participants requis'
+    );
+  }
+
+  const { page, limit, skip } = getPagination({ ...req.query, limit: req.query.limit || 100 });
+  const includeDeleted = req.query.includeDeleted !== 'false';
+  const parcelScope = moderationParcelScope(req.query.parcelId);
+
+  const where = cleanUndefined({
+    deletedAt: includeDeleted ? undefined : null,
+    parcelId: parcelScope,
+    OR: [
+      { senderId: userId, receiverId: peerId },
+      { senderId: peerId, receiverId: userId }
+    ]
+  });
+
+  const [total, messages, participants] = await Promise.all([
+    prisma.message.count({ where }),
+    prisma.message.findMany({
+      where,
+      orderBy: { createdAt: 'asc' },
+      skip,
+      take: limit,
+      include: MODERATION_MESSAGE_INCLUDE
+    }),
+    prisma.user.findMany({
+      where: { id: { in: [userId, peerId] } },
+      select: MODERATION_PARTICIPANT_SELECT
+    })
+  ]);
+
+  if (participants.length === 0) throw new NotFoundError('Participants introuvables');
+
+  return ok(res, {
+    message: 'Conversation',
+    data: { participants, messages: messages.map(serializeModerationMessage) },
+    meta: paginationMeta({ page, limit, total })
+  });
+});
+
+export const moderationMessages = handle('messages.moderation.list', async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const { page, limit, skip } = getPagination(req.query);
+  const includeDeleted = req.query.includeDeleted !== 'false';
+  const search = String(req.query.search || '').trim();
+  const userId = moderationUuid(req.query.userId, 'query.userId');
+
+  const scopes = [];
+  if (userId) scopes.push({ OR: [{ senderId: userId }, { receiverId: userId }] });
+
+  const where = cleanUndefined({
+    deletedAt: includeDeleted ? undefined : null,
+    senderId: moderationUuid(req.query.senderId, 'query.senderId'),
+    receiverId: moderationUuid(req.query.receiverId, 'query.receiverId'),
+    parcelId: moderationParcelScope(req.query.parcelId),
+    createdAt: moderationDateFilter(req.query.from, req.query.to),
+    body: search ? { contains: search, mode: 'insensitive' } : undefined,
+    AND: scopes.length ? scopes : undefined
+  });
+
+  const [total, messages] = await Promise.all([
+    prisma.message.count({ where }),
+    prisma.message.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit,
+      include: MODERATION_MESSAGE_INCLUDE
+    })
+  ]);
+
+  return ok(res, {
+    message: 'Messages',
+    data: { messages: messages.map(serializeModerationMessage) },
+    meta: paginationMeta({ page, limit, total })
+  });
+});
+
+// La suppression reste logique (`deletedAt`) : un message signale doit
+// disparaitre des ecrans sans effacer la preuve dont depend le litige.
+async function softDeleteMessage(tx, req, message, reason) {
+  await tx.message.update({
+    where: { id: message.id },
+    data: { deletedAt: new Date() }
+  });
+
+  if (!message.isRead) {
+    await tx.notification.deleteMany({
+      where: {
+        type: 'message',
+        userId: message.receiverId,
+        isRead: false,
+        data: { path: ['messageId'], equals: message.id }
+      }
+    });
+  }
+
+  await audit(tx, req, {
+    action: 'message.moderate.delete',
+    entityType: 'message',
+    entityId: message.id,
+    beforeData: {
+      body: message.body,
+      senderId: message.senderId,
+      receiverId: message.receiverId,
+      parcelId: message.parcelId,
+      isRead: message.isRead
+    },
+    afterData: { deleted: true, moderated: true, reason }
+  });
+}
+
+export const moderationDeleteMessage = handle('messages.moderation.delete', async (req, res) => {
+  const messageId = moderationUuid(req.params.messageId, 'params.messageId');
+  const reason = moderationReason(req);
+
+  const message = await prisma.message.findUnique({ where: { id: messageId } });
+  if (!message) throw new NotFoundError('Message introuvable');
+  if (message.deletedAt) {
+    return ok(res, { message: 'Message deja supprime', data: { deleted: 0 } });
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await softDeleteMessage(tx, req, message, reason);
+  });
+
+  return ok(res, { message: 'Message supprime', data: { deleted: 1 } });
+});
+
+export const moderationDeleteMessages = handle('messages.moderation.bulkDelete', async (req, res) => {
+  const rawIds = Array.isArray(req.body?.messageIds) ? req.body.messageIds : [];
+  if (rawIds.length === 0) {
+    throw new ValidationError([{ path: 'body.messageIds', message: 'Au moins un message requis' }]);
+  }
+  if (rawIds.length > MODERATION_BULK_MAX) {
+    throw new ValidationError([
+      { path: 'body.messageIds', message: `Maximum ${MODERATION_BULK_MAX} messages par appel` }
+    ]);
+  }
+
+  const messageIds = rawIds.map((id, index) => moderationUuid(id, `body.messageIds.${index}`));
+  const reason = moderationReason(req);
+
+  const messages = await prisma.message.findMany({
+    where: { id: { in: messageIds }, deletedAt: null }
+  });
+
+  // Chaque message ecrit sa propre ligne d'audit : la purge groupee reste
+  // relisible message par message, au prix d'une transaction plus longue que
+  // le delai Prisma par defaut (5 s).
+  await prisma.$transaction(
+    async (tx) => {
+      for (const message of messages) {
+        await softDeleteMessage(tx, req, message, reason);
+      }
+    },
+    { timeout: 30000 }
+  );
+
+  return ok(res, {
+    message: `${messages.length} message(s) supprime(s)`,
+    data: { deleted: messages.length, requested: messageIds.length }
+  });
 });
 
 // ============================================================
