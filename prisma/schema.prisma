@@ -973,9 +973,11 @@ model Message {
   readAt      DateTime? @map("read_at") @db.Timestamptz
   handledById String?   @map("handled_by") @db.Uuid
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  editedAt    DateTime? @map("edited_at") @db.Timestamptz
-  deletedAt   DateTime? @map("deleted_at") @db.Timestamptz
-  sender      User      @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  editedAt      DateTime? @map("edited_at") @db.Timestamptz
+  deletedAt     DateTime? @map("deleted_at") @db.Timestamptz
+  deletedBy     String?   @map("deleted_by") @db.Uuid
+  deletedReason String?   @map("deleted_reason")
+  sender        User      @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
   receiver    User      @relation("MessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
   handledBy   User?     @relation("MessageHandledBy", fields: [handledById], references: [id], onDelete: SetNull)
   parcel      Parcel?   @relation(fields: [parcelId], references: [id], onDelete: SetNull)

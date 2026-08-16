@@ -385,6 +385,12 @@ mobileRouter.delete(
   messageModerationRoles,
   mobileController.moderationDeleteMessage
 );
+mobileRouter.post(
+  '/messages/admin/messages/:messageId/restore',
+  authenticate,
+  messageModerationRoles,
+  mobileController.moderationRestoreMessage
+);
 
 // ============================================================
 // SUPPORT

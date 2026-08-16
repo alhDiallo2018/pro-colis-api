@@ -147,6 +147,11 @@ describe('moderation des messages', () => {
     expect(stored.deletedAt).not.toBeNull();
     // Suppression logique : la preuve du litige survit a la moderation.
     expect(stored.body).toBe(`A supprimer ${suffix}`);
+    // Le motif et l'auteur sont lisible directement sur le message, pas
+    // seulement dans l'audit : la console peut l'afficher sans croiser deux
+    // tables.
+    expect(stored.deletedReason).toBe('Signalement : propos haineux');
+    expect(stored.deletedBy).not.toBeNull();
 
     const trail = await prisma.auditLog.findFirst({
       where: { action: 'message.moderate.delete', entityId: message.id }
@@ -180,6 +185,33 @@ describe('moderation des messages', () => {
       .get(`/api/v1/messages/admin/thread?userId=${clientId}&peerId=${driverId}&includeDeleted=false`)
       .set(auth('support_technique'));
     expect(visibleOnly.body.messages.map((m) => m.id)).not.toContain(message.id);
+  });
+
+  it('restaure un message masque et trace l annulation', async () => {
+    const message = await seedMessage(`A restaurer ${suffix}`);
+    await request(app)
+      .delete(`/api/v1/messages/admin/messages/${message.id}`)
+      .set(auth('admin'))
+      .send({ reason: 'Signalement annule' });
+
+    const res = await request(app)
+      .post(`/api/v1/messages/admin/messages/${message.id}/restore`)
+      .set(auth('support_technique'))
+      .send({ reason: 'Erreur de moderation' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.restored).toBe(1);
+
+    const stored = await prisma.message.findUnique({ where: { id: message.id } });
+    expect(stored.deletedAt).toBeNull();
+    expect(stored.deletedBy).toBeNull();
+    expect(stored.deletedReason).toBeNull();
+
+    const trail = await prisma.auditLog.findFirst({
+      where: { action: 'message.moderate.restore', entityId: message.id }
+    });
+    expect(trail).not.toBeNull();
+    expect(trail.afterData.reason).toBe('Erreur de moderation');
   });
 
   it('purge une rafale de messages en un appel', async () => {

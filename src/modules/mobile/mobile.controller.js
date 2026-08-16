@@ -3880,6 +3880,8 @@ function serializeModerationMessage(message) {
     ...serializeMessage(message),
     readAt: message.readAt || null,
     deletedAt: message.deletedAt || null,
+    deletedBy: message.deletedBy || null,
+    deletedReason: message.deletedReason || null,
     isDeleted: Boolean(message.deletedAt),
     isPriceProposal: isPriceProposal(message),
     preview: messagePreview(message),
@@ -4148,7 +4150,7 @@ export const moderationMessages = handle('messages.moderation.list', async (req,
 async function softDeleteMessage(tx, req, message, reason) {
   await tx.message.update({
     where: { id: message.id },
-    data: { deletedAt: new Date() }
+    data: { deletedAt: new Date(), deletedBy: req.user.id, deletedReason: reason }
   });
 
   if (!message.isRead) {
@@ -4192,6 +4194,39 @@ export const moderationDeleteMessage = handle('messages.moderation.delete', asyn
   });
 
   return ok(res, { message: 'Message supprime', data: { deleted: 1 } });
+});
+
+export const moderationRestoreMessage = handle('messages.moderation.restore', async (req, res) => {
+  const messageId = moderationUuid(req.params.messageId, 'params.messageId');
+  const reason = moderationReason(req);
+
+  const message = await prisma.message.findUnique({ where: { id: messageId } });
+  if (!message) throw new NotFoundError('Message introuvable');
+  if (!message.deletedAt) {
+    return ok(res, { message: 'Message deja visible', data: { restored: 0 } });
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.message.update({
+      where: { id: message.id },
+      data: { deletedAt: null, deletedBy: null, deletedReason: null }
+    });
+
+    await audit(tx, req, {
+      action: 'message.moderate.restore',
+      entityType: 'message',
+      entityId: message.id,
+      beforeData: {
+        body: message.body,
+        senderId: message.senderId,
+        receiverId: message.receiverId,
+        parcelId: message.parcelId
+      },
+      afterData: { deleted: false, moderated: false, reason }
+    });
+  });
+
+  return ok(res, { message: 'Message restaure', data: { restored: 1 } });
 });
 
 export const moderationDeleteMessages = handle('messages.moderation.bulkDelete', async (req, res) => {
