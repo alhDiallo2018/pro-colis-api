@@ -5,6 +5,36 @@ const DURATION = z
   .string()
   .regex(/^\d+[smhd]?$/, 'Duree attendue au format 900, 15m, 12h ou 30d');
 
+// Secrets JWT : longueur minimale exigee en production. En developpement/test,
+// le schema de base (min 16) suffit pour autoriser une configuration locale.
+const PROD_JWT_SECRET_MIN_LENGTH = 32;
+
+// Placeholders connus a rejeter en production. Un secret de production ne doit
+// jamais etre une valeur par defaut recopiable depuis un exemple ou un README.
+const JWT_SECRET_PLACEHOLDERS = [
+  'change-me',
+  'change_me',
+  'changeme',
+  'change-this',
+  'changethis',
+  'replace-me',
+  'replace_me',
+  'replaceme',
+  'replace-this',
+  'your-secret',
+  'your_secret',
+  'yoursecret',
+  'placeholder',
+  'example-secret',
+  'dev-secret'
+];
+
+function isPlaceholderJwtSecret(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (!normalized) return true;
+  return JWT_SECRET_PLACEHOLDERS.some((placeholder) => normalized.includes(placeholder));
+}
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8080),
@@ -28,6 +58,9 @@ const envSchema = z.object({
   UPLOAD_STORAGE: z.enum(['local', 's3']).default('local'),
   UPLOAD_LOCAL_DIR: z.string().default('uploads'),
   PUBLIC_BASE_URL: z.string().url().default('http://localhost:8080'),
+  // Origine du frontend web, utilisée pour les redirections post-paiement
+  // (PayDunya return/cancel). Ne doit jamais être une URL locale en production.
+  WEB_APP_URL: z.string().url().default('https://sendprocolis.com'),
   LOG_LEVEL: z.string().default('info'),
   APP_RELEASE: z.string().min(1).default('development'),
   LOKI_BASE_URL: z.string().url().default('http://loki:3100'),
@@ -85,6 +118,40 @@ const envSchema = z.object({
       path: ['METRICS_TOKEN'],
       message: 'METRICS_TOKEN doit contenir au moins 32 caracteres en production'
     });
+  }
+
+  // En production, les secrets JWT doivent etre forts, non vides et differents
+  // des placeholders recopiables. En developpement/test on reste permissif pour
+  // ne pas imposer de vrai secret dans le depot ni casser les tests.
+  if (value.NODE_ENV === 'production') {
+    for (const field of ['JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET']) {
+      const secret = value[field];
+      if (isPlaceholderJwtSecret(secret)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: `${field} ne doit pas etre vide ni utiliser un placeholder en production`
+        });
+      } else if (secret.length < PROD_JWT_SECRET_MIN_LENGTH) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: `${field} doit contenir au moins ${PROD_JWT_SECRET_MIN_LENGTH} caracteres en production`
+        });
+      }
+    }
+
+    if (
+      !isPlaceholderJwtSecret(value.JWT_ACCESS_SECRET) &&
+      !isPlaceholderJwtSecret(value.JWT_REFRESH_SECRET) &&
+      value.JWT_ACCESS_SECRET === value.JWT_REFRESH_SECRET
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['JWT_REFRESH_SECRET'],
+        message: 'JWT_ACCESS_SECRET et JWT_REFRESH_SECRET doivent etre differents en production'
+      });
+    }
   }
 });
 

@@ -4,7 +4,8 @@ import { ok, fail } from '../utils/api-response.js';
 import { getPagination, paginationMeta } from '../utils/pagination.js';
 import { serializeUser } from '../utils/mobile-serializers.js';
 import { ValidationError, NotFoundError, normalizeError } from '../utils/errors.js';
-import { attemptDisbursement, toClientWithdrawalStatus, fromClientWithdrawalStatus } from '../utils/withdrawal-flow.js';
+import { attemptDisbursement, setWithdrawalTransactionStatus, toClientWithdrawalStatus, fromClientWithdrawalStatus } from '../utils/withdrawal-flow.js';
+import { getConfigValue, repayDebtFromWallet } from '../utils/commission.js';
 
 function decimal(value, fallback = null) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -108,6 +109,10 @@ export const financeDashboard = handle('finance.dashboard', async (req, res) => 
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
+  // Seuil de « solde faible » configurable (`finance.lowBalanceThreshold`) :
+  // aucune valeur financière codée en dur dans le backend. 500 FCFA par défaut.
+  const lowBalanceThreshold = Math.max(0, Number(await getConfigValue(prisma, 'finance.lowBalanceThreshold', 500)) || 0);
+
   const [
     totalWallets,
     aggregate,
@@ -129,7 +134,7 @@ export const financeDashboard = handle('finance.dashboard', async (req, res) => 
       _sum: { amount: true }
     }),
     prisma.wallet.count({
-      where: { balance: { lt: 500 }, status: 'active' }
+      where: { balance: { lt: lowBalanceThreshold }, status: 'active' }
     }),
     prisma.wallet.count({
       where: { lastActivityAt: { lt: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000) } }
@@ -263,9 +268,9 @@ export const rechargeWallet = handle('finance.rechargeWallet', async (req, res) 
   const result = await prisma.$transaction(async (tx) => {
     const existing = await tx.wallet.findUnique({ where: { userId } });
     const balanceBefore = existing ? number(existing.balance) : 0;
-    const balanceAfter = balanceBefore + numericAmount;
 
-    const wallet = await tx.wallet.upsert({
+    // 1. Crédit intégral sur le solde.
+    await tx.wallet.upsert({
       where: { userId },
       update: {
         balance: { increment: numericAmount },
@@ -285,13 +290,21 @@ export const rechargeWallet = handle('finance.rechargeWallet', async (req, res) 
       }
     });
 
+    // 2. La dette de commission est réglée en priorité depuis le solde crédité
+    //    (débit réel du wallet, agrégats mis à jour, transaction cohérente).
+    const repayment = await repayDebtFromWallet(tx, { userId, amount: numericAmount });
+    const netAmount = repayment.netAmount;
+
+    const walletAfter = await tx.wallet.findUnique({ where: { userId } });
+    const balanceAfter = number(walletAfter.balance);
+
     const transaction = await tx.walletTransaction.create({
       data: {
         walletUserId: userId,
         type,
         amount: numericAmount,
         balanceBefore,
-        balanceAfter,
+        balanceAfter: balanceBefore + numericAmount,
         parcelId: parcelId || null,
         description: description || 'Recharge portefeuille',
         origin: origin || 'admin',
@@ -305,7 +318,7 @@ export const rechargeWallet = handle('finance.rechargeWallet', async (req, res) 
       entityType: 'wallet',
       entityId: userId,
       beforeData: { balance: balanceBefore },
-      afterData: { balance: balanceAfter, amount: numericAmount }
+      afterData: { balance: balanceAfter, amount: numericAmount, netAmount, debtRepaid: repayment.debtRepaid }
     });
 
     // P1 : notifier l'utilisateur du mouvement d'argent sur son compte.
@@ -314,13 +327,13 @@ export const rechargeWallet = handle('finance.rechargeWallet', async (req, res) 
         userId,
         type: 'wallet_recharged',
         title: 'Portefeuille crédité',
-        body: `${numericAmount} FCFA ont été ajoutés à votre portefeuille par l'administration.`,
-        data: { amount: numericAmount, balanceAfter, origin: origin || 'admin' },
+        body: `${netAmount} FCFA ont été ajoutés à votre portefeuille par l'administration.`,
+        data: { amount: netAmount, requested: numericAmount, debtRepaid: repayment.debtRepaid, balanceAfter, origin: origin || 'admin' },
         priority: 'high'
       }
     });
 
-    return { wallet, transaction };
+    return { wallet: walletAfter, transaction, debtRepaid: repayment.debtRepaid };
   });
 
   const user = await prisma.user.findUnique({
@@ -739,19 +752,10 @@ export const approveWithdrawal = handle('finance.approveWithdrawal', async (req,
       }
     });
 
-    await tx.walletTransaction.create({
-      data: {
-        walletUserId: withdrawal.walletUserId,
-        type: 'withdrawal',
-        amount: Number(withdrawal.amount),
-        balanceBefore: 0,
-        balanceAfter: 0,
-        description: `Retrait ${withdrawal.method} — ${withdrawal.reference}`,
-        origin: 'withdrawal',
-        status: 'processing',
-        performedBy: req.user.id
-      }
-    });
+    // La transaction de retrait unique (créée à la demande) passe à `processing`.
+    // Aucune seconde transaction n'est créée : un retrait métier n'a qu'une
+    // transaction de type `withdrawal`.
+    await setWithdrawalTransactionStatus(tx, withdrawal, 'processing', { performedBy: req.user.id });
 
     await audit(tx, req, {
       action: 'withdrawal.approve',
@@ -805,10 +809,7 @@ export const completeWithdrawal = handle('finance.completeWithdrawal', async (re
       }
     });
 
-    await tx.walletTransaction.updateMany({
-      where: { walletUserId: withdrawal.walletUserId, origin: 'withdrawal', status: 'processing', description: { contains: withdrawal.reference } },
-      data: { status: 'completed' }
-    });
+    await setWithdrawalTransactionStatus(tx, withdrawal, 'completed');
 
     await tx.notification.create({
       data: {
@@ -854,7 +855,7 @@ export const rejectWithdrawal = handle('finance.rejectWithdrawal', async (req, r
       }
     });
 
-    await tx.wallet.update({
+    const wallet = await tx.wallet.update({
       where: { userId: withdrawal.walletUserId },
       data: {
         balance: { increment: Number(withdrawal.amount) },
@@ -863,9 +864,18 @@ export const rejectWithdrawal = handle('finance.rejectWithdrawal', async (req, r
       }
     });
 
-    await tx.walletTransaction.updateMany({
-      where: { walletUserId: withdrawal.walletUserId, origin: 'withdrawal', status: { in: ['pending', 'processing'] }, description: { contains: withdrawal.reference } },
-      data: { status: 'failed' }
+    await setWithdrawalTransactionStatus(tx, withdrawal, 'failed');
+    await tx.walletTransaction.create({
+      data: {
+        walletUserId: withdrawal.walletUserId,
+        type: 'refund',
+        amount: Number(withdrawal.amount),
+        balanceBefore: Number(wallet.balance) - Number(withdrawal.amount),
+        balanceAfter: Number(wallet.balance),
+        description: `Retrait ${withdrawal.reference} rejeté — ${reason || 'rejeté par l\'administrateur'}`,
+        origin: 'withdrawal',
+        status: 'completed'
+      }
     });
 
     await tx.notification.create({

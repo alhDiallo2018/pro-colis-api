@@ -26,7 +26,7 @@ describe('moderation des messages', () => {
       phone: `${phonePrefix}${suffix}`,
       fullName,
       pin: '123456',
-      role: ['client', 'driver', 'admin', 'super_admin'].includes(role) ? role : 'client'
+      role: ['client', 'driver'].includes(role) ? role : 'client'
     });
     expect(response.status).toBe(201);
 

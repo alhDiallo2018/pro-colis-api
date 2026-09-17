@@ -20,14 +20,19 @@ describe('cash payment reconciliation', () => {
   let garageId;
 
   async function register(phonePrefix, fullName, role) {
+    const publicRole = ['client', 'driver'].includes(role) ? role : 'client';
     const response = await request(app).post('/api/v1/auth/register').send({
       phone: `${phonePrefix}${suffix}`,
       fullName,
       pin: '123456',
-      role
+      role: publicRole
     });
     expect(response.status).toBe(201);
-    userIds.push(response.body.user.id);
+    const userId = response.body.user.id;
+    if (publicRole !== role) {
+      await prisma.user.update({ where: { id: userId }, data: { role } });
+    }
+    userIds.push(userId);
     return response;
   }
 

@@ -20,11 +20,13 @@ describe('gap endpoints (zones, reset-pin, commissions)', () => {
       phone: adminPhone,
       fullName: 'Super Admin Gap Test',
       pin: '123456',
-      role: 'super_admin'
+      role: 'client'
     });
     adminToken = adminRes.body.accessToken;
     adminId = adminRes.body.user?.id;
     expect(adminToken).toBeTruthy();
+    // Le rôle staff n'est pas créable en inscription publique : on promeut.
+    await prisma.user.update({ where: { id: adminId }, data: { role: 'super_admin' } });
 
     const driverRes = await request(app).post('/api/v1/auth/register').send({
       phone: driverPhone,

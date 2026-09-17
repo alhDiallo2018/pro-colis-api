@@ -3,25 +3,42 @@ import { env } from '../../config/env.js';
 import { prisma } from '../../config/prisma.js';
 import { fail, ok } from '../../utils/api-response.js';
 import { isBrevoConfigured, sendNotificationEmail, sendNotificationSms, sendOtpSms } from '../../utils/brevo.js';
-import { calculateCommission, calculateCommissionSync, deductCashCommission, getCfaPerPoint, getCommitmentFee, getDeliveryPoints } from '../../utils/commission.js';
-import { ConflictError, ForbiddenError, NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
+import { assertCanAcceptNewDelivery, calculateCommission, calculateCommissionSync, canAcceptNewDeliveries, deductCashCommission, getCfaPerPoint, getCommitmentFee, getDeliveryPoints, settleCommissionDebtFromWallet } from '../../utils/commission.js';
+import { assertClientCanCreateParcel } from '../../utils/client-debt.js';
+import { ConflictError, ForbiddenError, NotFoundError, ParcelAlreadyCancelledError, ValidationError, normalizeError } from '../../utils/errors.js';
+import {
+  applyCancellation,
+  computeCancellation,
+  executeCancellationRefund,
+  selectableCancellationReasons,
+  serializeCancellationMobile,
+  serializeCancellationWeb,
+  validateCancellationConfigCoherence,
+  validateCancellationConfigValue
+} from '../../utils/cancellation.js';
 import {
   serializeAdvertisement,
   serializeAdvertisementOffer,
   serializeAuditLog,
   serializeBid,
+  serializeDriverLocation,
   serializeDriverWalletTransaction,
   serializeGarage,
   serializeParcel,
   serializeParcelEvent,
   serializePayment,
+  serializePublicBid,
+  serializePublicDriver,
+  serializePublicFreeParcel,
+  serializePublicTrackingParcel,
   serializeScoreTransaction,
   serializeUser
 } from '../../utils/mobile-serializers.js';
 import { getPagination, paginationMeta } from '../../utils/pagination.js';
-import { phoneSearchVariants } from '../../utils/phone-normalizer.js';
+import { cleanPhone, phoneSearchVariants } from '../../utils/phone-normalizer.js';
 import { generateTrackingNumber } from '../../utils/tracking-number.js';
-import { attemptDisbursement, toClientWithdrawalStatus } from '../../utils/withdrawal-flow.js';
+import { attemptDisbursement, createWithdrawalTransaction, setWithdrawalTransactionStatus, toClientWithdrawalStatus } from '../../utils/withdrawal-flow.js';
+import { createPaydunyaPayment } from '../paydunya.controller.js';
 
 // Relations a charger des qu'un chauffeur est renvoye au client : le vehicule
 // vit dans sa propre table, il est absent de la reponse sans cet include et
@@ -32,6 +49,31 @@ const driverInclude = {
     where: { deletedAt: null },
     orderBy: { createdAt: 'desc' },
     take: 1
+  }
+};
+
+// Whitelist Prisma pour les endpoints publics de chauffeurs : meme en cas
+// d'erreur de serialisation, la requete ne remonte jamais les colonnes
+// sensibles (email, phone, address, gender, lastLogin, lastActiveAt, ...).
+const publicDriverSelect = {
+  id: true,
+  fullName: true,
+  profilePhoto: true,
+  city: true,
+  region: true,
+  driverStatus: true,
+  rating: true,
+  completedDeliveries: true
+};
+
+const publicDriverDetailSelect = {
+  ...publicDriverSelect,
+  totalDeliveries: true,
+  vehicles: {
+    where: { deletedAt: null },
+    orderBy: { createdAt: 'desc' },
+    take: 1,
+    select: { model: true, type: true }
   }
 };
 
@@ -141,6 +183,12 @@ const cashPaymentInclude = {
 
 const ACTIVE_PARCEL_STATUSES = ['pending', 'free', 'confirmed', 'picked_up', 'in_transit', 'arrived', 'out_for_delivery'];
 const CASH_PAYMENT_STATUSES = ['processing', 'completed', 'failed'];
+
+// Le GPS du chauffeur n'a de sens que pendant le transport reel du colis :
+// avant la prise en charge rien n'a encore bouge, et apres la livraison la
+// position cesse d'etre « live ». L'historique reste en base mais n'est plus
+// expose comme position active.
+const GPS_LIVE_PARCEL_STATUSES = ['picked_up', 'in_transit', 'arrived', 'out_for_delivery'];
 
 function decimal(value, fallback = null) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -444,6 +492,13 @@ function statusDescription(status) {
 }
 
 async function changeParcelStatus(req, parcel, status, extra = {}) {
+  // Garde défensive : le passage au statut « annulé » est réservé au moteur
+  // central d'annulation (`runParcelCancellation`). Aucun appelant ne doit
+  // contourner pénalité/remboursement/snapshot par un simple changement de statut.
+  if (status === 'cancelled') {
+    throw new ConflictError('L’annulation doit passer par le moteur d’annulation.');
+  }
+
   return prisma.$transaction(async (tx) => {
     const updated = await tx.parcel.update({
       where: { id: parcel.id },
@@ -451,9 +506,6 @@ async function changeParcelStatus(req, parcel, status, extra = {}) {
         status,
         pickupDate: status === 'picked_up' ? new Date() : undefined,
         deliveryDate: status === 'delivered' ? new Date() : undefined,
-        cancelledBy: status === 'cancelled' ? req.user.id : undefined,
-        cancellationReason: status === 'cancelled' ? extra.reason : undefined,
-        cancelledAt: status === 'cancelled' ? new Date() : undefined,
         signatureUrl: extra.signatureUrl,
         assignedDriverId: extra.driverId || undefined
       }),
@@ -467,14 +519,6 @@ async function changeParcelStatus(req, parcel, status, extra = {}) {
           where: { id: driverId },
           data: {
             completedDeliveries: { increment: 1 },
-            totalDeliveries: { increment: 1 }
-          }
-        });
-      } else if (status === 'cancelled') {
-        await tx.user.update({
-          where: { id: driverId },
-          data: {
-            cancelledDeliveries: { increment: 1 },
             totalDeliveries: { increment: 1 }
           }
         });
@@ -667,6 +711,7 @@ const PARCEL_TYPES = ['document', 'package', 'fragile', 'perishable', 'valuable'
 const PAYMENT_METHODS = ['wave', 'freemMoney', 'orange_money', 'card', 'cash'];
 const PAYMENT_CHANNELS = ['cash', 'platform'];
 const CASH_COLLECTION_POINTS = ['sender_pickup', 'receiver_delivery'];
+const WITHDRAWAL_METHODS = ['wave', 'orange_money', 'freeMoney', 'freemMoney', 'bank', 'paydunya'];
 
 const PARCEL_EDITABLE_TEXT_FIELDS = [
   'senderName',
@@ -869,6 +914,19 @@ export const createParcel = handle('parcel.create', async (req, res) => {
   }
 
   const result = await prisma.$transaction(async (tx) => {
+    // Un chauffeur qui crée un colis pour un client et s'y assigne lui-même
+    // prend en charge une nouvelle mission : bloqué en cas de dette.
+    if (req.user.role === 'driver' && req.body.senderId) {
+      await assertCanAcceptNewDelivery(tx, req.user.id);
+    }
+
+    // Un client ayant atteint le seuil configuré de pénalités d'annulation
+    // impayées (`cancellation.clientDebtLimit`) ne peut pas créer de nouveau
+    // colis. Aucun blocage par défaut (seuil = 0).
+    if (req.user.role === 'client') {
+      await assertClientCanCreateParcel(tx, req.user.id);
+    }
+
     const parcel = await tx.parcel.create({
       data: buildParcelData(req.user, req.body),
       include: parcelInclude
@@ -1130,7 +1188,7 @@ export const driverParcels = handle('driver.parcels', async (req, res) => {
   
   return ok(res, { 
     message: 'Colis chauffeur', 
-    data: { parcels: parcels.map(serializeParcel) }, 
+    data: { parcels: parcels.map((p) => serializeParcel(p, { redactPayment: true })) }, 
     meta: paginationMeta({ page, limit, total }) 
   });
 });
@@ -1166,16 +1224,54 @@ export const getParcelDetail = handle('parcel.detail', async (req, res) => {
 
 export const getDriverParcelDetail = handle('driver.parcel.detail', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
-  return ok(res, { message: 'Detail colis', data: { parcel: serializeParcel(parcel) } });
+  return ok(res, { message: 'Detail colis', data: { parcel: serializeParcel(parcel, { redactPayment: true }) } });
 });
 
-export const cancelParcel = handle('parcel.cancel', async (req, res) => {
-  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
-  const result = await changeParcelStatus(req, parcel, 'cancelled', { reason: req.body.reason || 'Annulation' });
+// Redaction selon le rôle : un client ne voit pas les soldes privés du
+// chauffeur ; un chauffeur ne voit pas les montants privés du client
+// (payé / remboursé / part client). Les rôles staff ont la vue complète.
+function cancellationRedaction(user) {
+  return {
+    redactDriverFinancials: user?.role === 'client',
+    redactClientFinancials: user?.role === 'driver'
+  };
+}
 
-  const driverId = parcel.assignedDriverId;
-  if (driverId) {
-    await prisma.$transaction(async (tx) => {
+// Message de conséquence unique, calculé côté serveur (jamais par le front).
+function cancellationMessage(outcome) {
+  if (outcome.exempt) return 'Colis annulé sans pénalité.';
+  const shares = [];
+  if (outcome.clientShare > 0) shares.push(`pénalité client ${outcome.clientShare} FCFA`);
+  if (outcome.driverShare > 0) shares.push(`pénalité chauffeur ${outcome.driverShare} FCFA`);
+  const base = `Colis annulé (${shares.length ? shares.join(', ') : 'aucune pénalité'}).`;
+  if (outcome.refundAmount > 0) {
+    if (outcome.refundStatus === 'completed') return `${base} Remboursement de ${outcome.refundAmount} FCFA effectué.`;
+    if (outcome.refundStatus === 'failed') return `${base} Le remboursement de ${outcome.refundAmount} FCFA a échoué.`;
+    return `${base} Remboursement de ${outcome.refundAmount} FCFA en cours.`;
+  }
+  return base;
+}
+
+// Unique moteur d'exécution : client, chauffeur et staff passent tous par ici,
+// jamais par une deuxième logique.
+async function runParcelCancellation(req, res, parcel, reason) {
+  // Le quote n'est jamais utilisé comme source de vérité : tout est recalculé ici.
+  const result = await prisma.$transaction(async (tx) => {
+    const current = await tx.parcel.findFirst({
+      where: { ...parcelAccessWhere(req.user, parcel.id), deletedAt: null },
+      include: parcelInclude
+    });
+    if (!current) throw new NotFoundError('Colis introuvable');
+    if (current.status === 'cancelled') throw new ParcelAlreadyCancelledError();
+
+    const outcome = await computeCancellation({ tx, parcel: current, actor: req.user, reason });
+    const applied = await applyCancellation({ tx, req, parcel: current, outcome, include: parcelInclude });
+
+    // Remboursement du dépôt d'engagement du chauffeur (points), comportement
+    // historique conservé : indépendant de la pénalité, configuré via
+    // `score.commitmentFee`.
+    const driverId = current.assignedDriverId;
+    if (driverId) {
       const commitmentFee = await getCommitmentFee(tx);
       if (commitmentFee > 0) {
         await tx.score.upsert({
@@ -1184,17 +1280,194 @@ export const cancelParcel = handle('parcel.cancel', async (req, res) => {
           create: { userId: driverId, points: commitmentFee }
         });
         await tx.scoreTransaction.create({
-          data: { userId: driverId, amount: commitmentFee, type: 'commitment_refund', source: 'system', parcelId: parcel.id, description: 'Remboursement engagement (colis annule)' }
+          data: { userId: driverId, amount: commitmentFee, type: 'commitment_refund', source: 'system', parcelId: current.id, description: 'Remboursement engagement (colis annulé)' }
         });
       }
+    }
+
+    await audit(tx, req, {
+      action: 'parcel.cancel',
+      entityType: 'parcel',
+      entityId: current.id,
+      beforeData: { status: current.status },
+      afterData: { status: 'cancelled', cancellation: applied.snapshot }
     });
+
+    // Notifications (dans la transaction : un rejeu est rejeté par la garde
+    // atomique, donc aucune notification dupliquée).
+    await notify(tx, {
+      userId: current.senderId,
+      parcelId: current.id,
+      senderId: req.user.id,
+      senderName: req.user.fullName,
+      type: 'parcel_cancelled',
+      title: 'Colis annulé',
+      body: `Votre colis ${current.trackingNumber} a été annulé.`,
+      data: { trackingNumber: current.trackingNumber, reason: outcome.reason }
+    });
+
+    if (outcome.penalized) {
+      if (driverId && outcome.driverShare > 0) {
+        await notify(tx, {
+          userId: driverId,
+          parcelId: current.id,
+          senderId: req.user.id,
+          senderName: req.user.fullName,
+          type: 'penalty_applied',
+          title: 'Pénalité appliquée',
+          body: `Une pénalité de ${outcome.driverShare} FCFA a été appliquée pour l'annulation du colis ${current.trackingNumber}.`,
+          data: { parcelId: current.id, penalty: outcome.driverShare, responsibility: outcome.responsibility },
+          priority: 'high'
+        });
+      }
+      if (current.senderId && outcome.clientShare > 0) {
+        await notify(tx, {
+          userId: current.senderId,
+          parcelId: current.id,
+          senderId: req.user.id,
+          senderName: req.user.fullName,
+          type: 'penalty_applied',
+          title: 'Pénalité appliquée',
+          body: `Une pénalité de ${outcome.clientShare} FCFA s'applique à l'annulation du colis ${current.trackingNumber}.`,
+          data: { parcelId: current.id, penalty: outcome.clientShare, responsibility: outcome.responsibility },
+          priority: 'high'
+        });
+      }
+      if (driverId && outcome.debt.created > 0) {
+        await notify(tx, {
+          userId: driverId,
+          parcelId: current.id,
+          senderId: req.user.id,
+          senderName: req.user.fullName,
+          type: 'debt_created',
+          title: 'Dette enregistrée',
+          body: `Le solde étant insuffisant, ${outcome.debt.created} FCFA ont été enregistrés en dette pour le colis ${current.trackingNumber}.`,
+          data: { parcelId: current.id, debt: outcome.debt.created },
+          priority: 'high'
+        });
+      }
+      if (current.senderId && outcome.clientDebt > 0) {
+        await notify(tx, {
+          userId: current.senderId,
+          parcelId: current.id,
+          senderId: req.user.id,
+          senderName: req.user.fullName,
+          type: 'client_penalty_debt',
+          title: 'Pénalité à régler',
+          body: `Une pénalité de ${outcome.clientDebt} FCFA est à régler pour l'annulation du colis ${current.trackingNumber}.`,
+          data: { parcelId: current.id, debt: outcome.clientDebt, reference: outcome.clientDebtReference },
+          priority: 'high'
+        });
+      }
+    }
+
+    if (outcome.refundStatus === 'pending') {
+      await notify(tx, {
+        userId: current.senderId,
+        parcelId: current.id,
+        senderId: req.user.id,
+        senderName: req.user.fullName,
+        type: 'refund_initiated',
+        title: 'Remboursement en cours',
+        body: `Votre remboursement de ${outcome.refundAmount} FCFA est en cours de traitement.`,
+        data: { parcelId: current.id, refund: outcome.refundAmount }
+      });
+    }
+
+    return { outcome, applied };
+  });
+
+  const { outcome, applied } = result;
+
+  // Remboursement réel (hors transaction, appel réseau PayDunya). Le statut
+  // retourné reflète l'état réellement constaté, jamais une simulation.
+  const refundSnapshot = await executeCancellationRefund({ parcelId: parcel.id, log: req.log });
+  if (refundSnapshot) {
+    outcome.refundStatus = refundSnapshot.refundStatus ?? outcome.refundStatus;
+    applied.parcel.cancellationData = refundSnapshot;
+    if (outcome.refundStatus === 'completed') {
+      await prisma.notification.create({
+        data: {
+          userId: parcel.senderId,
+          parcelId: parcel.id,
+          type: 'refund_completed',
+          title: 'Remboursement effectué',
+          body: `Votre remboursement de ${outcome.refundAmount} FCFA a été effectué.`,
+          data: { parcelId: parcel.id, refund: outcome.refundAmount }
+        }
+      }).catch(() => {});
+    } else if (outcome.refundStatus === 'failed') {
+      await prisma.notification.create({
+        data: {
+          userId: parcel.senderId,
+          parcelId: parcel.id,
+          type: 'refund_failed',
+          title: 'Remboursement échoué',
+          body: `Votre remboursement de ${outcome.refundAmount} FCFA a échoué. Contactez le support.`,
+          data: { parcelId: parcel.id, refund: outcome.refundAmount }
+        }
+      }).catch(() => {});
+    }
   }
 
-  return ok(res, { message: 'Colis annule', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
+  const redaction = cancellationRedaction(req.user);
+
+  return ok(res, {
+    message: cancellationMessage(outcome),
+    data: {
+      parcel: serializeParcel(applied.parcel, redaction),
+      event: serializeParcelEvent(applied.event),
+      cancellation: serializeCancellationMobile(outcome, redaction),
+      reasons: selectableCancellationReasons(outcome.config, req.user.role),
+      ...serializeCancellationWeb(outcome, redaction)
+    }
+  });
+}
+
+export const cancelParcel = handle('parcel.cancel', async (req, res) => {
+  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+  return runParcelCancellation(req, res, parcel, reason);
+});
+
+export const driverCancelParcel = handle('parcel.driverCancel', async (req, res) => {
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
+  if (parcel.assignedDriverId !== req.user.id) {
+    throw new ForbiddenError("Vous n'êtes pas assigné à ce colis");
+  }
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+  return runParcelCancellation(req, res, parcel, reason);
+});
+
+export const getCancellationQuote = handle('parcel.cancelQuote', async (req, res) => {
+  const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  const reason = typeof req.query?.reason === 'string' ? req.query.reason : undefined;
+
+  // Devis uniquement : aucun prélèvement, aucun remboursement, aucune écriture.
+  // Le motif n'est pas exigé ici (`requireReason: false`) afin que l'écran puisse
+  // lister les motifs disponibles sans préjuger de la pénalité ; il sera exigé
+  // par le backend au moment de confirmer l'annulation.
+  const outcome = await computeCancellation({ tx: prisma, parcel, actor: req.user, reason, requireReason: false });
+
+  return ok(res, {
+    message: cancellationMessage(outcome),
+    data: {
+      cancellation: serializeCancellationMobile(outcome, cancellationRedaction(req.user)),
+      reasons: selectableCancellationReasons(outcome.config, req.user.role),
+      ...serializeCancellationWeb(outcome, cancellationRedaction(req.user))
+    }
+  });
 });
 
 export const updateParcelStatus = handle('parcel.updateStatus', async (req, res) => {
   const parcel = await findAccessibleParcel(req.user, req.params.parcelId);
+  // L'annulation d'un colis n'est jamais un simple changement de statut : elle
+  // doit passer par le moteur central (pénalité, remboursement, snapshot). Le
+  // staff (admin garage / super admin) est donc redirigé vers `cancelParcel`.
+  if (req.body?.status === 'cancelled') {
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : undefined;
+    return runParcelCancellation(req, res, parcel, reason);
+  }
   const result = await changeParcelStatus(req, parcel, req.body.status, req.body);
   return ok(res, { message: 'Statut mis a jour', data: { parcel: serializeParcel(result.parcel), event: serializeParcelEvent(result.event) } });
 });
@@ -1244,6 +1517,8 @@ export const respondToProposal = handle('proposal.respond', async (req, res) => 
     let updatedParcel;
 
     if (action === 'accept') {
+      await assertCanAcceptNewDelivery(tx, req.user.id);
+
       updatedParcel = await tx.parcel.update({
         where: { id: parcelId },
         data: {
@@ -1404,6 +1679,10 @@ export const respondToCounterProposal = handle('proposal.respondCounter', async 
     let updatedParcel;
 
     if (action === 'accept') {
+      // Le client accepte la contre-offre d'un chauffeur : on refuse si ce
+      // chauffeur possède une dette de commission (chemin alternatif d'affectation).
+      await assertCanAcceptNewDelivery(tx, parcel.proposedDriverId);
+
       updatedParcel = await tx.parcel.update({
         where: { id: parcelId },
         data: {
@@ -1803,7 +2082,7 @@ export const freeParcels = handle('public.freeParcels', async (req, res) => {
     prisma.parcel.count({ where }),
     prisma.parcel.findMany({ where, include: parcelInclude, orderBy: { createdAt: 'desc' }, skip, take: limit })
   ]);
-  return ok(res, { message: 'Annonces', data: { parcels: parcels.map(serializeParcel) }, meta: paginationMeta({ page, limit, total }) });
+  return ok(res, { message: 'Annonces', data: { parcels: parcels.map(serializePublicFreeParcel) }, meta: paginationMeta({ page, limit, total }) });
 });
 
 export const trackParcel = handle('public.trackParcel', async (req, res) => {
@@ -1812,8 +2091,47 @@ export const trackParcel = handle('public.trackParcel', async (req, res) => {
     include: parcelInclude
   });
   if (!parcel || parcel.deletedAt) throw new NotFoundError('Colis introuvable');
-  return ok(res, { message: 'Suivi colis', data: { parcel: serializeParcel(parcel), events: parcel.events.map(serializeParcelEvent) } });
+  const driverLocation = await buildPublicDriverLocation(parcel);
+  return ok(res, {
+    message: 'Suivi colis',
+    data: { parcel: serializePublicTrackingParcel(parcel), events: parcel.events.map(serializeParcelEvent), driverLocation }
+  });
 });
+
+/**
+ * Derniere position connue du chauffeur pour ce colis, exposee au client.
+ *
+ * La position n'est « live » que pendant le transport. Avant prise en charge
+ * et apres livraison on renvoie `{ available: false }` sans inventer de
+ * coordonnees. On ne remonte jamais l'historique complet : uniquement la ligne
+ * la plus recente (parcelId + createdAt DESC), avec son horodatage.
+ */
+async function buildPublicDriverLocation(parcel) {
+  if (!parcel.assignedDriverId || !GPS_LIVE_PARCEL_STATUSES.includes(parcel.status)) {
+    return { available: false };
+  }
+
+  const latest = await prisma.driverLocation.findFirst({
+    where: { parcelId: parcel.id, driverId: parcel.assignedDriverId },
+    orderBy: { createdAt: 'desc' }
+  });
+
+  if (!latest) return { available: false };
+
+  return {
+    available: true,
+    latitude: coordNumber(latest.latitude),
+    longitude: coordNumber(latest.longitude),
+    accuracy: coordNumber(latest.accuracy),
+    updatedAt: latest.createdAt.toISOString()
+  };
+}
+
+function coordNumber(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
 
 export const publicParcelEvents = handle('public.parcelEvents', async (req, res) => {
   const events = await prisma.parcelEvent.findMany({ where: { parcelId: req.params.parcelId }, orderBy: { createdAt: 'asc' } });
@@ -1827,7 +2145,7 @@ export const publicParcelBids = handle('public.parcelBids', async (req, res) => 
     include: { driver: true, negotiationMessages: { orderBy: { createdAt: 'asc' } } },
     orderBy: { createdAt: 'desc' }
   });
-  return ok(res, { message: 'Offres colis', data: { bids: bids.map(serializeBid) } });
+  return ok(res, { message: 'Offres colis', data: { bids: bids.map(serializePublicBid) } });
 });
 
 export const parcelTimeline = handle('parcel.timeline', async (req, res) => {
@@ -1930,6 +2248,8 @@ export const acceptBid = handle('bid.accept', async (req, res) => {
   }
 
   const result = await prisma.$transaction(async (tx) => {
+    await assertCanAcceptNewDelivery(tx, bid.driverId);
+
     await tx.bid.updateMany({ where: { parcelId: parcel.id, id: { not: bid.id } }, data: { status: 'rejected', respondedAt: new Date() } });
     const accepted = await tx.bid.update({
       where: { id: bid.id },
@@ -2282,6 +2602,8 @@ export const driverRespondCounter = handle('bid.respondCounter', async (req, res
     let updatedBid;
 
     if (accept) {
+      await assertCanAcceptNewDelivery(tx, req.user.id);
+
       updatedBid = await tx.bid.update({
         where: { id: bidId },
         data: {
@@ -2410,6 +2732,10 @@ export const clientAcceptBid = handle('bid.clientAccept', async (req, res) => {
       throw new ConflictError('Vous avez fait la dernière proposition : attendez la réponse du chauffeur');
     }
 
+    // Le client accepte l'offre d'un chauffeur : refuse si ce chauffeur a une
+    // dette de commission (chemin alternatif d'affectation).
+    await assertCanAcceptNewDelivery(tx, bid.driverId);
+
     const updatedBid = await tx.bid.update({
       where: { id: bidId },
       data: {
@@ -2494,9 +2820,27 @@ export const initiatePayment = handle('payment.initiate', async (req, res) => {
 
 export const confirmPayment = handle('payment.confirm', async (req, res) => {
   const payment = await prisma.$transaction(async (tx) => {
-    const updated = await tx.payment.update({
+    // Garde atomique : seul un paiement encore pending/processing peut être
+    // confirmé, ce qui rend l'opération idempotente (double clic / rejeu rejeté
+    // sans seconde écriture) et empêche de re-confirmer un paiement déjà traité.
+    const claimed = await tx.payment.updateMany({
+      where: { id: req.params.paymentId, status: { in: ['pending', 'processing'] } },
+      data: {
+        status: 'completed',
+        transactionId: req.body.transactionId,
+        validatedBy: req.user.id,
+        validatedAt: new Date(),
+        completedAt: new Date()
+      }
+    });
+    if (claimed.count !== 1) {
+      const existing = await tx.payment.findUnique({ where: { id: req.params.paymentId } });
+      if (!existing) throw new NotFoundError('Paiement introuvable');
+      throw new ConflictError('Ce paiement a déjà été traité');
+    }
+
+    const updated = await tx.payment.findUnique({
       where: { id: req.params.paymentId },
-      data: { status: 'completed', transactionId: req.body.transactionId, validatedBy: req.user.id, validatedAt: new Date(), completedAt: new Date() },
       include: { parcel: true }
     });
     if (updated.parcelId) {
@@ -2857,10 +3201,16 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
 
   const parcelPrice = Number(parcel.price || parcel.totalAmount || 0);
   const isDelivered = parcel.status === 'delivered';
+  const driverId = parcel.assignedDriverId;
+  const shouldCreditDriver = isDelivered && !!driverId && parcelPrice > 0;
+  const commission = shouldCreditDriver ? await calculateCommission(parcelPrice) : 0;
 
-  await prisma.$transaction([
-    prisma.parcel.update({ where: { id: parcelId }, data: { paymentStatus: 'completed' } }),
-    prisma.payment.create({
+  // Transaction unique : la confirmation du paiement, le crédit du chauffeur et
+  // la création éventuelle de dette restent atomiques. Si le plafond de dette
+  // est dépassé, aucune écriture (paiement, crédit, dette) n'est persistée.
+  await prisma.$transaction(async (tx) => {
+    await tx.parcel.update({ where: { id: parcelId }, data: { paymentStatus: 'completed' } });
+    await tx.payment.create({
       data: {
         userId: parcel.senderId || req.user.id,
         parcelId,
@@ -2873,8 +3223,8 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
         completedAt: new Date(),
         reference: `CASH-${Date.now()}`
       }
-    }),
-    prisma.notification.create({
+    });
+    await tx.notification.create({
       data: {
         userId: parcel.senderId || req.user.id,
         type: 'payment_cash',
@@ -2882,8 +3232,8 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
         body: `Le paiement de ${parcelPrice} FCFA pour le colis ${parcel.trackingNumber} a ete confirme en especes.`,
         data: { parcelId, amount: parcelPrice }
       }
-    }),
-    prisma.notification.create({
+    });
+    await tx.notification.create({
       data: {
         userId: req.user.id,
         type: 'admin_payment_confirmed',
@@ -2891,78 +3241,70 @@ export const confirmCashPayment = handle('payment.confirmCash', async (req, res)
         body: `${parcelPrice} FCFA confirmes${isDelivered ? ` — chauffeur ${parcel.assignedDriverId} sera credite` : ''}.`,
         data: { parcelId, amount: parcelPrice, delivered: isDelivered }
       }
-    })
-  ]);
+    });
 
-  const driverId = parcel.assignedDriverId;
-  if (isDelivered && driverId && parcelPrice > 0) {
-    const commission = await calculateCommission(parcelPrice);
+    if (!shouldCreditDriver) return;
 
-    await prisma.$transaction(async (tx) => {
+    // 1. La commission est réglée sur les ressources existantes du chauffeur
+    //    (wallet + points) ; la part non couverte devient une dette
+    //    (`commissionDebt`). Une livraison déjà acceptée n'est jamais bloquée,
+    //    seul le plafond `commission.debtLimit` peut refuser l'opération.
+    let deductionResult = { walletDeducted: 0, pointsDeducted: 0, debt: 0, cfaPerPoint: 1 };
+    if (commission > 0) {
+      deductionResult = await deductCashCommission({
+        parcelId,
+        driverId,
+        commission,
+        tx,
+        req
+      });
+    }
+
+    // 2. Le gain net (prix - commission) est crédité au portefeuille.
+    const driverNet = Math.max(0, parcelPrice - commission);
+    if (driverNet > 0) {
       const wallet = await tx.wallet.upsert({
         where: { userId: driverId },
-        update: { balance: { increment: parcelPrice }, totalDeposited: { increment: parcelPrice }, lastActivityAt: new Date(), lastDepositAt: new Date() },
-        create: { userId: driverId, balance: parcelPrice, totalDeposited: parcelPrice, lastDepositAt: new Date(), lastActivityAt: new Date() }
+        update: { balance: { increment: driverNet }, totalDeposited: { increment: driverNet }, lastActivityAt: new Date(), lastDepositAt: new Date() },
+        create: { userId: driverId, balance: driverNet, totalDeposited: driverNet, lastDepositAt: new Date(), lastActivityAt: new Date() }
       });
       await tx.walletTransaction.create({
         data: {
           walletUserId: driverId,
           type: 'deposit',
-          amount: parcelPrice,
-          balanceBefore: Number(wallet.balance) - parcelPrice,
+          amount: driverNet,
+          balanceBefore: Number(wallet.balance) - driverNet,
           balanceAfter: Number(wallet.balance),
           parcelId,
-          description: `Gain brut colis ${parcel.trackingNumber} (paiement especes)`,
+          description: `Gain net colis ${parcel.trackingNumber} (paiement especes)`,
           origin: 'delivery',
           status: 'completed'
         }
       });
+    }
 
-      let deductionResult = { walletDeducted: 0, pointsDeducted: 0 };
-      if (commission > 0) {
-        try {
-          deductionResult = await deductCashCommission({
-            parcelId,
-            driverId,
-            commission,
-            tx,
-            req
-          });
-        } catch (err) {
-          if (err.code === 'INSUFFICIENT_FUNDS') {
-            throw new ValidationError(
-              [{ path: 'commission', message: 'Ressources insuffisantes. Wallet + Points ne couvrent pas la commission.' }],
-              'Solde insuffisant pour la commission'
-            );
-          }
-          throw err;
-        }
+    const notifBody = `+${driverNet} FCFA nets pour le colis ${parcel.trackingNumber}.`
+      + `${commission > 0 ? ` Commission: ${commission} FCFA (Wallet: ${deductionResult.walletDeducted} FCFA, Points: ${deductionResult.pointsDeducted} pts${deductionResult.debt > 0 ? `, Dette: ${deductionResult.debt} FCFA` : ''}).` : ''}`;
+
+    await tx.notification.create({
+      data: {
+        userId: driverId,
+        type: 'delivery_paid',
+        title: 'Paiement recu (especes)',
+        body: notifBody,
+        data: { parcelId, earning: driverNet, commission, gross: parcelPrice, ...deductionResult }
       }
-
-      const driverNet = parcelPrice - commission;
-      const notifBody = `+${driverNet} FCFA nets pour le colis ${parcel.trackingNumber}.`
-        + `${commission > 0 ? ` Commission: ${commission} FCFA (Wallet: ${deductionResult.walletDeducted} FCFA, Points: ${deductionResult.pointsDeducted} pts).` : ''}`;
-
-      await tx.notification.create({
-        data: {
-          userId: driverId,
-          type: 'delivery_paid',
-          title: 'Paiement recu (especes)',
-          body: notifBody,
-          data: { parcelId, earning: driverNet, commission, gross: parcelPrice, ...deductionResult }
-        }
-      });
-      await tx.notification.create({
-        data: {
-          userId: req.user.id,
-          type: 'admin_driver_credited',
-          title: `Especes - ${parcel.trackingNumber}`,
-          body: `Chauffeur: +${driverNet} FCFA nets. Commission: ${commission} FCFA (Wallet: ${deductionResult.walletDeducted}, Points: ${deductionResult.pointsDeducted}).`,
-          data: { parcelId, driverId, earning: driverNet, commission, ...deductionResult }
-        }
-      });
     });
-  }
+    await tx.notification.create({
+      data: {
+        userId: req.user.id,
+        type: 'admin_driver_credited',
+        title: `Especes - ${parcel.trackingNumber}`,
+        body: `Chauffeur: +${driverNet} FCFA nets. Commission: ${commission} FCFA (Wallet: ${deductionResult.walletDeducted}, Points: ${deductionResult.pointsDeducted}).`,
+        data: { parcelId, driverId, earning: driverNet, commission, ...deductionResult }
+      }
+    });
+  });
 
   return ok(res, { message: 'Paiement especes confirme', data: { driverCredited: isDelivered && !!driverId } });
 });
@@ -3015,6 +3357,8 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
     totalRefunded: number(wallet.totalRefunded),
     totalWithdrawn: number(wallet.totalWithdrawn),
     totalCommissionsPaid: number(wallet.totalCommissionsPaid),
+    commissionDebt: number(wallet.commissionDebt),
+    canAcceptNewDeliveries: canAcceptNewDeliveries(wallet.commissionDebt),
     isActive: wallet.status === 'active',
     status: wallet.status,
     lastDepositAt: wallet.lastDepositAt,
@@ -3034,43 +3378,115 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
   });
 });
 
+export const driverPayWalletDebt = handle('driver.payWalletDebt', async (req, res) => {
+  const amount = number(req.body.amount);
+
+  const outcome = await prisma.$transaction(async (tx) => {
+    const wallet = await tx.wallet.findUnique({ where: { userId: req.user.id } });
+    const debt = Number(wallet?.commissionDebt ?? 0);
+    const balance = Number(wallet?.balance ?? 0);
+
+    if (debt <= 0) {
+      throw new ValidationError([{ path: 'body.amount', message: 'Aucune dette de commission a regler' }]);
+    }
+    if (balance <= 0 || (amount > 0 && amount > balance)) {
+      throw new ValidationError([{ path: 'body.amount', message: `Solde insuffisant (${balance} FCFA disponibles)` }]);
+    }
+
+    const settlement = await settleCommissionDebtFromWallet(tx, { userId: req.user.id, amount });
+
+    const walletAfter = await tx.wallet.findUnique({ where: { userId: req.user.id } });
+
+    await audit(tx, req, {
+      action: 'commission.debt.pay',
+      entityType: 'wallet',
+      entityId: req.user.id,
+      beforeData: { balance, commissionDebt: debt },
+      afterData: {
+        balance: Number(walletAfter.balance),
+        commissionDebt: Number(walletAfter.commissionDebt),
+        settled: settlement.settled
+      }
+    });
+
+    return { settlement, walletAfter };
+  });
+
+  const { settlement, walletAfter } = outcome;
+  return ok(res, {
+    message: 'Dette de commission reglee',
+    data: {
+      debtRepaid: settlement.settled,
+      remainingDebt: settlement.remainingDebt,
+      commissionDebt: number(walletAfter?.commissionDebt),
+      balance: number(walletAfter?.balance),
+      canAcceptNewDeliveries: canAcceptNewDeliveries(number(walletAfter?.commissionDebt))
+    }
+  });
+});
+
 export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
   const amount = Number(req.body.amount || 0);
-  const minWithdrawal = env.PAYDUNYA_MIN_WITHDRAWAL;
+  // Minimum de retrait issu de la configuration (`withdrawal.minAmount`), gérable
+  // depuis l'admin. L'environnement ne sert plus que de repli si la clé est absente.
+  const minWithdrawal = Number(await getConfigValue('withdrawal.minAmount', env.PAYDUNYA_MIN_WITHDRAWAL));
   if (!amount || amount < minWithdrawal) {
     throw new ValidationError([{ path: 'body.amount', message: `Montant minimum ${minWithdrawal} FCFA` }]);
   }
 
   const method = req.body.method || 'wave';
-  const phone = req.body.phone || req.user.phone;
+  if (!WITHDRAWAL_METHODS.includes(method)) {
+    throw new ValidationError([{ path: 'body.method', message: 'Methode de retrait invalide' }]);
+  }
 
-  const wallet = await prisma.wallet.findUnique({ where: { userId: req.user.id } });
-  const availableBalance = Number(wallet?.balance || 0);
-  if (availableBalance < amount) {
-    throw new ValidationError([{ path: 'body.amount', message: `Solde insuffisant. Disponible: ${availableBalance} FCFA` }]);
+  // Le numéro du bénéficiaire doit être un numéro de téléphone plausible ; un
+  // numéro arbitraire ou vide est rejeté. Le chauffeur reste libre de retirer
+  // vers un autre numéro que le sien, mais ce numéro doit être valide.
+  const rawPhone = req.body.phone || req.user.phone;
+  const phoneDigits = cleanPhone(rawPhone);
+  if (!phoneDigits || phoneDigits.length < 8 || phoneDigits.length > 15) {
+    throw new ValidationError([{ path: 'body.phone', message: 'Numero de telephone invalide' }]);
   }
 
   const reference = `WTH-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 
   const result = await prisma.$transaction(async (tx) => {
-    await tx.wallet.update({
-      where: { userId: req.user.id },
+    // Le contrôle de solde et le gel sont atomiques : deux retraits concurrents
+    // ne peuvent pas faire passer le solde en dessous de zéro.
+    const walletRow = await tx.wallet.findUnique({ where: { userId: req.user.id } });
+    const availableBalance = Number(walletRow?.balance ?? 0);
+    if (availableBalance < amount) {
+      throw new ValidationError([{ path: 'body.amount', message: `Solde insuffisant. Disponible: ${availableBalance} FCFA` }]);
+    }
+
+    const froze = await tx.wallet.updateMany({
+      where: { userId: req.user.id, balance: { gte: amount } },
       data: {
         balance: { decrement: amount },
         pendingBalance: { increment: amount },
         lastActivityAt: new Date()
       }
     });
+    if (froze.count === 0) {
+      throw new ValidationError([{ path: 'body.amount', message: `Solde insuffisant. Disponible: ${availableBalance} FCFA` }]);
+    }
 
     const withdrawal = await tx.withdrawal.create({
       data: {
         walletUserId: req.user.id,
         amount,
         method,
-        phone,
+        phone: rawPhone,
         status: 'pending',
         reference
       }
+    });
+
+    // Une seule transaction financière de retrait, créée ici avec le débit réel
+    // du solde ; son statut évoluera ensuite (processing/completed/failed/cancelled).
+    await createWithdrawalTransaction(tx, withdrawal, {
+      balanceBefore: availableBalance,
+      balanceAfter: availableBalance - amount
     });
 
     await tx.notification.create({
@@ -3085,8 +3501,8 @@ export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
 
     await notifyAdmins(tx, 'admin_withdrawal_request',
       `Nouveau retrait - ${amount} FCFA`,
-      `${req.user.fullName} demande un retrait de ${amount} FCFA via ${method}${phone ? ` (${phone})` : ''}. Reference: ${reference}`,
-      { userId: req.user.id, amount, method, phone, reference, withdrawalId: withdrawal.id }
+      `${req.user.fullName} demande un retrait de ${amount} FCFA via ${method}${rawPhone ? ` (${rawPhone})` : ''}. Reference: ${reference}`,
+      { userId: req.user.id, amount, method, phone: rawPhone, reference, withdrawalId: withdrawal.id }
     );
 
     return withdrawal;
@@ -3173,12 +3589,28 @@ export const cancelWithdrawal = handle('driver.withdrawal.cancel', async (req, r
       data: { status: 'cancelled' }
     });
 
-    await tx.wallet.update({
+    const wallet = await tx.wallet.update({
       where: { userId: req.user.id },
       data: {
         balance: { increment: Number(withdrawal.amount) },
         pendingBalance: { decrement: Number(withdrawal.amount) },
         lastActivityAt: new Date()
+      }
+    });
+
+    // La transaction de retrait unique est marquée annulée (jamais de doublon),
+    // et le montant recrédité est tracé via une transaction de type `refund`.
+    await setWithdrawalTransactionStatus(tx, withdrawal, 'cancelled');
+    await tx.walletTransaction.create({
+      data: {
+        walletUserId: req.user.id,
+        type: 'refund',
+        amount: Number(withdrawal.amount),
+        balanceBefore: Number(wallet.balance) - Number(withdrawal.amount),
+        balanceAfter: Number(wallet.balance),
+        description: `Retrait ${withdrawal.reference} annulé — montant recrédité`,
+        origin: 'withdrawal',
+        status: 'completed'
       }
     });
 
@@ -3207,26 +3639,12 @@ export const getScoreHistory = handle('score.history', async (req, res) => {
 });
 
 export const purchaseScore = handle('score.purchase', async (req, res) => {
-  const pointsRequested = Number(req.body.points || req.body.amount || 0);
-  if (pointsRequested <= 0) throw new ValidationError([{ path: 'body.points', message: 'Le nombre de points doit etre positif' }]);
-  const result = await prisma.$transaction(async (tx) => {
-    const cfaPerPoint = await getCfaPerPoint(tx);
-    const cfaAmount = Math.round(pointsRequested * cfaPerPoint);
-
-    await tx.score.upsert({
-      where: { userId: req.user.id },
-      update: { points: { increment: pointsRequested }, totalEarned: { increment: pointsRequested }, lastUpdated: new Date() },
-      create: { userId: req.user.id, points: pointsRequested, totalEarned: pointsRequested }
-    });
-    const payment = await tx.payment.create({
-      data: { userId: req.user.id, amount: decimal(cfaAmount, '0'), method: req.body.method || req.body.paymentMethod || 'cash', status: 'completed', phoneNumber: req.body.phoneNumber, reference: `SCORE-${Date.now()}`, completedAt: new Date() }
-    });
-    const transaction = await tx.scoreTransaction.create({
-      data: { userId: req.user.id, amount: pointsRequested, type: 'purchase', source: req.body.source || 'driver_recharge', description: `Achat de ${pointsRequested} points (${cfaAmount} FCFA)`, metadata: { paymentId: payment.id, cfaPerPoint, cfaAmount } }
-    });
-    return { payment, transaction };
-  });
-  return ok(res, { message: 'Points achetes', data: { payment: serializePayment(result.payment), transaction: serializeScoreTransaction(result.transaction) } });
+  // L'achat de points est une opération financière : il est STRICTEMENT interdit
+  // de créditer des points sur la simple foi d'une quantité envoyée par le client.
+  // On délègue à la création de facture PayDunya (type "score") ; les points ne
+  // sont crédités que par l'IPN/confirm PayDunya, de façon idempotente.
+  req.body = { ...req.body, type: 'score' };
+  return createPaydunyaPayment(req, res);
 });
 
 export const purchaseScoreWithWallet = handle('score.purchaseWallet', async (req, res) => {
@@ -3276,21 +3694,37 @@ export const purchaseScoreWithWallet = handle('score.purchaseWallet', async (req
 });
 
 async function mutateScore({ userId, amount, type, description, parcelId, metadata = {}, direction }) {
-  const delta = direction === 'debit' ? -Math.abs(amount) : Math.abs(amount);
+  const magnitude = Number(amount);
+  // Rejette les montants non numériques, nuls, négatifs ou non entiers. Un
+  // montant négatif ne doit jamais permettre de contourner la logique de débit.
+  if (!Number.isFinite(magnitude) || magnitude <= 0 || !Number.isInteger(magnitude)) {
+    throw new ValidationError([{ path: 'amount', message: 'Le montant doit etre un nombre entier positif' }]);
+  }
+
+  const delta = direction === 'debit' ? -magnitude : magnitude;
   return prisma.$transaction(async (tx) => {
+    const existing = await tx.score.findUnique({ where: { userId } });
+    const currentPoints = Number(existing?.points ?? 0);
+
+    // Aucune dette de points n'est autorisée : le débit ne peut pas dépasser
+    // le solde disponible.
+    if (direction === 'debit' && currentPoints < magnitude) {
+      throw new ValidationError([{ path: 'amount', message: `Points insuffisants (${currentPoints} disponibles, ${magnitude} requis)` }]);
+    }
+
     const score = await tx.score.upsert({
       where: { userId },
       update: {
         points: { increment: delta },
-        totalEarned: direction === 'credit' ? { increment: Math.abs(amount) } : undefined,
-        totalSpent: direction === 'debit' ? { increment: Math.abs(amount) } : undefined,
+        totalEarned: direction === 'credit' ? { increment: magnitude } : undefined,
+        totalSpent: direction === 'debit' ? { increment: magnitude } : undefined,
         lastUpdated: new Date()
       },
       create: {
         userId,
-        points: Math.max(delta, 0),
-        totalEarned: direction === 'credit' ? Math.abs(amount) : 0,
-        totalSpent: direction === 'debit' ? Math.abs(amount) : 0
+        points: direction === 'credit' ? magnitude : 0,
+        totalEarned: direction === 'credit' ? magnitude : 0,
+        totalSpent: direction === 'debit' ? magnitude : 0
       }
     });
     const transaction = await tx.scoreTransaction.create({ data: { userId, amount: delta, type, parcelId, description, metadata } });
@@ -4357,32 +4791,75 @@ export const searchParcels = handle('search.parcels', async (req, res) => {
 export const searchDrivers = handle('drivers.search', async (req, res) => {
   const drivers = await prisma.user.findMany({
     where: cleanUndefined({ role: 'driver', status: 'active', city: req.query.city, garageId: req.query.garageId }),
-    include: driverInclude,
+    select: publicDriverSelect,
     take: Number(req.query.limit || 100)
   });
-  return ok(res, { message: 'Chauffeurs', data: { drivers: drivers.map(serializeUser) } });
+  return ok(res, { message: 'Chauffeurs', data: { drivers: drivers.map((d) => serializePublicDriver(d)) } });
 });
 
 export const publicDriverDetail = handle('drivers.detail', async (req, res) => {
-  const driver = await prisma.user.findFirst({ where: { id: req.params.driverId, role: 'driver' }, include: driverInclude });
+  const driver = await prisma.user.findFirst({ where: { id: req.params.driverId, role: 'driver' }, select: publicDriverDetailSelect });
   if (!driver) throw new NotFoundError('Chauffeur introuvable');
-  return ok(res, { message: 'Detail chauffeur', data: { driver: serializeUser(driver) } });
+  return ok(res, { message: 'Detail chauffeur', data: { driver: serializePublicDriver(driver, { detailed: true }) } });
 });
 
 export const garagePublicDrivers = handle('drivers.garage', async (req, res) => {
-  const drivers = await prisma.user.findMany({ where: { role: 'driver', garageId: req.params.garageId, status: 'active' }, include: driverInclude });
-  return ok(res, { message: 'Chauffeurs zone', data: { drivers: drivers.map(serializeUser) } });
+  const drivers = await prisma.user.findMany({ where: { role: 'driver', garageId: req.params.garageId, status: 'active' }, select: publicDriverSelect });
+  return ok(res, { message: 'Chauffeurs zone', data: { drivers: drivers.map((d) => serializePublicDriver(d)) } });
 });
 
 // ============================================================
 // DRIVER LOCATION - Localisation chauffeur
 // ============================================================
 
+function parseCoordinate(value, path, min, max) {
+  const num = Number(value);
+  if (value === undefined || value === null || value === '' || !Number.isFinite(num)) {
+    throw new ValidationError([{ path, message: 'Coordonnee requise' }]);
+  }
+  if (num < min || num > max) {
+    throw new ValidationError([{ path, message: `Coordonnee hors plage (${min}..${max})` }]);
+  }
+  return num;
+}
+
 export const saveDriverLocation = handle('driver.location', async (req, res) => {
+  const parcelId = req.body.parcelId;
+  if (!parcelId) {
+    throw new ValidationError([{ path: 'body.parcelId', message: 'parcelId requis' }]);
+  }
+
+  const latitude = parseCoordinate(req.body.latitude, 'body.latitude', -90, 90);
+  const longitude = parseCoordinate(req.body.longitude, 'body.longitude', -180, 180);
+
+  let accuracy = null;
+  if (req.body.accuracy !== undefined && req.body.accuracy !== null && req.body.accuracy !== '') {
+    const parsedAccuracy = Number(req.body.accuracy);
+    if (!Number.isFinite(parsedAccuracy) || parsedAccuracy < 0) {
+      throw new ValidationError([{ path: 'body.accuracy', message: 'Precision invalide' }]);
+    }
+    accuracy = parsedAccuracy;
+  }
+
+  // Le chauffeur ne peut tracer que le colis qui lui est reellement assigne.
+  // Le driverId vient exclusivement de l'authentification, jamais du client.
+  const parcel = await prisma.parcel.findUnique({ where: { id: parcelId } });
+  if (!parcel || parcel.deletedAt) throw new NotFoundError('Colis introuvable');
+  if (parcel.assignedDriverId !== req.user.id) {
+    throw new ForbiddenError("Vous n'êtes pas assigné à ce colis");
+  }
+
   const location = await prisma.driverLocation.create({
-    data: { driverId: req.user.id, parcelId: req.body.parcelId, latitude: decimal(req.body.latitude, '0'), longitude: decimal(req.body.longitude, '0'), accuracy: decimal(req.body.accuracy) }
+    data: {
+      driverId: req.user.id,
+      parcelId,
+      latitude,
+      longitude,
+      accuracy
+    }
   });
-  return ok(res, { status: 201, message: 'Position enregistree', data: { location } });
+
+  return ok(res, { status: 201, message: 'Position enregistree', data: { location: serializeDriverLocation(location) } });
 });
 
 // ============================================================
@@ -4849,6 +5326,10 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
     if (req.user.role !== 'super_admin' && advertisement.driverId !== req.user.id) {
       throw new ForbiddenError('Vous ne pouvez accepter que les offres de vos propres annonces');
     }
+
+    // Acceptation d'une offre = nouvelle mission pour le chauffeur propriétaire
+    // de l'annonce : bloquée tant qu'il possède une dette de commission.
+    await assertCanAcceptNewDelivery(tx, advertisement.driverId);
 
     const currentOffer = await tx.advertisementOffer.findFirst({
       where: {
@@ -5412,13 +5893,14 @@ export const driverStats = handle('driver.stats', async (req, res) => {
   // ✅ On utilise req.user.id directement, pas besoin de driverId
   const driverId = req.user.id;
 
-  const [assignedParcels, activeParcels, completedDeliveries, score, pendingBids, openAdvertisements] = await Promise.all([
+  const [assignedParcels, activeParcels, completedDeliveries, score, pendingBids, openAdvertisements, wallet] = await Promise.all([
     prisma.parcel.count({ where: { assignedDriverId: driverId } }),
     prisma.parcel.count({ where: { assignedDriverId: driverId, status: { in: ACTIVE_PARCEL_STATUSES } } }),
     prisma.parcel.count({ where: { assignedDriverId: driverId, status: 'delivered' } }),
     prisma.score.findUnique({ where: { userId: driverId } }),
     prisma.bid.count({ where: { driverId: driverId, status: 'pending' } }),
-    prisma.advertisement.count({ where: { driverId: driverId, status: 'open' } })
+    prisma.advertisement.count({ where: { driverId: driverId, status: 'open' } }),
+    prisma.wallet.findUnique({ where: { userId: driverId } })
   ]);
 
   // Récupérer le véhicule du chauffeur
@@ -5445,6 +5927,8 @@ export const driverStats = handle('driver.stats', async (req, res) => {
         completedDeliveries,
         rating: Number(req.user.rating || 0),
         scoreBalance: score?.points || 0,
+        commissionDebt: number(wallet?.commissionDebt),
+        canAcceptNewDeliveries: canAcceptNewDeliveries(wallet?.commissionDebt),
         pendingBids,
         openAdvertisements,
         proposals,
@@ -5522,6 +6006,18 @@ export const superAdminUsers = handle('super.users', async (req, res) => {
 });
 
 export const superAdminCreateUser = handle('super.userCreate', async (req, res) => {
+  const role = req.body.role;
+  // Whitelist stricte des rôles attribuables, alignée sur superAdminUpdateUserRole.
+  if (!ASSIGNABLE_ROLES.includes(role)) {
+    throw new ValidationError([{ path: 'body.role', message: 'Role inconnu' }]);
+  }
+  // Seul un super admin crée des comptes staff ; un support ne peut créer que
+  // des comptes publics (client/driver), jamais un admin/super_admin/support.
+  const isStaffRole = !['client', 'driver'].includes(role);
+  if (isStaffRole && req.user.role !== 'super_admin') {
+    throw new ForbiddenError('Seul un super admin peut créer un compte avec ce rôle');
+  }
+
   const pinHash = req.body.pin ? await bcrypt.hash(req.body.pin, 12) : null;
   const passwordHash = req.body.password ? await bcrypt.hash(req.body.password, 12) : null;
   const user = await prisma.$transaction(async (tx) => {
@@ -5532,7 +6028,7 @@ export const superAdminCreateUser = handle('super.userCreate', async (req, res) 
         fullName: req.body.fullName,
         passwordHash,
         pinHash,
-        role: req.body.role,
+        role,
         status: req.body.status || 'active',
         garageId: req.body.garageId,
         city: req.body.city,
@@ -5828,7 +6324,31 @@ export const auditLogs = handle('super.auditLogs', async (req, res) => {
 
 export const getSystemConfig = handle('super.configGet', async (_req, res) => {
   const rows = await prisma.systemConfig.findMany();
-  const config = Object.fromEntries(rows.map((row) => [row.key, row.value]));
+
+  // Whitelist de sortie : aucune clé sensible (PayDunya, Brevo, secrets) ne
+  // transite par cette réponse. Les clés sont filtrées par préfixe/nom et par
+  // indice (secret/token/key/password) pour ne jamais réintroduire un credential.
+  const sensitivePatterns = [/^paydunya\./, /^brevo$/];
+  const sensitiveHints = /(secret|token|password|apikey|api_key|private_key|master_key)/i;
+
+  const config = {};
+  for (const row of rows) {
+    if (sensitivePatterns.some((p) => p.test(row.key))) continue;
+    if (sensitiveHints.test(row.key)) continue;
+    config[row.key] = row.value;
+  }
+
+  // Statuts non sensibles uniquement (configured true/false), jamais les secrets.
+  const dbValue = (key) => rows.find((r) => r.key === key)?.value;
+  config.paydunya = {
+    configured: Boolean(
+      (dbValue('paydunya.masterKey') || env.PAYDUNYA_MASTER_KEY) &&
+      (dbValue('paydunya.privateKey') || env.PAYDUNYA_PRIVATE_KEY) &&
+      (dbValue('paydunya.token') || env.PAYDUNYA_TOKEN)
+    )
+  };
+  config.brevo = { configured: isBrevoConfigured() };
+
   return ok(res, { message: 'Configuration', data: { config } });
 });
 
@@ -5838,9 +6358,212 @@ export const getPublicBroadcasts = handle('config.broadcasts', async (_req, res)
   return ok(res, { message: 'Annonces', data: { broadcasts } });
 });
 
+// Configuration publique consommée par le mobile (client et chauffeur).
+// Ne contient aucune valeur sensible (clés PayDunya, secrets…) : uniquement
+// les paramètres métier nécessaires à l'affichage et aux calculs côté app.
+async function readPublicConfig() {
+  const keys = [
+    'score.deliveryCompleted',
+    'score.signupBonus',
+    'score.cfaPerPoint',
+    'score.commitmentFee',
+    'score.packs',
+    'withdrawal.minAmount',
+    'withdrawal.maxAmount',
+    'withdrawal.maxPerDay',
+    'commission.insufficient_rule',
+    'commission.debtLimit',
+    'support.phone',
+    'support.email',
+    'support.technicalEmail',
+    'support.technicalPhone',
+    'support.responseTime',
+    'support.availability',
+    'help.topics',
+    'help.faqs',
+    'cancellation.reasons',
+    // Identité légale affichée dans les pages « Mentions légales »,
+    // « Confidentialité » et « CGU ». Vide tant que l'administrateur ne l'a pas
+    // renseignée : les clients affichent alors un libellé « à compléter ».
+    'legal.companyName',
+    'legal.address',
+    'legal.registrationNumber',
+    'legal.cdpAuthorization',
+    'legal.privacyEmail',
+    'legal.publisherName',
+    'legal.hostName',
+    'legal.directorName',
+    'legal.directorEmail',
+    'legal.technicalDirectorName',
+    'legal.technicalDirectorEmail'
+  ];
+
+  const [rows, commissionConfigs] = await Promise.all([
+    prisma.systemConfig.findMany({ where: { key: { in: keys } } }),
+    prisma.commissionConfig.findMany({ where: { isActive: true } })
+  ]);
+
+  const map = Object.fromEntries(rows.map((row) => [row.key, row.value]));
+  const value = (key, fallback) => {
+    const raw = map[key];
+    if (raw === undefined || raw === null) return fallback;
+    return typeof raw === 'object' ? raw.value ?? fallback : raw;
+  };
+
+  // Contenu d'aide : stocke en JSON dans `systemConfig` (`help.topics` /
+  // `help.faqs`), avec un contenu par defaut tant que l'administrateur n'a
+  // rien personnalise. Le mobile n'a donc plus rien de code en dur.
+  const listValue = (key, fallback) => {
+    const raw = map[key];
+    if (Array.isArray(raw)) return raw.length ? raw : fallback;
+    if (Array.isArray(raw?.value)) return raw.value.length ? raw.value : fallback;
+    return fallback;
+  };
+
+  const commissionCfg = commissionConfigs.find((c) => c.profile === 'local') || commissionConfigs[0];
+
+  const packsRaw = map['score.packs'];
+  const packs = Array.isArray(packsRaw)
+    ? packsRaw.map(Number).filter((n) => Number.isFinite(n) && n > 0)
+    : Array.isArray(packsRaw?.value)
+      ? packsRaw.value.map(Number).filter((n) => Number.isFinite(n) && n > 0)
+      : [];
+
+  const defaultHelpTopics = [
+    { icon: 'inventory', title: 'Créer et envoyer un colis' },
+    { icon: 'sell', title: 'Libre service et offres' },
+    { icon: 'qr_code', title: 'Suivi et livraison' },
+    { icon: 'wallet', title: 'Points et paiements' },
+    { icon: 'shield', title: 'Sécurité et litiges' },
+    { icon: 'person', title: 'Mon compte' }
+  ];
+
+  const defaultHelpFaqs = [
+    {
+      question: 'Comment fonctionne le libre service ?',
+      answer: 'Vous publiez votre colis, des chauffeurs vérifiés font des offres, vous acceptez celle qui vous convient.'
+    },
+    {
+      question: 'Que se passe-t-il à la livraison ?',
+      answer: 'Le destinataire communique un code PIN au chauffeur pour confirmer la remise du colis.'
+    },
+    {
+      question: 'Comment sont calculés les points ?',
+      answer: 'Chaque colis livré crédite des points utilisables en réductions sur vos prochains envois.'
+    },
+    {
+      question: 'Comment payer mes envois ?',
+      answer: 'Vous pouvez payer par carte, Orange Money, Wave, Free Money ou en espèces. Le paiement est débité une fois le colis livré.'
+    },
+    {
+      question: 'Comment suivre mon colis ?',
+      answer: 'Connectez-vous à votre compte et allez dans « Suivi ». Entrez votre numéro de suivi pour voir les statuts en temps réel.'
+    },
+    {
+      question: 'Puis-je annuler un colis ?',
+      answer: 'Oui, vous pouvez annuler un colis tant qu\'il n\'a pas encore été confirmé par un chauffeur. Au-delà, contactez notre support.'
+    },
+    {
+      question: 'Comment devenir chauffeur ?',
+      answer: 'Créez un compte en sélectionnant le rôle « Conduire », remplissez votre profil, ajoutez vos documents et votre véhicule. Notre équipe vérifiera vos informations.'
+    },
+    {
+      question: 'Comment sont protégés mes paiements ?',
+      answer: 'Tous les paiements sont sécurisés via PayDunya. Les fonds sont conservés sur un compte séquestre jusqu\'à la confirmation de livraison.'
+    },
+    {
+      question: 'Que faire en cas de colis endommagé ?',
+      answer: 'Contactez notre support dans les 48 heures avec des photos du colis et votre numéro de suivi. Nous traiterons votre réclamation rapidement.'
+    }
+  ];
+
+  return {
+    commission: commissionCfg
+      ? {
+          percentage: Number(commissionCfg.percentage),
+          minAmount: Number(commissionCfg.minAmount),
+          maxAmount: Number(commissionCfg.maxAmount)
+        }
+      : { percentage: 5, minAmount: 100, maxAmount: 500 },
+    points: {
+      deliveryCompleted: Number(value('score.deliveryCompleted', 0)),
+      signupBonus: Number(value('score.signupBonus', 0)),
+      cfaPerPoint: Number(value('score.cfaPerPoint', 1)),
+      commitmentFee: Number(value('score.commitmentFee', 0)),
+      packs
+    },
+    withdrawal: {
+      minAmount: Number(value('withdrawal.minAmount', 500)),
+      maxAmount: Number(value('withdrawal.maxAmount', 0)),
+      maxPerDay: Number(value('withdrawal.maxPerDay', 0))
+    },
+    insufficientPolicy: String(value('commission.insufficient_rule', 'block')),
+    debtLimit: Number(value('commission.debtLimit', 0)),
+    support: {
+      phone: String(value('support.phone', '+221 33 123 45 67')),
+      email: String(value('support.email', 'support-commercial@sendprocolis.com')),
+      technicalEmail: String(value('support.technicalEmail', 'support-technic@sendprocolis.com')),
+      technicalPhone: String(value('support.technicalPhone', '+221 76 516 27 96')),
+      responseTime: String(value('support.responseTime', '24h')),
+      availability: String(value('support.availability', '7j/7'))
+    },
+    help: {
+      topics: listValue('help.topics', defaultHelpTopics),
+      faqs: listValue('help.faqs', defaultHelpFaqs)
+    },
+    // Motifs d'annulation (value/label uniquement) : les règles financières
+    // restent côté serveur, seul le libellé est exposé pour l'affichage.
+    cancellation: {
+      reasons: listValue('cancellation.reasons', [])
+        .map((r) => ({ value: String(r?.value ?? '').trim(), label: String(r?.label ?? r?.value ?? '').trim() }))
+        .filter((r) => r.value && r.label)
+    },
+    // Identité légale configurée par l'administrateur. Les champs vides sont
+    // renvoyés tels quels : le client affiche alors « [À COMPLÉTER] ».
+    legal: {
+      companyName: String(value('legal.companyName', '')),
+      address: String(value('legal.address', '')),
+      registrationNumber: String(value('legal.registrationNumber', '')),
+      cdpAuthorization: String(value('legal.cdpAuthorization', '')),
+      privacyEmail: String(value('legal.privacyEmail', '')),
+      publisherName: String(value('legal.publisherName', '')),
+      hostName: String(value('legal.hostName', '')),
+      directorName: String(value('legal.directorName', '')),
+      directorEmail: String(value('legal.directorEmail', '')),
+      technicalDirectorName: String(value('legal.technicalDirectorName', '')),
+      technicalDirectorEmail: String(value('legal.technicalDirectorEmail', ''))
+    }
+  };
+}
+
+export const getPublicConfig = handle('config.public', async (_req, res) => {
+  return ok(res, { message: 'Configuration publique', data: { config: await readPublicConfig() } });
+});
+
 export const updateSystemConfig = handle('super.configUpdate', async (req, res) => {
   const entries = Object.entries(req.body);
   if (entries.length === 0) throw new ValidationError([{ path: 'body', message: 'Au moins un parametre requis' }]);
+
+  // Validation des clés `cancellation.*` avant toute écriture : le serveur est
+  // la source de vérité et refuse une configuration incohérente (motif mal
+  // formé, responsabilité hors enum, pourcentage hors bornes, clé inconnue…).
+  const cancellationEntries = entries.filter(([key]) => key.startsWith('cancellation.'));
+  for (const [key, value] of cancellationEntries) {
+    validateCancellationConfigValue(key, value);
+  }
+
+  // Cohérence transversale : on fusionne l'existant avec les valeurs à écrire.
+  if (cancellationEntries.length > 0) {
+    const existing = await prisma.systemConfig.findMany({ where: { key: { startsWith: 'cancellation.' } } });
+    const existingMap = Object.fromEntries(existing.map((row) => [row.key, row.value]));
+    const incoming = Object.fromEntries(cancellationEntries);
+    validateCancellationConfigCoherence({
+      penaltyMinAmount: incoming['cancellation.penalty.minAmount'] ?? existingMap['cancellation.penalty.minAmount'],
+      penaltyMaxAmount: incoming['cancellation.penalty.maxAmount'] ?? existingMap['cancellation.penalty.maxAmount'],
+      clientSharePercent: incoming['cancellation.penalty.clientSharePercent'] ?? existingMap['cancellation.penalty.clientSharePercent'],
+      reasons: incoming['cancellation.reasons'] ?? existingMap['cancellation.reasons']
+    });
+  }
 
   for (const [key, value] of entries) {
     await prisma.systemConfig.upsert({
@@ -6026,29 +6749,22 @@ export const driverPayCommission = handle('driver.payCommission', async (req, re
   const outcome = await prisma.$transaction(async (tx) => {
     let walletDebited = 0;
     let pointsDebited = 0;
+    let debt = 0;
     let transaction = null;
 
     if (source === 'auto') {
-      let deduction;
-      try {
-        deduction = await deductCashCommission({
-          parcelId: parcel.id,
-          driverId: req.user.id,
-          commission,
-          tx,
-          req
-        });
-      } catch (err) {
-        if (err.code === 'INSUFFICIENT_FUNDS') {
-          throw new ValidationError(
-            [{ path: 'commission', message: 'Ressources insuffisantes. Wallet + Points ne couvrent pas la commission.' }],
-            'Solde insuffisant pour la commission'
-          );
-        }
-        throw err;
-      }
+      // La commission non couverte devient une dette ; seul le plafond
+      // `commission.debtLimit` peut refuser (AppError propagée au client).
+      const deduction = await deductCashCommission({
+        parcelId: parcel.id,
+        driverId: req.user.id,
+        commission,
+        tx,
+        req
+      });
       walletDebited = deduction.walletDeducted;
       pointsDebited = deduction.pointsDeducted;
+      debt = deduction.debt ?? 0;
     } else if (source === 'wallet') {
       const wallet = await tx.wallet.upsert({
         where: { userId: req.user.id },
@@ -6137,7 +6853,7 @@ export const driverPayCommission = handle('driver.payCommission', async (req, re
       afterData: { commission, source, walletDebited, pointsDebited }
     });
 
-    return { walletDebited, pointsDebited, transaction };
+    return { walletDebited, pointsDebited, debt, transaction };
   });
 
   const [walletAfter, scoreAfter] = await Promise.all([
@@ -6156,7 +6872,8 @@ export const driverPayCommission = handle('driver.payCommission', async (req, re
         pointsDebited: outcome.pointsDebited,
         newWalletBalance: walletAfter ? Number(walletAfter.balance) : 0,
         newScoreBalance: scoreAfter ? scoreAfter.points : 0,
-        debt: null,
+        debt: outcome.debt,
+        commissionDebt: walletAfter ? Number(walletAfter.commissionDebt ?? 0) : 0,
         transaction: outcome.transaction
           ? { id: outcome.transaction.id, type: outcome.transaction.type, amount: Number(outcome.transaction.amount) }
           : null

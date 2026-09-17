@@ -3,9 +3,23 @@ import { env } from '../../config/env.js';
 import { ok, fail } from '../../utils/api-response.js';
 import { getPagination, paginationMeta } from '../../utils/pagination.js';
 import { NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
-import { serializeUser } from '../../utils/mobile-serializers.js';
+import { serializePublicDriver } from '../../utils/mobile-serializers.js';
 
 const DEFAULT_RADIUS_KM = 30;
+
+// Whitelist Prisma pour les chauffeurs exposes publiquement par zone : les
+// colonnes sensibles (email, phone, address, gender, lastLogin, lastActiveAt,
+// ...) ne sont jamais remontees par la requete.
+const publicDriverSelect = {
+  id: true,
+  fullName: true,
+  profilePhoto: true,
+  city: true,
+  region: true,
+  driverStatus: true,
+  rating: true,
+  completedDeliveries: true
+};
 
 function number(value, fallback = 0) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -862,16 +876,13 @@ export const zonePublicDrivers = handle('zones.publicDrivers', async (req, res) 
 
   const drivers = await prisma.user.findMany({
     where: { role: 'driver', status: 'active', OR: filters },
-    include: {
-      garage: true,
-      vehicles: { where: { deletedAt: null }, orderBy: { createdAt: 'desc' }, take: 1 }
-    },
+    select: publicDriverSelect,
     orderBy: { fullName: 'asc' }
   });
 
   return ok(res, {
     message: 'Chauffeurs de la zone',
-    data: { drivers: drivers.map(serializeUser) }
+    data: { drivers: drivers.map((d) => serializePublicDriver(d)) }
   });
 });
 

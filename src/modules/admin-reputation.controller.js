@@ -4,7 +4,7 @@ import { ok, fail } from '../utils/api-response.js';
 import { getPagination, paginationMeta } from '../utils/pagination.js';
 import { serializeUser } from '../utils/mobile-serializers.js';
 import { NotFoundError, ValidationError, normalizeError } from '../utils/errors.js';
-import { getConfigValue } from '../utils/commission.js';
+import { getCfaPerPoint, getConfigValue, repayDebtFromPoints } from '../utils/commission.js';
 
 function decimal(value, fallback = null) {
   if (value === undefined || value === null || value === '') return fallback;
@@ -276,17 +276,23 @@ export const addPoints = handle('reputation.addPoints', async (req, res) => {
   if (!user) throw new NotFoundError('Utilisateur introuvable');
 
   const result = await prisma.$transaction(async (tx) => {
+    // Une dette de commission existante est réglée en priorité sur les points
+    // ajoutés par l'admin ; seul le reliquat crédite le solde de points.
+    const cfaPerPoint = await getCfaPerPoint(tx);
+    const repayment = await repayDebtFromPoints(tx, { userId, points: amount, cfaPerPoint });
+    const netPoints = repayment.netPoints;
+
     const score = await tx.score.upsert({
       where: { userId },
       update: {
-        points: { increment: amount },
-        totalEarned: { increment: amount },
+        points: { increment: netPoints },
+        totalEarned: { increment: netPoints },
         lastUpdated: new Date()
       },
       create: {
         userId,
-        points: amount,
-        totalEarned: amount,
+        points: netPoints,
+        totalEarned: netPoints,
         totalSpent: 0
       }
     });
@@ -297,7 +303,7 @@ export const addPoints = handle('reputation.addPoints', async (req, res) => {
         amount,
         type: 'admin_credit',
         description,
-        metadata: { adminId: req.user.id, adminName: req.user.fullName }
+        metadata: { adminId: req.user.id, adminName: req.user.fullName, pointsRequested: amount, netPoints, debtRepaid: repayment.debtRepaid }
       }
     });
 

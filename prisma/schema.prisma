@@ -194,6 +194,12 @@ enum WithdrawalStatus {
   cancelled
 }
 
+enum ClientDebtStatus {
+  pending
+  partially_paid
+  paid
+}
+
 enum ZoneType {
   CIRCLE
   POLYGON
@@ -256,6 +262,7 @@ model User {
   validatedPayments       Payment[]              @relation("PaymentValidator")
   score                   Score?
   scoreTransactions       ScoreTransaction[]
+  clientPenaltyDebts      ClientPenaltyDebt[]
   notifiedTransactions    ScoreTransaction[]     @relation("ScorePerformer")
   notifications           Notification[]         @relation("NotificationRecipient")
   sentNotifications       Notification[]         @relation("NotificationSender")
@@ -393,6 +400,11 @@ model Parcel {
   cancelledBy           String?              @map("cancelled_by") @db.Uuid
   cancellationReason    String?              @map("cancellation_reason")
   cancelledAt           DateTime?            @map("cancelled_at") @db.Timestamptz
+  // Instantané JSON de la décision d'annulation calculée par le backend
+  // (responsabilité, pénalité, répartition, frais, remboursement, soldes
+  // wallet/points/dette au moment de l'annulation). Unique source de vérité
+  // re-exposée par le serializer sans recalcul, et immuable une fois écrit.
+  cancellationData      Json?                @map("cancellation_data")
   deletedAt             DateTime?            @map("deleted_at") @db.Timestamptz
   createdAt             DateTime             @default(now()) @map("created_at") @db.Timestamptz
   updatedAt             DateTime             @updatedAt @map("updated_at") @db.Timestamptz
@@ -423,6 +435,7 @@ model Parcel {
   ratings               Rating[]
   messages              Message[]
   negotiationMessages   NegotiationMessage[]
+  clientPenaltyDebts    ClientPenaltyDebt[]
 
   @@index([senderId])
   @@index([proposedDriverId])
@@ -593,6 +606,11 @@ model Wallet {
   totalRefunded        Decimal             @default(0) @map("total_refunded") @db.Decimal(12, 2)
   totalWithdrawn       Decimal             @default(0) @map("total_withdrawn") @db.Decimal(12, 2)
   totalCommissionsPaid Decimal             @default(0) @map("total_commissions_paid") @db.Decimal(12, 2)
+  // Dette de commission non réglée (FCFA) : alimentée quand un chauffeur
+  // effectue une livraison espèces sans solde suffisant et que la règle
+  // configurée (`commission.insufficient_rule`) autorise la dette. La limite
+  // `commission.debtLimit` (0 = dette interdite) est appliquée par le backend.
+  commissionDebt      Decimal             @default(0) @map("commission_debt") @db.Decimal(12, 2)
   status               WalletStatus        @default(active)
   lastDepositAt        DateTime?           @map("last_deposit_at") @db.Timestamptz
   lastActivityAt       DateTime?           @map("last_activity_at") @db.Timestamptz
@@ -613,6 +631,10 @@ model WalletTransaction {
   balanceBefore Decimal               @map("balance_before") @db.Decimal(12, 2)
   balanceAfter  Decimal               @map("balance_after") @db.Decimal(12, 2)
   parcelId      String?               @map("parcel_id") @db.Uuid
+  // Rattachement à un retrait : garantit qu'un retrait métier ne produit
+  // qu'une seule transaction de type `withdrawal` (mise à jour au fil du
+  // cycle de vie au lieu d'en créer une nouvelle).
+  withdrawalId  String?               @map("withdrawal_id") @db.Uuid
   description   String?
   origin        String?
   status        String                @default("completed")
@@ -620,9 +642,11 @@ model WalletTransaction {
   createdAt     DateTime              @default(now()) @map("created_at") @db.Timestamptz
   wallet        Wallet                @relation(fields: [walletUserId], references: [userId], onDelete: Cascade)
   parcel        Parcel?               @relation(fields: [parcelId], references: [id], onDelete: SetNull)
+  withdrawal    Withdrawal?           @relation(fields: [withdrawalId], references: [id], onDelete: SetNull)
   admin         User?                 @relation(fields: [performedBy], references: [id], onDelete: SetNull)
 
   @@index([walletUserId, createdAt])
+  @@index([withdrawalId])
   @@map("wallet_transactions")
 }
 
@@ -646,10 +670,42 @@ model Withdrawal {
   updatedAt     DateTime         @updatedAt @map("updated_at") @db.Timestamptz
   wallet        Wallet           @relation(fields: [walletUserId], references: [userId], onDelete: Cascade)
   processor     User?            @relation(fields: [processedBy], references: [id], onDelete: SetNull)
+  transactions  WalletTransaction[]
 
   @@index([walletUserId, createdAt])
   @@index([status])
   @@map("withdrawals")
+}
+
+// Pénalité d'annulation client impayée (FCFA). Dette dédiée, strictement
+// séparée de `Wallet.commissionDebt` (dette de commission chauffeur) : le client
+// n'a pas de wallet préfinancé. La pénalité non couverte par un remboursement
+// (espèces, colis non payé, remboursement nul) devient une ligne ici, réglée
+// directement via PayDunya (type `penalty_debt`), sans wallet ni commission.
+model ClientPenaltyDebt {
+  id        String           @id @default(uuid()) @db.Uuid
+  userId    String           @map("user_id") @db.Uuid
+  parcelId  String           @map("parcel_id") @db.Uuid
+  // Pénalité initiale au moment de l'annulation (immuable).
+  amount    Decimal          @db.Decimal(12, 2)
+  // Reliquat restant à régler. `amount` à la création, décrémenté au règlement.
+  remaining Decimal          @db.Decimal(12, 2)
+  status    ClientDebtStatus @default(pending)
+  // Référence stable de suivi (affichage, réconciliation).
+  reference String           @unique
+  // Motif d'annulation à l'origine de la dette (traçabilité).
+  reason    String?
+  metadata  Json             @default("{}")
+  settledAt DateTime?        @map("settled_at") @db.Timestamptz
+  createdAt DateTime         @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parcel Parcel @relation(fields: [parcelId], references: [id], onDelete: Restrict)
+
+  @@index([userId, status])
+  @@index([parcelId])
+  @@map("client_penalty_debts")
 }
 
 model CommissionConfig {
@@ -790,6 +846,8 @@ model DriverLocation {
   parcel    Parcel?  @relation(fields: [parcelId], references: [id], onDelete: SetNull)
 
   @@index([driverId, createdAt])
+  // Le suivi public lit la derniere position d'un colis : parcelId + createdAt.
+  @@index([parcelId, createdAt])
   @@map("driver_locations")
 }
 

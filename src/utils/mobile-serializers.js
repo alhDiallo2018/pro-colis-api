@@ -1,3 +1,5 @@
+import { snapshotToCancellation } from './cancellation.js';
+
 function decimalToString(value) {
   if (value === null || value === undefined) {
     return value;
@@ -84,6 +86,46 @@ export function serializeUser(user) {
   };
 }
 
+/**
+ * DTO public d'un chauffeur (WHITELIST stricte).
+ *
+ * Concu pour les endpoints publics (`/public/drivers/*`). N'expose jamais les
+ * donnees personnelles du chauffeur : pas d'email, de telephone, d'adresse, de
+ * genre, de `lastLogin` / `lastActiveAt`, ni aucune donnee de compte, de
+ * paiement, de wallet ou de KYC. Seuls les champs necessaires a la mise en
+ * relation publique sont presents.
+ *
+ * `detailed` ajoute les statistiques et la description publique du vehicule
+ * (modele / type) pour la fiche publique. La plaque n'est jamais exposee : elle
+ * identifie personnellement le chauffeur et ne doit transiter que via un
+ * endpoint authentifie une fois la mission engagee.
+ */
+export function serializePublicDriver(driver, { detailed = false } = {}) {
+  if (!driver) return null;
+
+  const base = {
+    id: driver.id,
+    fullName: driver.fullName,
+    profilePhoto: driver.profilePhoto ?? null,
+    city: driver.city ?? null,
+    region: driver.region ?? null,
+    driverStatus: driver.driverStatus ?? null,
+    rating: decimalToString(driver.rating),
+    completedDeliveries: driver.completedDeliveries ?? 0
+  };
+
+  if (!detailed) return base;
+
+  const vehicle = Array.isArray(driver.vehicles) ? driver.vehicles[0] : driver.vehicle;
+
+  return {
+    ...base,
+    totalDeliveries: driver.totalDeliveries ?? 0,
+    vehicleModel: vehicle?.model ?? null,
+    vehicleType: vehicle?.type ?? null
+  };
+}
+
 export function serializeBid(bid) {
   if (!bid) return null;
 
@@ -119,6 +161,9 @@ export function serializeBid(bid) {
     driverId: bid.driverId,
     driverName: bid.driver?.fullName,
     driverPhone: bid.driver?.phone,
+    driverRating: decimalToString(bid.driver?.rating ?? null),
+    driverCity: bid.driver?.city ?? null,
+    driverZoneName: bid.driver?.garage?.name ?? null,
     price: decimalToString(bid.price),
     message: bid.message,
     status: bid.status,
@@ -134,6 +179,60 @@ export function serializeBid(bid) {
     canClientAccept: isOpen && lastOfferBy === 'driver',
     canDriverAccept: isOpen && lastOfferBy === 'client',
     ...(negotiationHistory ? { negotiationHistory } : {})
+  };
+}
+
+/**
+ * Representation publique d'une offre (GET /public/parcels/:id/bids).
+ *
+ * Variante de `serializeBid` dediee aux reponses publiques : elle n'expose
+ * jamais `driverPhone` (ni telephone, email ou adresse du chauffeur), ni la
+ * ville / zone du chauffeur, ni l'historique de negociation. Le chauffeur ne
+ * remonte que sous forme minimale `{ driverId, driverName, driverRating }`.
+ */
+export function serializePublicBid(bid) {
+  if (!bid) return null;
+
+  const lastEntry = Array.isArray(bid.negotiationMessages) && bid.negotiationMessages.length
+    ? bid.negotiationMessages[bid.negotiationMessages.length - 1]
+    : null;
+
+  const lastOfferBy = bid.lastOfferBy || lastEntry?.fromUserRole || 'driver';
+  const isOpen = bid.status === 'pending' || bid.status === 'countered';
+
+  return {
+    id: bid.id,
+    parcelId: bid.parcelId,
+    driverId: bid.driverId,
+    driverName: bid.driver?.fullName,
+    driverRating: decimalToString(bid.driver?.rating ?? null),
+    price: decimalToString(bid.price),
+    message: bid.message,
+    status: bid.status,
+    responseMessage: bid.responseMessage,
+    audioUrl: bid.audioUrl,
+    respondedAt: dateToIso(bid.respondedAt),
+    createdAt: dateToIso(bid.createdAt),
+    updatedAt: dateToIso(bid.updatedAt),
+    lastOfferBy,
+    lastPrice: decimalToString(lastEntry?.price ?? bid.price),
+    lastMessage: lastEntry?.message ?? bid.responseMessage ?? bid.message ?? null,
+    lastMessageAt: dateToIso(lastEntry?.createdAt ?? bid.respondedAt ?? bid.createdAt),
+    canClientAccept: isOpen && lastOfferBy === 'driver',
+    canDriverAccept: isOpen && lastOfferBy === 'client'
+  };
+}
+
+export function serializeDriverLocation(location) {
+  if (!location) return null;
+  return {
+    id: location.id,
+    driverId: location.driverId,
+    parcelId: location.parcelId,
+    latitude: decimalToString(location.latitude),
+    longitude: decimalToString(location.longitude),
+    accuracy: decimalToString(location.accuracy),
+    createdAt: dateToIso(location.createdAt)
   };
 }
 
@@ -265,8 +364,21 @@ function serializeParcelProposal(parcel) {
   };
 }
 
-export function serializeParcel(parcel) {
+export function serializeParcel(parcel, options = {}) {
   if (!parcel) return null;
+
+  // Le chauffeur n'a pas à connaître l'état du paiement du client (ex.
+  // « Payé ») ni les coordonnées de paiement qui ne concernent pas sa mission.
+  // Ces champs sont donc omis quand la sérialisation cible un chauffeur. Le
+  // prix et le canal (espèces / plateforme) restent exposés : ils déterminent
+  // la commission et le mode d'encaissement de la mission.
+  const redactPayment = options.redactPayment === true;
+
+  const paymentStatus = redactPayment ? undefined : parcel.paymentStatus;
+  const paymentPhoneNumber = redactPayment ? undefined : parcel.paymentPhoneNumber;
+  const cashCollectedAmount = redactPayment ? undefined : decimalToString(parcel.cashCollectedAmount);
+  const cashCollectedAt = redactPayment ? undefined : dateToIso(parcel.cashCollectedAt);
+
   return {
     id: parcel.id,
     trackingNumber: parcel.trackingNumber,
@@ -295,6 +407,12 @@ export function serializeParcel(parcel) {
     departureZoneName: parcel.departureZone?.name,
     arrivalZoneId: parcel.arrivalZoneId,
     arrivalZoneName: parcel.arrivalZone?.name,
+    // Coordonnées des zones : permettent au mobile de calculer une distance
+    // réelle au lieu d'afficher une valeur figée.
+    departureLatitude: decimalToString(parcel.departureZone?.latitude),
+    departureLongitude: decimalToString(parcel.departureZone?.longitude),
+    arrivalLatitude: decimalToString(parcel.arrivalZone?.latitude),
+    arrivalLongitude: decimalToString(parcel.arrivalZone?.longitude),
     // La ville vient de la zone quand elle existe, du garage sinon : les colis
     // antérieurs à la migration n'ont pas tous de zone rattachée.
     departureCity: parcel.departureZone?.city ?? parcel.departureGarage?.city,
@@ -325,10 +443,10 @@ export function serializeParcel(parcel) {
     paymentChannel: parcel.paymentChannel,
     acceptedPaymentChannels: parcel.acceptedPaymentChannels || [],
     cashCollectionPoint: parcel.cashCollectionPoint,
-    cashCollectedAmount: decimalToString(parcel.cashCollectedAmount),
-    cashCollectedAt: dateToIso(parcel.cashCollectedAt),
-    paymentPhoneNumber: parcel.paymentPhoneNumber,
-    paymentStatus: parcel.paymentStatus,
+    cashCollectedAmount,
+    cashCollectedAt,
+    paymentPhoneNumber,
+    paymentStatus,
     signatureUrl: parcel.signatureUrl,
     notes: parcel.notes,
     pickupDate: dateToIso(parcel.pickupDate),
@@ -338,12 +456,125 @@ export function serializeParcel(parcel) {
     cancelledBy: parcel.cancelledBy,
     cancellationReason: parcel.cancellationReason,
     cancelledAt: dateToIso(parcel.cancelledAt),
+    // Conséquences d'annulation calculées par le backend : ré-exposées depuis
+    // l'instantané persisté, sans recalcul. `null` quand aucune donnée n'existe.
+    cancellation: snapshotToCancellation(parcel.cancellationData, {
+      redactDriverFinancials: options.redactDriverFinancials === true,
+      redactClientFinancials: options.redactClientFinancials === true || redactPayment
+    }),
     createdAt: dateToIso(parcel.createdAt),
     updatedAt: dateToIso(parcel.updatedAt),
     ...serializeParcelProposal(parcel),
     bids: parcel.bids?.map(serializeBid) || [],
     events: parcel.events?.map(serializeParcelEvent) || [],
     media: parcel.media?.map(serializeMedia) || [],
+    photoUrls: parcel.media?.filter((item) => item.mediaType === 'photo').map((item) => item.url) || [],
+    videoUrls: parcel.media?.filter((item) => item.mediaType === 'video').map((item) => item.url) || [],
+    audioUrls: parcel.media?.filter((item) => item.mediaType === 'audio').map((item) => item.url) || []
+  };
+}
+
+/**
+ * Representation dediee au suivi public d'un colis (GET /public/parcels/track).
+ *
+ * Contrairement a `serializeParcel`, ce serializer n'expose jamais les donnees
+ * personnelles du chauffeur : pas de `serializeUser` (email, telephone, adresse,
+ * genre, lastLogin, etc.), pas de `driverPhone`, pas de donnees de paiement ou de
+ * caisse, et pas d'historique de negociation (offres, propositions). Le chauffeur
+ * ne remonte que sous la forme minimale `{ id, name }`.
+ */
+export function serializePublicTrackingParcel(parcel) {
+  if (!parcel) return null;
+
+  const driver = parcel.assignedDriver
+    ? { id: parcel.assignedDriver.id, name: parcel.assignedDriver.fullName }
+    : null;
+
+  return {
+    id: parcel.id,
+    trackingNumber: parcel.trackingNumber,
+    status: parcel.status,
+    senderName: parcel.senderName,
+    receiverName: parcel.receiverName,
+    receiverAddress: parcel.receiverAddress,
+    description: parcel.description,
+    type: parcel.type,
+    weight: decimalToString(parcel.weight),
+    length: decimalToString(parcel.length),
+    width: decimalToString(parcel.width),
+    height: decimalToString(parcel.height),
+    isUrgent: parcel.isUrgent,
+    departureGarageId: parcel.departureGarageId,
+    departureGarageName: parcel.departureGarage?.name,
+    arrivalGarageId: parcel.arrivalGarageId,
+    arrivalGarageName: parcel.arrivalGarage?.name,
+    departureZoneId: parcel.departureZoneId,
+    departureZoneName: parcel.departureZone?.name,
+    arrivalZoneId: parcel.arrivalZoneId,
+    arrivalZoneName: parcel.arrivalZone?.name,
+    departureLatitude: decimalToString(parcel.departureZone?.latitude),
+    departureLongitude: decimalToString(parcel.departureZone?.longitude),
+    arrivalLatitude: decimalToString(parcel.arrivalZone?.latitude),
+    arrivalLongitude: decimalToString(parcel.arrivalZone?.longitude),
+    departureCity: parcel.departureZone?.city ?? parcel.departureGarage?.city,
+    arrivalCity: parcel.arrivalZone?.city ?? parcel.arrivalGarage?.city,
+    driverId: parcel.assignedDriverId,
+    driverName: parcel.assignedDriver?.fullName,
+    driver,
+    assignedDriverId: parcel.assignedDriverId,
+    assignedDriver: driver,
+    price: decimalToString(parcel.price),
+    pickupDate: dateToIso(parcel.pickupDate),
+    deliveryDate: dateToIso(parcel.deliveryDate),
+    estimatedDeliveryDate: dateToIso(parcel.estimatedDeliveryDate),
+    cancellationReason: parcel.cancellationReason,
+    cancelledAt: dateToIso(parcel.cancelledAt),
+    createdAt: dateToIso(parcel.createdAt),
+    updatedAt: dateToIso(parcel.updatedAt),
+    events: parcel.events?.map(serializeParcelEvent) || [],
+    photoUrls: parcel.media?.filter((item) => item.mediaType === 'photo').map((item) => item.url) || [],
+    videoUrls: parcel.media?.filter((item) => item.mediaType === 'video').map((item) => item.url) || [],
+    audioUrls: parcel.media?.filter((item) => item.mediaType === 'audio').map((item) => item.url) || []
+  };
+}
+
+/**
+ * Représentation publique d'un colis « libre » (GET /public/parcels/free).
+ *
+ * Whitelist stricte : aucune donnée permettant de contacter ou d'identifier un
+ * utilisateur hors plateforme. Pas de téléphone, d'email, de nom d'expéditeur ou
+ * de destinataire, d'adresse, de chauffeur, de paiement ni de négociation. Seuls
+ * les champs nécessaires à l'affichage public d'une annonce sont exposés.
+ */
+export function serializePublicFreeParcel(parcel) {
+  if (!parcel) return null;
+
+  return {
+    id: parcel.id,
+    trackingNumber: parcel.trackingNumber,
+    status: parcel.status,
+    type: parcel.type,
+    description: parcel.description,
+    weight: decimalToString(parcel.weight),
+    length: decimalToString(parcel.length),
+    width: decimalToString(parcel.width),
+    height: decimalToString(parcel.height),
+    isUrgent: parcel.isUrgent,
+    isFreeForBidding: parcel.isFreeForBidding,
+    departureGarageId: parcel.departureGarageId,
+    departureGarageName: parcel.departureGarage?.name,
+    arrivalGarageId: parcel.arrivalGarageId,
+    arrivalGarageName: parcel.arrivalGarage?.name,
+    departureZoneId: parcel.departureZoneId,
+    departureZoneName: parcel.departureZone?.name,
+    arrivalZoneId: parcel.arrivalZoneId,
+    arrivalZoneName: parcel.arrivalZone?.name,
+    departureCity: parcel.departureZone?.city ?? parcel.departureGarage?.city,
+    arrivalCity: parcel.arrivalZone?.city ?? parcel.arrivalGarage?.city,
+    price: decimalToString(parcel.price),
+    pickupDate: dateToIso(parcel.pickupDate),
+    estimatedDeliveryDate: dateToIso(parcel.estimatedDeliveryDate),
+    createdAt: dateToIso(parcel.createdAt),
     photoUrls: parcel.media?.filter((item) => item.mediaType === 'photo').map((item) => item.url) || [],
     videoUrls: parcel.media?.filter((item) => item.mediaType === 'video').map((item) => item.url) || [],
     audioUrls: parcel.media?.filter((item) => item.mediaType === 'audio').map((item) => item.url) || []

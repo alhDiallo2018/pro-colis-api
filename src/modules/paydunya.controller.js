@@ -1,9 +1,9 @@
 import { prisma } from '../config/prisma.js'
 import { env } from '../config/env.js'
 import { ok, fail } from '../utils/api-response.js'
-import { ValidationError, normalizeError } from '../utils/errors.js'
+import { ValidationError, ForbiddenError, NotFoundError, normalizeError } from '../utils/errors.js'
 import { sendNotificationEmail, sendNotificationSms, isBrevoConfigured } from '../utils/brevo.js'
-import { calculateCommission } from '../utils/commission.js'
+import { calculateCommission, getCfaPerPoint, repayDebtFromPoints, repayDebtFromWallet } from '../utils/commission.js'
 import {
   createInvoice as paydunyaCreateInvoice,
   confirmInvoice as paydunyaConfirmInvoice,
@@ -65,71 +65,62 @@ async function getPaydunyaConfig() {
   return null
 }
 
-async function creditScore(userId, points, token) {
-  await prisma.$transaction(async (tx) => {
-    await tx.score.upsert({
-      where: { userId },
-      update: { points: { increment: points }, totalEarned: { increment: points }, lastUpdated: new Date() },
-      create: { userId, points, totalEarned: points }
-    })
-    await tx.scoreTransaction.create({
-      data: { userId, amount: points, type: 'purchase', source: 'paydunya', description: `Achat points via PayDunya (${token})` }
-    })
-    await tx.notification.create({
-      data: {
-        userId,
-        type: 'score_credited',
-        title: 'Points credites',
-        body: `${points} points ont ete ajoutes a votre compte via PayDunya.`,
-        data: { points, token, source: 'paydunya' }
-      }
-    })
-  })
-}
+async function creditScore(tx, userId, points, token) {
+  const cfaPerPoint = await getCfaPerPoint(tx)
+  // La dette de commission est réglée en priorité sur les points achetés.
+  const repayment = await repayDebtFromPoints(tx, { userId, points, cfaPerPoint })
+  const netPoints = repayment.netPoints
 
-async function creditWallet(userId, amount, token) {
-  await prisma.$transaction(async (tx) => {
-    const wallet = await tx.wallet.upsert({
-      where: { userId },
-      update: { balance: { increment: amount }, totalDeposited: { increment: amount }, lastActivityAt: new Date(), lastDepositAt: new Date() },
-      create: { userId, balance: amount, totalDeposited: amount, lastDepositAt: new Date(), lastActivityAt: new Date() }
-    })
-    await tx.walletTransaction.create({
-      data: {
-        walletUserId: userId,
-        type: 'deposit',
-        amount,
-        balanceBefore: number(wallet.balance) - amount,
-        balanceAfter: number(wallet.balance),
-        description: `Recharge via PayDunya (${token})`,
-        origin: 'paydunya',
-        status: 'completed'
-      }
-    })
-    await tx.notification.create({
-      data: {
-        userId,
-        type: 'wallet_recharged',
-        title: 'Portefeuille recharge',
-        body: `${amount} FCFA ont ete ajoutes a votre portefeuille via PayDunya.`,
-        data: { amount, token, source: 'paydunya' }
-      }
-    })
+  await tx.score.upsert({
+    where: { userId },
+    update: { points: { increment: netPoints }, totalEarned: { increment: netPoints }, lastUpdated: new Date() },
+    create: { userId, points: netPoints, totalEarned: netPoints }
   })
-}
-
-async function createPaymentRecord(userId, parcelId, amount, token) {
-  await prisma.payment.create({
+  await tx.scoreTransaction.create({
+    data: { userId, amount: points, type: 'purchase', source: 'paydunya', description: `Achat points via PayDunya (${token})`, metadata: { pointsRequested: points, netPoints, debtRepaid: repayment.debtRepaid } }
+  })
+  await tx.notification.create({
     data: {
       userId,
-      parcelId: parcelId || null,
+      type: 'score_credited',
+      title: 'Points credites',
+      body: `${netPoints} points ont ete ajoutes a votre compte via PayDunya.`,
+      data: { points: netPoints, requested: points, debtRepaid: repayment.debtRepaid, token, source: 'paydunya' }
+    }
+  })
+}
+
+async function creditWallet(tx, userId, amount, token) {
+  // 1. Crédit intégral sur le solde (la dette est réglée ensuite depuis le solde).
+  const wallet = await tx.wallet.upsert({
+    where: { userId },
+    update: { balance: { increment: amount }, totalDeposited: { increment: amount }, lastActivityAt: new Date(), lastDepositAt: new Date() },
+    create: { userId, balance: amount, totalDeposited: amount, lastDepositAt: new Date(), lastActivityAt: new Date() }
+  })
+  await tx.walletTransaction.create({
+    data: {
+      walletUserId: userId,
+      type: 'deposit',
       amount,
-      currency: 'XOF',
-      method: 'card',
-      status: 'completed',
-      transactionId: token,
-      completedAt: new Date(),
-      metadata: { source: 'paydunya', token }
+      balanceBefore: number(wallet.balance) - amount,
+      balanceAfter: number(wallet.balance),
+      description: `Recharge via PayDunya (${token})`,
+      origin: 'paydunya',
+      status: 'completed'
+    }
+  })
+
+  // 2. La dette de commission est réglée en priorité depuis le solde crédité.
+  const repayment = await repayDebtFromWallet(tx, { userId, amount })
+  const netAmount = repayment.netAmount
+
+  await tx.notification.create({
+    data: {
+      userId,
+      type: 'wallet_recharged',
+      title: 'Portefeuille recharge',
+      body: `${netAmount} FCFA ont ete ajoutes a votre portefeuille via PayDunya.`,
+      data: { amount: netAmount, requested: amount, debtRepaid: repayment.debtRepaid, token, source: 'paydunya' }
     }
   })
 }
@@ -156,7 +147,7 @@ async function sendNotification(userId, type, title, body, data = {}) {
   }
 }
 
-async function creditDriverForParcel(parcel, token) {
+async function creditDriverForParcel(tx, parcel, token) {
   const parcelPrice = Number(parcel.price || parcel.totalAmount || 0)
   if (!parcelPrice || !parcel.assignedDriverId) return
 
@@ -165,47 +156,45 @@ async function creditDriverForParcel(parcel, token) {
 
   if (driverEarning <= 0) return
 
-  await prisma.$transaction(async (tx) => {
-    const wallet = await tx.wallet.upsert({
-      where: { userId: parcel.assignedDriverId },
-      update: { balance: { increment: driverEarning }, totalDeposited: { increment: driverEarning }, lastActivityAt: new Date(), lastDepositAt: new Date() },
-      create: { userId: parcel.assignedDriverId, balance: driverEarning, totalDeposited: driverEarning, lastDepositAt: new Date(), lastActivityAt: new Date() }
-    })
-    await tx.walletTransaction.create({
-      data: {
-        walletUserId: parcel.assignedDriverId,
-        type: 'deposit',
-        amount: driverEarning,
-        balanceBefore: Number(wallet.balance) - driverEarning,
-        balanceAfter: Number(wallet.balance),
-        parcelId: parcel.id,
-        description: `Gain colis ${parcel.trackingNumber} (${driverEarning} FCFA, comm. ${commission} FCFA)`,
-        origin: 'delivery',
-        status: 'completed'
-      }
-    })
-    await tx.notification.create({
-      data: {
-        userId: parcel.assignedDriverId,
-        type: 'delivery_paid',
-        title: 'Paiement recu',
-        body: `+${driverEarning} FCFA pour le colis ${parcel.trackingNumber}. Commission: ${commission} FCFA.`,
-        data: { parcelId: parcel.id, earning: driverEarning, commission }
-      }
-    })
-    const admins = await tx.user.findMany({ where: { role: 'super_admin', status: 'active' }, select: { id: true } })
-    await Promise.all(admins.map((a) =>
-      tx.notification.create({
-        data: {
-          userId: a.id,
-          type: 'admin_driver_credited',
-          title: `PayDunya - ${parcel.trackingNumber}`,
-          body: `Chauffeur credite (${driverEarning} FCFA). Commission: ${commission} FCFA.`,
-          data: { parcelId: parcel.id, driverId: parcel.assignedDriverId, earning: driverEarning, commission }
-        }
-      })
-    ))
+  const wallet = await tx.wallet.upsert({
+    where: { userId: parcel.assignedDriverId },
+    update: { balance: { increment: driverEarning }, totalDeposited: { increment: driverEarning }, lastActivityAt: new Date(), lastDepositAt: new Date() },
+    create: { userId: parcel.assignedDriverId, balance: driverEarning, totalDeposited: driverEarning, lastDepositAt: new Date(), lastActivityAt: new Date() }
   })
+  await tx.walletTransaction.create({
+    data: {
+      walletUserId: parcel.assignedDriverId,
+      type: 'deposit',
+      amount: driverEarning,
+      balanceBefore: Number(wallet.balance) - driverEarning,
+      balanceAfter: Number(wallet.balance),
+      parcelId: parcel.id,
+      description: `Gain colis ${parcel.trackingNumber} (${driverEarning} FCFA, comm. ${commission} FCFA)`,
+      origin: 'delivery',
+      status: 'completed'
+    }
+  })
+  await tx.notification.create({
+    data: {
+      userId: parcel.assignedDriverId,
+      type: 'delivery_paid',
+      title: 'Paiement recu',
+      body: `+${driverEarning} FCFA pour le colis ${parcel.trackingNumber}. Commission: ${commission} FCFA.`,
+      data: { parcelId: parcel.id, earning: driverEarning, commission }
+    }
+  })
+  const admins = await tx.user.findMany({ where: { role: 'super_admin', status: 'active' }, select: { id: true } })
+  await Promise.all(admins.map((a) =>
+    tx.notification.create({
+      data: {
+        userId: a.id,
+        type: 'admin_driver_credited',
+        title: `PayDunya - ${parcel.trackingNumber}`,
+        body: `Chauffeur credite (${driverEarning} FCFA). Commission: ${commission} FCFA.`,
+        data: { parcelId: parcel.id, driverId: parcel.assignedDriverId, earning: driverEarning, commission }
+      }
+    })
+  ))
 }
 
 export const createPaydunyaPayment = handle('paydunya.create', async (req, res) => {
@@ -214,19 +203,13 @@ export const createPaydunyaPayment = handle('paydunya.create', async (req, res) 
     throw new ValidationError([{ path: 'paydunya', message: 'PayDunya non configure' }])
   }
 
-  const { type, parcelId, points, amount: rawAmount } = req.body
+  const { type, parcelId, points, amount: rawAmount, debtId } = req.body
   const paymentType = type || 'parcel'
-  const amount = number(rawAmount || points || req.body.amount || 0)
-
-  if (amount <= 0) throw new ValidationError([{ path: 'body.amount', message: 'Montant invalide' }])
-  const minAmount = env.PAYDUNYA_MIN_AMOUNT
-  if (amount < minAmount) {
-    throw new ValidationError([{ path: 'body.amount', message: `Le montant minimum est de ${minAmount} FCFA` }])
-  }
-  if (!['parcel', 'score', 'wallet'].includes(paymentType)) {
-    throw new ValidationError([{ path: 'body.type', message: 'Type invalide (parcel, score, wallet)' }])
+  if (!['parcel', 'score', 'wallet', 'penalty_debt'].includes(paymentType)) {
+    throw new ValidationError([{ path: 'body.type', message: 'Type invalide (parcel, score, wallet, penalty_debt)' }])
   }
 
+  let amount
   let description = ''
   let redirectPath = '/client/colis'
   // Métadonnées renvoyées telles quelles par PayDunya (confirm + IPN) : servent à
@@ -234,7 +217,6 @@ export const createPaydunyaPayment = handle('paydunya.create', async (req, res) 
   const customData = {
     type: paymentType,
     userId: req.user.id,
-    amount,
     mode: config.mode || 'test',
     initiatedAt: new Date().toISOString()
   }
@@ -246,20 +228,59 @@ export const createPaydunyaPayment = handle('paydunya.create', async (req, res) 
     if (parcel.paymentStatus === 'completed') {
       throw new ValidationError([{ path: 'body.parcelId', message: 'Ce colis est deja paye' }])
     }
+    // Le montant exigé est celui du colis, recalculé côté serveur : le montant
+    // envoyé par le client n'est jamais la source de vérité du paiement.
+    amount = Number(parcel.totalAmount ?? parcel.price ?? 0)
+    if (!(amount > 0)) {
+      throw new ValidationError([{ path: 'body.parcelId', message: 'Montant du colis invalide' }])
+    }
     customData.parcelId = parcelId
+    customData.expectedAmount = amount
     description = `Paiement colis ${parcel.trackingNumber}`
     redirectPath = '/client/colis'
   } else if (paymentType === 'score') {
-    const pts = number(points || amount || 0)
-    if (pts <= 0) throw new ValidationError([{ path: 'body.points', message: 'Points invalides' }])
+    const pts = number(points || 0)
+    if (!(pts > 0)) throw new ValidationError([{ path: 'body.points', message: 'Points invalides' }])
+    // Le prix des points est calculé côté serveur (config `score.cfaPerPoint`) :
+    // jamais à partir d'un montant fourni par le client.
+    const cfaPerPoint = await getCfaPerPoint(prisma)
+    amount = Math.round(pts * cfaPerPoint)
     customData.points = pts
+    customData.expectedAmount = amount
     description = `Achat de ${pts} points`
     redirectPath = '/driver/points'
   } else if (paymentType === 'wallet') {
-    const amt = number(amount)
-    if (amt <= 0) throw new ValidationError([{ path: 'body.amount', message: 'Montant invalide' }])
+    const amt = number(rawAmount)
+    if (!(amt > 0)) throw new ValidationError([{ path: 'body.amount', message: 'Montant invalide' }])
+    amount = amt
     description = `Recharge portefeuille ${amt} FCFA`
     redirectPath = '/driver/revenus'
+  } else if (paymentType === 'penalty_debt') {
+    if (!debtId) throw new ValidationError([{ path: 'body.debtId', message: 'Dette requise' }])
+    const debt = await prisma.clientPenaltyDebt.findUnique({ where: { id: debtId } })
+    if (!debt) throw new ValidationError([{ path: 'body.debtId', message: 'Dette introuvable' }])
+    if (debt.userId !== req.user.id) throw new ForbiddenError('Cette dette ne vous appartient pas')
+    const remaining = Number(debt.remaining)
+    if (debt.status === 'paid' || remaining <= 0) {
+      throw new ValidationError([{ path: 'body.debtId', message: 'Cette dette est déjà réglée' }])
+    }
+    // Règlement partiel OU intégral : le montant demandé est borné par le
+    // reliquat recalculé côté serveur. Le client ne peut jamais dépasser le
+    // montant restant, ni fixer un montant arbitraire depuis le frontend.
+    const requested = number(rawAmount)
+    amount = requested > 0 ? requested : remaining
+    if (amount > remaining) {
+      throw new ValidationError([{ path: 'body.amount', message: `Le paiement ne peut pas dépasser le montant restant (${remaining} FCFA)` }])
+    }
+    customData.debtId = debtId
+    customData.expectedAmount = amount
+    description = `Règlement pénalité d'annulation ${debt.reference} (${amount} FCFA)`
+    redirectPath = '/client/colis'
+  }
+
+  const minAmount = env.PAYDUNYA_MIN_AMOUNT
+  if (amount < minAmount) {
+    throw new ValidationError([{ path: 'body.amount', message: `Le montant minimum est de ${minAmount} FCFA` }])
   }
 
   const user = await prisma.user.findUnique({ where: { id: req.user.id } })
@@ -325,57 +346,170 @@ export const paydunyaIpn = handle('paydunya.ipn', async (req, res) => {
   return ok(res, { message: 'IPN recu' })
 })
 
-async function processCompletedPayment(result, token, reqLogger) {
-  const existing = await prisma.payment.findFirst({
-    where: { transactionId: token, status: 'completed' }
-  })
+function underpaymentError() {
+  const err = new Error('Montant payé insuffisant')
+  err.code = 'PAYDUNYA_UNDERPAYMENT'
+  return err
+}
+
+function debtAlreadySettledError() {
+  const err = new Error('Dette déjà réglée')
+  err.code = 'DEBT_ALREADY_SETTLED'
+  return err
+}
+
+export async function processCompletedPayment(result, token, reqLogger) {
+  const raw = result.raw || result
+  const cd = raw.custom_data || result.customData || {}
+  const type = cd.type || 'parcel'
+  const paidAmount = Math.round(Number(raw.invoice?.total_amount ?? raw.total_amount ?? result.amount ?? 0))
+  const userId = cd.userId
+
+  if (!token) {
+    reqLogger?.warn?.({ type }, 'PayDunya: token manquant, complétion ignorée')
+    return
+  }
+  if (!userId) {
+    reqLogger?.warn?.({ type }, 'PayDunya: userId manquant dans custom_data, complétion ignorée')
+    return
+  }
+
+  // Chemin rapide d'idempotence (lecture seule). La garantie réelle vient de la
+  // contrainte unique sur `Payment.transactionId` posée dans la transaction.
+  const existing = await prisma.payment.findUnique({ where: { transactionId: token } })
   if (existing) {
     reqLogger?.warn?.({ token }, 'PayDunya: duplicate completion ignored')
     return
   }
 
-  const raw = result.raw || result
-  const cd = raw.custom_data || result.customData || {}
-  const type = cd.type || 'parcel'
-  const amount = Number(raw.invoice?.total_amount || raw.total_amount || result.amount || 0)
-  const userId = cd.userId
-
   try {
-    if (type === 'parcel' && cd.parcelId) {
-      const parcel = await prisma.parcel.findUnique({ where: { id: cd.parcelId } })
-      if (!parcel) return reqLogger?.warn?.({ parcelId: cd.parcelId }, 'PayDunya: parcel not found')
+    await prisma.$transaction(async (tx) => {
+      // Sous-paiement : vérifié AVANT toute écriture, pour chaque flux dont le
+      // montant attendu est connu côté serveur. Un montant insuffisant rejette
+      // l'opération entière : aucun crédit, aucun statut « payé ».
+      if (type === 'parcel' && cd.parcelId) {
+        const parcel = await tx.parcel.findUnique({ where: { id: cd.parcelId } })
+        if (!parcel) throw new NotFoundError('Colis introuvable')
+        const expected = Number(parcel.totalAmount ?? parcel.price ?? 0)
+        if (expected > 0 && paidAmount < expected) {
+          reqLogger?.warn?.({ parcelId: cd.parcelId, paidAmount, expected }, 'PayDunya: sous-paiement colis rejeté')
+          throw underpaymentError()
+        }
+      } else if (type === 'score' && cd.points) {
+        const cfaPerPoint = await getCfaPerPoint(tx)
+        const expected = Math.round(Number(cd.points) * cfaPerPoint)
+        if (expected > 0 && paidAmount < expected) {
+          reqLogger?.warn?.({ userId, paidAmount, expected, points: cd.points }, 'PayDunya: sous-paiement points rejeté')
+          throw underpaymentError()
+        }
+      } else if (type === 'penalty_debt' && cd.debtId) {
+        const debt = await tx.clientPenaltyDebt.findUnique({ where: { id: cd.debtId } })
+        if (!debt) throw new NotFoundError('Dette introuvable')
+        if (debt.status === 'paid' || Number(debt.remaining) <= 0) {
+          reqLogger?.warn?.({ debtId: cd.debtId }, 'PayDunya: dette déjà réglée, règlement ignoré')
+          throw debtAlreadySettledError()
+        }
+        // Sous-paiement : le client doit payer au moins le montant facturé
+        // (`expectedAmount`, figé à la création). Le montant appliqué est de
+        // toute façon borné au reliquat au moment du règlement.
+        const expected = cd.expectedAmount != null ? Number(cd.expectedAmount) : Number(debt.remaining)
+        if (expected > 0 && paidAmount < expected) {
+          reqLogger?.warn?.({ debtId: cd.debtId, paidAmount, expected }, 'PayDunya: sous-paiement dette rejeté')
+          throw underpaymentError()
+        }
+      }
 
-      await prisma.parcel.updateMany({
-        where: { id: cd.parcelId },
-        data: { paymentStatus: 'completed' }
+      // Garde atomique d'idempotence : `transactionId` est unique. Un rejeu
+      // concurrent lève P2002 et annule toutes les écritures de crédit.
+      await tx.payment.create({
+        data: {
+          userId,
+          parcelId: type === 'parcel' ? cd.parcelId || null : null,
+          amount: paidAmount,
+          currency: 'XOF',
+          method: 'card',
+          status: 'completed',
+          transactionId: token,
+          completedAt: new Date(),
+          metadata: { source: 'paydunya', token, type, ...(cd.debtId ? { debtId: cd.debtId } : {}) }
+        }
       })
-      if (userId) {
-        await createPaymentRecord(userId, cd.parcelId, amount, token)
+
+      if (type === 'parcel' && cd.parcelId) {
+        const parcel = await tx.parcel.findUnique({ where: { id: cd.parcelId } })
+        await tx.parcel.updateMany({ where: { id: cd.parcelId }, data: { paymentStatus: 'completed' } })
         await sendNotification(userId, 'payment_completed', 'Paiement confirme',
-          `Votre paiement de ${amount} FCFA pour le colis a ete confirme.`, { parcelId: cd.parcelId, amount, token })
-      }
+          `Votre paiement de ${paidAmount} FCFA pour le colis a ete confirme.`, { parcelId: cd.parcelId, amount: paidAmount, token })
 
-      if (parcel.status === 'delivered' && parcel.assignedDriverId) {
-        await creditDriverForParcel(parcel, token)
-      }
+        if (parcel.status === 'delivered' && parcel.assignedDriverId) {
+          await creditDriverForParcel(tx, parcel, token)
+        }
+        reqLogger?.info?.({ parcelId: cd.parcelId, amount: paidAmount, token }, 'PayDunya: parcel payment completed')
+      } else if (type === 'score' && cd.points) {
+        await creditScore(tx, userId, Number(cd.points), token)
+        reqLogger?.info?.({ userId, points: cd.points }, 'PayDunya: score credited')
+      } else if (type === 'wallet') {
+        // Top-up libre : le wallet crédite le montant réellement payé, il n'y a
+        // donc pas de « montant attendu » supérieur à vérifier.
+        await creditWallet(tx, userId, paidAmount, token)
+        reqLogger?.info?.({ userId, amount: paidAmount }, 'PayDunya: wallet credited')
+      } else if (type === 'penalty_debt' && cd.debtId) {
+        // Règlement partiel ou intégral de la pénalité client : aucune commission
+        // chauffeur, aucun crédit wallet, aucune recette de livraison. Le reliquat
+        // est recalculé côté serveur, ne peut jamais devenir négatif ni dépasser
+        // le montant restant, et la garde conditionnelle rend chaque écriture
+        // idempotente face à un rejeu IPN / une double facture.
+        const debt = await tx.clientPenaltyDebt.findUnique({ where: { id: cd.debtId } })
+        if (!debt) throw new NotFoundError('Dette introuvable')
+        const applyAmount = Math.min(paidAmount, Number(debt.remaining))
 
-      reqLogger?.info?.({ parcelId: cd.parcelId, amount, token }, 'PayDunya: parcel payment completed')
-    } else if (type === 'score' && userId && cd.points) {
-      await creditScore(userId, Number(cd.points), token)
-      reqLogger?.info?.({ userId, points: cd.points }, 'PayDunya: score credited')
-    } else if (type === 'wallet' && userId) {
-      await creditWallet(userId, amount, token)
-      reqLogger?.info?.({ userId, amount }, 'PayDunya: wallet credited')
-    } else {
-      reqLogger?.warn?.({ type, cd }, 'PayDunya: unknown payment type or missing data')
-    }
+        const decremented = await tx.clientPenaltyDebt.updateMany({
+          where: { id: cd.debtId, remaining: { gte: applyAmount }, status: { not: 'paid' } },
+          data: { remaining: { decrement: applyAmount } }
+        })
+        if (decremented.count === 0) throw debtAlreadySettledError()
+
+        const updated = await tx.clientPenaltyDebt.findUnique({ where: { id: cd.debtId } })
+        const nextRemaining = Number(updated.remaining)
+        const finalStatus = nextRemaining === 0 ? 'paid' : 'partially_paid'
+        await tx.clientPenaltyDebt.update({
+          where: { id: cd.debtId },
+          data: { status: finalStatus, settledAt: finalStatus === 'paid' ? new Date() : null }
+        })
+
+        await sendNotification(userId, 'client_penalty_debt_paid',
+          finalStatus === 'paid' ? 'Pénalité réglée' : 'Paiement partiel reçu',
+          finalStatus === 'paid'
+            ? `Votre pénalité de ${applyAmount} FCFA a été réglée.`
+            : `Un paiement de ${applyAmount} FCFA a été appliqué. Reste ${nextRemaining} FCFA.`,
+          { debtId: cd.debtId, amount: applyAmount, remaining: nextRemaining, token })
+        reqLogger?.info?.({ userId, debtId: cd.debtId, amount: applyAmount, remaining: nextRemaining }, 'PayDunya: penalty debt settled (partial or full)')
+      } else {
+        reqLogger?.warn?.({ type, cd }, 'PayDunya: unknown payment type or missing data')
+      }
+    })
   } catch (err) {
+    if (err?.code === 'P2002') {
+      reqLogger?.warn?.({ token }, 'PayDunya: doublon concurrent ignoré')
+      return
+    }
+    if (err?.code === 'PAYDUNYA_UNDERPAYMENT') {
+      // Sous-paiement : rien n'est crédité, aucune écriture persistée. Le rejeu
+      // de la même transaction échouera de nouveau sans crédit.
+      return
+    }
+    if (err?.code === 'DEBT_ALREADY_SETTLED') {
+      // Dette déjà réglée par un autre règlement concurrent : le paiement en
+      // double est annulé (rollback), aucun double règlement n'est persisté.
+      reqLogger?.warn?.({ token }, 'PayDunya: dette déjà réglée, règlement ignoré')
+      return
+    }
     reqLogger?.error?.({ err, type, token }, 'PayDunya: processCompletedPayment failed')
   }
 }
 
 export const paydunyaReturn = handle('paydunya.return', async (req, res) => {
-  const frontUrl = env.CORS_ORIGIN === '*' ? 'http://localhost:5173' : (env.CORS_ORIGIN || '').split(',')[0]
+  const frontUrl = env.WEB_APP_URL
   const { token } = req.query
 
   if (!token) {
@@ -404,7 +538,7 @@ export const paydunyaReturn = handle('paydunya.return', async (req, res) => {
 })
 
 export const paydunyaCancel = (_req, res) => {
-  const frontUrl = env.CORS_ORIGIN === '*' ? 'http://localhost:5173' : (env.CORS_ORIGIN || '').split(',')[0]
+  const frontUrl = env.WEB_APP_URL
   return res.redirect(`${frontUrl}/client/colis?payment=cancelled`)
 }
 

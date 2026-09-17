@@ -53,13 +53,63 @@ async function notify(userId, type, title, body, data = {}) {
   }
 }
 
+/**
+ * Crée la transaction financière unique d'un retrait au moment où le solde est
+ * réellement gelé. `balanceBefore`/`balanceAfter` reflètent le débit effectif du
+ * wallet : le retrait ne produira ensuite qu'une seule transaction, dont seul le
+ * statut évoluera.
+ */
+export async function createWithdrawalTransaction(tx, withdrawal, { balanceBefore, balanceAfter }) {
+  return tx.walletTransaction.create({
+    data: {
+      walletUserId: withdrawal.walletUserId,
+      withdrawalId: withdrawal.id,
+      type: 'withdrawal',
+      amount: Number(withdrawal.amount),
+      balanceBefore,
+      balanceAfter,
+      description: `Retrait ${withdrawal.method} — ${withdrawal.reference}`,
+      origin: 'withdrawal',
+      status: 'pending'
+    }
+  });
+}
+
+/**
+ * Met à jour le statut de la transaction de retrait unique (`type: withdrawal`)
+ * associée à un retrait, ou la crée si elle n'existe pas encore (retrait
+ * antérieur à ce correctif). Un retrait métier ne génère ainsi jamais deux
+ * transactions de type `withdrawal` : seule la ligne existante évolue.
+ */
+export async function setWithdrawalTransactionStatus(tx, withdrawal, status, extra = {}) {
+  const existing = await tx.walletTransaction.findFirst({
+    where: { withdrawalId: withdrawal.id, type: 'withdrawal' }
+  });
+  if (existing) {
+    return tx.walletTransaction.update({ where: { id: existing.id }, data: { status, ...extra } });
+  }
+  return tx.walletTransaction.create({
+    data: {
+      walletUserId: withdrawal.walletUserId,
+      withdrawalId: withdrawal.id,
+      type: 'withdrawal',
+      amount: Number(withdrawal.amount),
+      balanceBefore: extra.balanceBefore ?? 0,
+      balanceAfter: extra.balanceAfter ?? 0,
+      description: `Retrait ${withdrawal.method} — ${withdrawal.reference}`,
+      origin: 'withdrawal',
+      status
+    }
+  });
+}
+
 /** Succès : le montant gelé est consommé, totaux mis à jour, chauffeur notifié. */
 export async function finalizeWithdrawalSuccess(withdrawalId, { transactionId = null, providerRef = null } = {}) {
   const result = await prisma.$transaction(async (tx) => {
     const withdrawal = await tx.withdrawal.findUnique({ where: { id: withdrawalId } });
-    if (!withdrawal || withdrawal.status === 'completed') return withdrawal;
+    if (!withdrawal || ['completed', 'failed', 'cancelled'].includes(withdrawal.status)) return withdrawal;
     const amount = Number(withdrawal.amount);
-    const wallet = await tx.wallet.update({
+    await tx.wallet.update({
       where: { userId: withdrawal.walletUserId },
       data: {
         pendingBalance: { decrement: amount },
@@ -68,18 +118,7 @@ export async function finalizeWithdrawalSuccess(withdrawalId, { transactionId = 
         lastActivityAt: new Date()
       }
     });
-    await tx.walletTransaction.create({
-      data: {
-        walletUserId: withdrawal.walletUserId,
-        type: 'withdrawal',
-        amount,
-        balanceBefore: Number(wallet.balance) ,
-        balanceAfter: Number(wallet.balance),
-        description: `Retrait ${withdrawal.method} — ${withdrawal.reference} (PayDunya)`,
-        origin: 'withdrawal',
-        status: 'completed'
-      }
-    });
+    await setWithdrawalTransactionStatus(tx, withdrawal, 'completed');
     return tx.withdrawal.update({
       where: { id: withdrawalId },
       data: {
@@ -116,6 +155,7 @@ export async function failWithdrawal(withdrawalId, reason) {
         lastActivityAt: new Date()
       }
     });
+    await setWithdrawalTransactionStatus(tx, withdrawal, 'failed');
     await tx.walletTransaction.create({
       data: {
         walletUserId: withdrawal.walletUserId,
