@@ -1,6 +1,15 @@
 import { prisma } from '../config/prisma.js';
 import { CommissionDebtRequiredError, DebtLimitExceededError } from './errors.js';
 
+/**
+ * Verrouille le portefeuille pendant un calcul dette/solde. Les règlements
+ * financiers font plusieurs écritures liées (wallet + ledger) : sans ce verrou,
+ * deux requêtes concurrentes pourraient toutes deux consommer la même dette.
+ */
+async function lockWallet(tx, userId) {
+  await tx.$queryRaw`SELECT "user_id" FROM "wallets" WHERE "user_id" = ${userId}::uuid FOR UPDATE`;
+}
+
 export async function calculateCommission(price, profile = 'local') {
   if (!price || price <= 0) return 0;
 
@@ -45,8 +54,8 @@ export async function getCommitmentFee(tx) {
 /// Montant maximal de commission impayée qu'un chauffeur peut accumuler (FCFA).
 /// `0` signifie « aucune limite » : la dette est autorisée sans plafond afin
 /// qu'une livraison déjà acceptée puisse toujours être terminée. Une valeur
-/// positive borne la dette (`commissionDebt`) ; la limite est appliquée par le
-/// backend au moment de la création de la dette.
+/// positive borne la dette (`commissionDebt`) et bloque toute nouvelle mission
+/// dès que le montant courant atteint ce seuil.
 export async function getDebtLimit(tx) {
   const value = await getConfigValue(tx, 'commission.debtLimit', 0);
   const parsed = Number(value);
@@ -59,18 +68,31 @@ export async function getCommissionDebt(tx, userId) {
   return Number(wallet?.commissionDebt ?? 0);
 }
 
-/// Lève une erreur métier si le chauffeur possède une dette de commission
-/// impayée : il ne peut pas accepter un nouveau colis tant qu'elle subsiste.
+/// Règle unique de blocage : un seuil nul désactive la restriction, sinon le
+/// chauffeur est bloqué dès que sa dette atteint (ou dépasse) ce seuil.
+export function isCommissionDebtLimitReached(debt, debtLimit) {
+  const amount = Number(debt || 0);
+  const limit = Number(debtLimit || 0);
+  return limit > 0 && amount >= limit;
+}
+
+/// Lève une erreur métier lorsque la dette atteint le seuil administrable.
+/// La vérification reste dans la transaction qui attribue la mission afin que
+/// deux acceptations concurrentes ne puissent pas contourner le verrou.
 export async function assertCanAcceptNewDelivery(tx, userId) {
-  const debt = await getCommissionDebt(tx, userId);
-  if (debt > 0) throw new CommissionDebtRequiredError(debt);
+  const [debt, debtLimit] = await Promise.all([
+    getCommissionDebt(tx, userId),
+    getDebtLimit(tx)
+  ]);
+  if (isCommissionDebtLimitReached(debt, debtLimit)) {
+    throw new CommissionDebtRequiredError(debt, debtLimit);
+  }
   return debt;
 }
 
-/// État dérivé (aucun statut en base) : un chauffeur sans dette peut accepter
-/// de nouvelles livraisons.
-export function canAcceptNewDeliveries(debt) {
-  return Number(debt || 0) <= 0;
+/// État dérivé (aucun statut en base), calculé avec la même règle que le verrou.
+export function canAcceptNewDeliveries(debt, debtLimit) {
+  return !isCommissionDebtLimitReached(debt, debtLimit);
 }
 
 /// Rembourse prioritairement la dette de commission à partir de nouveaux points
@@ -78,6 +100,7 @@ export function canAcceptNewDeliveries(debt) {
 /// réellement crédité est réduit de la part convertie en FCFA affectée au
 /// règlement (`cfaPerPoint`).
 export async function repayDebtFromPoints(tx, { userId, points, cfaPerPoint }) {
+  await lockWallet(tx, userId);
   const debt = await getCommissionDebt(tx, userId);
   if (debt <= 0 || points <= 0) return { netPoints: points, debtRepaid: 0, pointsForDebt: 0 };
 
@@ -113,6 +136,7 @@ export async function repayDebtFromPoints(tx, { userId, points, cfaPerPoint }) {
 /// financiers et trace une transaction cohérente
 /// (`balanceAfter = balanceBefore - montant débité`).
 export async function repayDebtFromWallet(tx, { userId, amount }) {
+  await lockWallet(tx, userId);
   const wallet = await tx.wallet.findUnique({ where: { userId } });
   const debt = Number(wallet?.commissionDebt ?? 0);
   const balance = Number(wallet?.balance ?? 0);
@@ -155,6 +179,7 @@ export async function repayDebtFromWallet(tx, { userId, amount }) {
 /// réglé est borné par le solde disponible et la dette restante. `amount <= 0`
 /// signifie « régler tout ce que le solde permet ».
 export async function settleCommissionDebtFromWallet(tx, { userId, amount }) {
+  await lockWallet(tx, userId);
   const wallet = await tx.wallet.findUnique({ where: { userId } });
   const debt = Number(wallet?.commissionDebt ?? 0);
   const balance = Number(wallet?.balance ?? 0);

@@ -31,6 +31,12 @@ export async function getClientPenaltyDebtTotal(tx, userId) {
   return Number(agg._sum.remaining ?? 0);
 }
 
+export function isClientDebtLimitReached(totalDebt, debtLimit) {
+  const total = Number(totalDebt || 0);
+  const limit = Number(debtLimit || 0);
+  return limit > 0 && total >= limit;
+}
+
 /// Lève une erreur métier si le client a atteint le seuil configuré de dette de
 /// pénalité. Aucun blocage arbitraire : `cancellation.clientDebtLimit` = 0 (défaut)
 /// n'impose aucune restriction. Le blocage n'intervient que si le seuil est > 0
@@ -39,7 +45,31 @@ export async function assertClientCanCreateParcel(tx, userId) {
   const limit = await getClientDebtLimit(tx);
   if (limit <= 0) return;
 
-  const total = await getClientPenaltyDebtTotal(tx, userId);
-  if (total >= limit) throw new CancellationDebtLimitExceededError(total);
+  // Les lignes payables sont jointes à l'erreur métier : le mobile peut
+  // proposer immédiatement le règlement sans inventer un identifiant de dette.
+  const debts = await tx.clientPenaltyDebt.findMany({
+    where: { userId, remaining: { gt: 0 } },
+    select: {
+      id: true,
+      parcelId: true,
+      amount: true,
+      remaining: true,
+      status: true,
+      reference: true
+    },
+    orderBy: { createdAt: 'asc' }
+  });
+  const total = debts.reduce((sum, debt) => sum + Number(debt.remaining ?? 0), 0);
+  if (isClientDebtLimitReached(total, limit)) {
+    throw new CancellationDebtLimitExceededError(
+      total,
+      limit,
+      debts.map((debt) => ({
+        ...debt,
+        amount: Number(debt.amount),
+        remaining: Number(debt.remaining)
+      }))
+    );
+  }
   return total;
 }

@@ -356,28 +356,22 @@ export const removePoints = handle('reputation.removePoints', async (req, res) =
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user) throw new NotFoundError('Utilisateur introuvable');
 
-  const currentScore = await prisma.score.findUnique({ where: { userId } });
-  const currentPoints = currentScore?.points || 0;
-
-  if (currentPoints - amount < 0) {
-    throw new ValidationError([{ path: 'body.amount', message: 'Solde de points insuffisant pour ce retrait' }]);
-  }
-
   const result = await prisma.$transaction(async (tx) => {
-    const score = await tx.score.upsert({
-      where: { userId },
-      update: {
+    // Le solde minimal fait partie du prédicat de débit. Cette écriture
+    // atomique empêche deux retraits administratifs simultanés de faire passer
+    // le compte en négatif.
+    const debited = await tx.score.updateMany({
+      where: { userId, points: { gte: amount } },
+      data: {
         points: { decrement: amount },
         totalSpent: { increment: amount },
         lastUpdated: new Date()
-      },
-      create: {
-        userId,
-        points: 0,
-        totalEarned: 0,
-        totalSpent: amount
       }
     });
+    if (debited.count !== 1) {
+      throw new ValidationError([{ path: 'body.amount', message: 'Solde de points insuffisant pour ce retrait' }]);
+    }
+    const score = await tx.score.findUnique({ where: { userId } });
 
     const transaction = await tx.scoreTransaction.create({
       data: {

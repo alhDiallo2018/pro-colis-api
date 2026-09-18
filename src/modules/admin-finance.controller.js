@@ -258,14 +258,27 @@ export const walletTransactions = handle('finance.walletTransactions', async (re
 });
 
 export const rechargeWallet = handle('finance.rechargeWallet', async (req, res) => {
-  const { userId, amount, type = 'deposit', description, parcelId, origin } = req.body;
+  // L'identifiant canonique est celui de l'URL REST. Le champ historique du
+  // corps reste accepté pour compatibilité avec d'anciens clients internes.
+  const userId = req.params.userId || req.body.userId;
+  const { amount, type = 'deposit', description, parcelId, origin } = req.body;
   const numericAmount = number(amount);
 
-  if (numericAmount <= 0) {
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
     throw new ValidationError([{ path: 'body.amount', message: 'Le montant doit etre positif' }]);
   }
 
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: { garage: true }
+  });
+  if (!user) throw new NotFoundError('Utilisateur introuvable');
+
   const result = await prisma.$transaction(async (tx) => {
+    // Sérialise les crédits du même portefeuille afin que `balanceBefore` et
+    // le ledger restent exacts, y compris lorsque deux admins créditent en même
+    // temps ou qu'un crédit rembourse immédiatement une dette de commission.
+    await tx.$queryRaw`SELECT "user_id" FROM "wallets" WHERE "user_id" = ${userId}::uuid FOR UPDATE`;
     const existing = await tx.wallet.findUnique({ where: { userId } });
     const balanceBefore = existing ? number(existing.balance) : 0;
 
@@ -336,13 +349,6 @@ export const rechargeWallet = handle('finance.rechargeWallet', async (req, res) 
     return { wallet: walletAfter, transaction, debtRepaid: repayment.debtRepaid };
   });
 
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    include: { garage: true }
-  });
-
-  if (!user) throw new NotFoundError('Utilisateur introuvable');
-
   return ok(res, {
     message: 'Portefeuille recharge',
     data: {
@@ -353,43 +359,46 @@ export const rechargeWallet = handle('finance.rechargeWallet', async (req, res) 
 });
 
 export const debitWallet = handle('finance.debitWallet', async (req, res) => {
-  const { userId, amount, type = 'adjustment', description, parcelId, origin } = req.body;
+  // Même contrat que la recharge : `/wallets/:userId/debit` fonctionne sans
+  // dupliquer l'identifiant dans le corps de la requête.
+  const userId = req.params.userId || req.body.userId;
+  const { amount, type = 'adjustment', description, parcelId, origin } = req.body;
   const numericAmount = number(amount);
 
-  if (numericAmount <= 0) {
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
     throw new ValidationError([{ path: 'body.amount', message: 'Le montant doit etre positif' }]);
   }
 
-  const result = await prisma.$transaction(async (tx) => {
-    const existing = await tx.wallet.findUnique({ where: { userId } });
-    const balanceBefore = existing ? number(existing.balance) : 0;
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: { garage: true }
+  });
+  if (!user) throw new NotFoundError('Utilisateur introuvable');
 
-    if (balanceBefore < numericAmount) {
+  const result = await prisma.$transaction(async (tx) => {
+    // Le prédicat `balance >= montant` fait partie de l'UPDATE : même si deux
+    // administrateurs débitent simultanément, un seul mouvement peut consommer
+    // le dernier solde disponible et le portefeuille ne devient jamais négatif.
+    const debited = await tx.wallet.updateMany({
+      where: { userId, balance: { gte: numericAmount } },
+      data: {
+        balance: { decrement: numericAmount },
+        totalSpent: { increment: numericAmount },
+        lastActivityAt: new Date()
+      }
+    });
+    if (debited.count !== 1) {
+      const current = await tx.wallet.findUnique({ where: { userId } });
+      const available = number(current?.balance);
       throw new ValidationError(
-        [{ path: 'body.amount', message: `Solde insuffisant (${balanceBefore} disponible)` }],
+        [{ path: 'body.amount', message: `Solde insuffisant (${available} disponible)` }],
         'Solde insuffisant'
       );
     }
 
-    const balanceAfter = balanceBefore - numericAmount;
-
-    const wallet = await tx.wallet.upsert({
-      where: { userId },
-      update: {
-        balance: { decrement: numericAmount },
-        totalSpent: { increment: numericAmount },
-        lastActivityAt: new Date()
-      },
-      create: {
-        userId,
-        balance: 0,
-        totalDeposited: 0,
-        totalSpent: numericAmount,
-        totalRefunded: 0,
-        status: 'active',
-        lastActivityAt: new Date()
-      }
-    });
+    const wallet = await tx.wallet.findUnique({ where: { userId } });
+    const balanceAfter = number(wallet.balance);
+    const balanceBefore = balanceAfter + numericAmount;
 
     const transaction = await tx.walletTransaction.create({
       data: {
@@ -428,13 +437,6 @@ export const debitWallet = handle('finance.debitWallet', async (req, res) => {
 
     return { wallet, transaction };
   });
-
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    include: { garage: true }
-  });
-
-  if (!user) throw new NotFoundError('Utilisateur introuvable');
 
   return ok(res, {
     message: 'Portefeuille debite',

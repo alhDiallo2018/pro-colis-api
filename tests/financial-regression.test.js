@@ -35,6 +35,12 @@ describe('régression financière - retraits', () => {
     });
   });
 
+  afterEach(async () => {
+    await prisma.systemConfig.deleteMany({
+      where: { key: { in: ['withdrawal.maxAmount', 'withdrawal.maxPerDay'] } }
+    });
+  });
+
   afterAll(async () => {
     await prisma.withdrawal.deleteMany({ where: { walletUserId: { in: userIds } } });
     await prisma.walletTransaction.deleteMany({ where: { walletUserId: { in: userIds } } });
@@ -172,6 +178,68 @@ describe('régression financière - retraits', () => {
       .set(driverAuth())
       .send({ amount: 2000, method: 'wave', phone: '123' });
     expect(res.status).toBe(422);
+  });
+
+  it('applique le montant maximum configuré', async () => {
+    await fundWallet(5000);
+    await prisma.systemConfig.upsert({
+      where: { key: 'withdrawal.maxAmount' },
+      update: { value: 1500 },
+      create: { key: 'withdrawal.maxAmount', value: 1500 }
+    });
+
+    const res = await request(app)
+      .post('/api/v1/driver/wallet/withdraw')
+      .set(driverAuth())
+      .send({ amount: 2000, method: 'wave', phone: `77${suffix}` });
+
+    expect(res.status).toBe(422);
+    expect(Number((await prisma.wallet.findUnique({ where: { userId: driverId } })).balance)).toBe(5000);
+  });
+
+  it('applique le cumul journalier configuré', async () => {
+    await fundWallet(10000);
+    const previous = await prisma.withdrawal.aggregate({
+      where: {
+        walletUserId: driverId,
+        status: { in: ['pending', 'processing', 'completed'] }
+      },
+      _sum: { amount: true }
+    });
+    const alreadyRequested = Number(previous._sum.amount ?? 0);
+    await prisma.systemConfig.upsert({
+      where: { key: 'withdrawal.maxPerDay' },
+      update: { value: alreadyRequested + 3000 },
+      create: { key: 'withdrawal.maxPerDay', value: alreadyRequested + 3000 }
+    });
+
+    await request(app)
+      .post('/api/v1/driver/wallet/withdraw')
+      .set(driverAuth())
+      .send({ amount: 2000, method: 'wave', phone: `77${suffix}` })
+      .expect(201);
+    const refused = await request(app)
+      .post('/api/v1/driver/wallet/withdraw')
+      .set(driverAuth())
+      .send({ amount: 1500, method: 'wave', phone: `77${suffix}` });
+
+    expect(refused.status).toBe(422);
+    expect(refused.body.error?.details?.[0]?.message).toContain('Plafond journalier');
+  });
+
+  it('sérialise deux retraits concurrents sans découvert', async () => {
+    await fundWallet(3000);
+    const send = () => request(app)
+      .post('/api/v1/driver/wallet/withdraw')
+      .set(driverAuth())
+      .send({ amount: 2000, method: 'wave', phone: `77${suffix}` });
+
+    const results = await Promise.all([send(), send()]);
+    expect(results.map((res) => res.status).sort()).toEqual([201, 422]);
+
+    const wallet = await prisma.wallet.findUnique({ where: { userId: driverId } });
+    expect(Number(wallet.balance)).toBe(1000);
+    expect(Number(wallet.pendingBalance)).toBe(2000);
   });
 });
 
@@ -345,6 +413,20 @@ describe('régression financière - dette de commission par le wallet (recharge)
     expect(Number(wallet.balance)).toBe(500);
     expect(Number(wallet.commissionDebt)).toBe(400);
   });
+
+  it('utilise le userId de l URL et sérialise les débits concurrents', async () => {
+    await setWallet(5000, 0);
+    const debit = () => request(app)
+      .post(`/api/v1/super-admin/wallets/${driverId}/debit`)
+      .set(authHeader(admin.accessToken))
+      .send({ amount: 4000 });
+
+    const results = await Promise.all([debit(), debit()]);
+    expect(results.map((res) => res.status).sort()).toEqual([200, 422]);
+
+    const wallet = await prisma.wallet.findUnique({ where: { userId: driverId } });
+    expect(Number(wallet.balance)).toBe(1000);
+  });
 });
 
 describe('régression financière - débit de points sans solde négatif', () => {
@@ -412,6 +494,18 @@ describe('régression financière - débit de points sans solde négatif', () =>
       .set(auth())
       .send({ userId: clientId, amount: 'abc' });
     expect(res.status).toBe(422);
+  });
+
+  it('sérialise deux débits concurrents sans solde négatif', async () => {
+    await prisma.score.update({ where: { userId: clientId }, data: { points: 30 } });
+    const debit = () => request(app)
+      .post('/api/v1/score/debit')
+      .set(auth())
+      .send({ userId: clientId, amount: 20 });
+
+    const results = await Promise.all([debit(), debit()]);
+    expect(results.map((res) => res.status).sort()).toEqual([200, 422]);
+    expect((await prisma.score.findUnique({ where: { userId: clientId } })).points).toBe(10);
   });
 });
 

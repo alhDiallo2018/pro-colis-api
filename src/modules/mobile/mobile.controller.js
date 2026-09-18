@@ -3,7 +3,7 @@ import { env } from '../../config/env.js';
 import { prisma } from '../../config/prisma.js';
 import { fail, ok } from '../../utils/api-response.js';
 import { isBrevoConfigured, sendNotificationEmail, sendNotificationSms, sendOtpSms } from '../../utils/brevo.js';
-import { assertCanAcceptNewDelivery, calculateCommission, calculateCommissionSync, canAcceptNewDeliveries, deductCashCommission, getCfaPerPoint, getCommitmentFee, getDeliveryPoints, settleCommissionDebtFromWallet } from '../../utils/commission.js';
+import { assertCanAcceptNewDelivery, calculateCommission, calculateCommissionSync, canAcceptNewDeliveries, deductCashCommission, getCfaPerPoint, getCommitmentFee, getDebtLimit, getDeliveryPoints, settleCommissionDebtFromWallet } from '../../utils/commission.js';
 import { assertClientCanCreateParcel } from '../../utils/client-debt.js';
 import { ConflictError, ForbiddenError, NotFoundError, ParcelAlreadyCancelledError, ValidationError, normalizeError } from '../../utils/errors.js';
 import {
@@ -62,6 +62,7 @@ const publicDriverSelect = {
   city: true,
   region: true,
   driverStatus: true,
+  isVerified: true,
   rating: true,
   completedDeliveries: true
 };
@@ -146,7 +147,13 @@ const parcelInclude = {
   // ✅ CORRECTION : driver remplacé par assignedDriver
   assignedDriver: { 
     include: { 
-      garage: true 
+      garage: true,
+      vehicles: {
+        where: { deletedAt: null },
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+        select: { type: true }
+      }
     } 
   },
   bids: { 
@@ -3333,7 +3340,7 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
   });
 
   const where = { walletUserId: req.user.id };
-  const [total, transactionRows] = await Promise.all([
+  const [total, transactionRows, debtLimit] = await Promise.all([
     prisma.walletTransaction.count({ where }),
     prisma.walletTransaction.findMany({
       where,
@@ -3343,7 +3350,8 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
       orderBy: { createdAt: 'desc' },
       skip,
       take: limit
-    })
+    }),
+    getDebtLimit(prisma)
   ]);
   const transactions = transactionRows.map(serializeDriverWalletTransaction);
   const serializedWallet = {
@@ -3358,7 +3366,8 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
     totalWithdrawn: number(wallet.totalWithdrawn),
     totalCommissionsPaid: number(wallet.totalCommissionsPaid),
     commissionDebt: number(wallet.commissionDebt),
-    canAcceptNewDeliveries: canAcceptNewDeliveries(wallet.commissionDebt),
+    debtLimit,
+    canAcceptNewDeliveries: canAcceptNewDeliveries(wallet.commissionDebt, debtLimit),
     isActive: wallet.status === 'active',
     status: wallet.status,
     lastDepositAt: wallet.lastDepositAt,
@@ -3394,6 +3403,12 @@ export const driverPayWalletDebt = handle('driver.payWalletDebt', async (req, re
     }
 
     const settlement = await settleCommissionDebtFromWallet(tx, { userId: req.user.id, amount });
+    // Une seconde requête concurrente peut arriver après les validations mais
+    // trouver la dette déjà soldée une fois le verrou acquis. Elle doit être
+    // refusée, pas annoncée comme un règlement réussi de montant zéro.
+    if (settlement.settled <= 0) {
+      throw new ValidationError([{ path: 'body.amount', message: 'Aucune dette de commission a regler' }]);
+    }
 
     const walletAfter = await tx.wallet.findUnique({ where: { userId: req.user.id } });
 
@@ -3413,6 +3428,7 @@ export const driverPayWalletDebt = handle('driver.payWalletDebt', async (req, re
   });
 
   const { settlement, walletAfter } = outcome;
+  const debtLimit = await getDebtLimit(prisma);
   return ok(res, {
     message: 'Dette de commission reglee',
     data: {
@@ -3420,18 +3436,35 @@ export const driverPayWalletDebt = handle('driver.payWalletDebt', async (req, re
       remainingDebt: settlement.remainingDebt,
       commissionDebt: number(walletAfter?.commissionDebt),
       balance: number(walletAfter?.balance),
-      canAcceptNewDeliveries: canAcceptNewDeliveries(number(walletAfter?.commissionDebt))
+      debtLimit,
+      canAcceptNewDeliveries: canAcceptNewDeliveries(
+        number(walletAfter?.commissionDebt),
+        debtLimit
+      )
     }
   });
 });
 
 export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
   const amount = Number(req.body.amount || 0);
-  // Minimum de retrait issu de la configuration (`withdrawal.minAmount`), gérable
-  // depuis l'admin. L'environnement ne sert plus que de repli si la clé est absente.
-  const minWithdrawal = Number(await getConfigValue('withdrawal.minAmount', env.PAYDUNYA_MIN_WITHDRAWAL));
-  if (!amount || amount < minWithdrawal) {
+  // Les trois limites sont administrables en base. Les valeurs max à 0
+  // signifient « sans plafond » ; seul le minimum possède un repli venant de
+  // l'environnement afin que le prestataire ne reçoive jamais un petit montant
+  // qu'il refuserait.
+  const [minRaw, maxRaw, dailyRaw] = await Promise.all([
+    getConfigValue('withdrawal.minAmount', env.PAYDUNYA_MIN_WITHDRAWAL),
+    getConfigValue('withdrawal.maxAmount', 0),
+    getConfigValue('withdrawal.maxPerDay', 0)
+  ]);
+  const minWithdrawal = Math.max(0, Number(minRaw) || 0);
+  const maxWithdrawal = Math.max(0, Number(maxRaw) || 0);
+  const maxPerDay = Math.max(0, Number(dailyRaw) || 0);
+
+  if (!Number.isFinite(amount) || !Number.isInteger(amount) || amount < minWithdrawal) {
     throw new ValidationError([{ path: 'body.amount', message: `Montant minimum ${minWithdrawal} FCFA` }]);
+  }
+  if (maxWithdrawal > 0 && amount > maxWithdrawal) {
+    throw new ValidationError([{ path: 'body.amount', message: `Montant maximum ${maxWithdrawal} FCFA` }]);
   }
 
   const method = req.body.method || 'wave';
@@ -3451,12 +3484,36 @@ export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
   const reference = `WTH-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 
   const result = await prisma.$transaction(async (tx) => {
-    // Le contrôle de solde et le gel sont atomiques : deux retraits concurrents
-    // ne peuvent pas faire passer le solde en dessous de zéro.
+    // Le verrou par portefeuille sérialise les retraits d'un même chauffeur.
+    // Il protège simultanément le solde et le plafond journalier : deux appels
+    // concurrents ne peuvent ni mettre le solde à découvert, ni dépasser la
+    // limite quotidienne après avoir lu le même total initial.
+    await tx.$queryRaw`SELECT "user_id" FROM "wallets" WHERE "user_id" = ${req.user.id}::uuid FOR UPDATE`;
+
     const walletRow = await tx.wallet.findUnique({ where: { userId: req.user.id } });
     const availableBalance = Number(walletRow?.balance ?? 0);
     if (availableBalance < amount) {
       throw new ValidationError([{ path: 'body.amount', message: `Solde insuffisant. Disponible: ${availableBalance} FCFA` }]);
+    }
+
+    if (maxPerDay > 0) {
+      const dayStart = new Date();
+      dayStart.setUTCHours(0, 0, 0, 0);
+      const daily = await tx.withdrawal.aggregate({
+        where: {
+          walletUserId: req.user.id,
+          requestedAt: { gte: dayStart },
+          status: { in: ['pending', 'processing', 'completed'] }
+        },
+        _sum: { amount: true }
+      });
+      const withdrawnToday = Number(daily._sum.amount ?? 0);
+      if (withdrawnToday + amount > maxPerDay) {
+        throw new ValidationError([{
+          path: 'body.amount',
+          message: `Plafond journalier ${maxPerDay} FCFA (deja demandes: ${withdrawnToday} FCFA)`
+        }]);
+      }
     }
 
     const froze = await tx.wallet.updateMany({
@@ -3470,6 +3527,8 @@ export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
     if (froze.count === 0) {
       throw new ValidationError([{ path: 'body.amount', message: `Solde insuffisant. Disponible: ${availableBalance} FCFA` }]);
     }
+    const walletAfterFreeze = await tx.wallet.findUnique({ where: { userId: req.user.id } });
+    const balanceAfterFreeze = Number(walletAfterFreeze.balance);
 
     const withdrawal = await tx.withdrawal.create({
       data: {
@@ -3485,8 +3544,8 @@ export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
     // Une seule transaction financière de retrait, créée ici avec le débit réel
     // du solde ; son statut évoluera ensuite (processing/completed/failed/cancelled).
     await createWithdrawalTransaction(tx, withdrawal, {
-      balanceBefore: availableBalance,
-      balanceAfter: availableBalance - amount
+      balanceBefore: balanceAfterFreeze + amount,
+      balanceAfter: balanceAfterFreeze
     });
 
     await tx.notification.create({
@@ -3655,23 +3714,26 @@ export const purchaseScoreWithWallet = handle('score.purchaseWallet', async (req
     const cfaPerPoint = await getCfaPerPoint(tx);
     const cfaAmount = Math.round(pointsRequested * cfaPerPoint);
 
-    const wallet = await tx.wallet.findUnique({ where: { userId: req.user.id } });
-    const balance = Number(wallet?.balance || 0);
-    if (balance < cfaAmount) {
-      throw new ValidationError([{ path: 'wallet', message: `Solde insuffisant. Disponible: ${balance} FCFA, requis: ${cfaAmount} FCFA (${pointsRequested} pts × ${cfaPerPoint} FCFA/pt)` }]);
-    }
-
-    await tx.wallet.update({
-      where: { userId: req.user.id },
+    // Débit conditionnel atomique : des achats concurrents ne peuvent pas
+    // dépenser deux fois le même solde wallet.
+    const debited = await tx.wallet.updateMany({
+      where: { userId: req.user.id, balance: { gte: cfaAmount } },
       data: { balance: { decrement: cfaAmount }, totalSpent: { increment: cfaAmount }, lastActivityAt: new Date() }
     });
+    if (debited.count !== 1) {
+      const current = await tx.wallet.findUnique({ where: { userId: req.user.id } });
+      const available = Number(current?.balance || 0);
+      throw new ValidationError([{ path: 'wallet', message: `Solde insuffisant. Disponible: ${available} FCFA, requis: ${cfaAmount} FCFA (${pointsRequested} pts × ${cfaPerPoint} FCFA/pt)` }]);
+    }
+    const wallet = await tx.wallet.findUnique({ where: { userId: req.user.id } });
+    const balanceAfter = Number(wallet.balance);
     await tx.walletTransaction.create({
       data: {
         walletUserId: req.user.id,
         type: 'commission',
         amount: cfaAmount,
-        balanceBefore: balance,
-        balanceAfter: balance - cfaAmount,
+        balanceBefore: balanceAfter + cfaAmount,
+        balanceAfter,
         description: `Achat de ${pointsRequested} points (${cfaPerPoint} FCFA/pt)`,
         origin: 'score_purchase',
         status: 'completed'
@@ -3703,30 +3765,41 @@ async function mutateScore({ userId, amount, type, description, parcelId, metada
 
   const delta = direction === 'debit' ? -magnitude : magnitude;
   return prisma.$transaction(async (tx) => {
-    const existing = await tx.score.findUnique({ where: { userId } });
-    const currentPoints = Number(existing?.points ?? 0);
-
-    // Aucune dette de points n'est autorisée : le débit ne peut pas dépasser
-    // le solde disponible.
-    if (direction === 'debit' && currentPoints < magnitude) {
-      throw new ValidationError([{ path: 'amount', message: `Points insuffisants (${currentPoints} disponibles, ${magnitude} requis)` }]);
-    }
-
-    const score = await tx.score.upsert({
-      where: { userId },
-      update: {
-        points: { increment: delta },
-        totalEarned: direction === 'credit' ? { increment: magnitude } : undefined,
-        totalSpent: direction === 'debit' ? { increment: magnitude } : undefined,
-        lastUpdated: new Date()
-      },
-      create: {
-        userId,
-        points: direction === 'credit' ? magnitude : 0,
-        totalEarned: direction === 'credit' ? magnitude : 0,
-        totalSpent: direction === 'debit' ? magnitude : 0
+    let score;
+    if (direction === 'debit') {
+      // Le contrôle du solde et le débit sont une seule instruction SQL. Deux
+      // requêtes concurrentes ne peuvent donc jamais créer un solde négatif en
+      // lisant toutes les deux l'ancien nombre de points.
+      const debited = await tx.score.updateMany({
+        where: { userId, points: { gte: magnitude } },
+        data: {
+          points: { decrement: magnitude },
+          totalSpent: { increment: magnitude },
+          lastUpdated: new Date()
+        }
+      });
+      if (debited.count !== 1) {
+        const current = await tx.score.findUnique({ where: { userId } });
+        const currentPoints = Number(current?.points ?? 0);
+        throw new ValidationError([{ path: 'amount', message: `Points insuffisants (${currentPoints} disponibles, ${magnitude} requis)` }]);
       }
-    });
+      score = await tx.score.findUnique({ where: { userId } });
+    } else {
+      score = await tx.score.upsert({
+        where: { userId },
+        update: {
+          points: { increment: delta },
+          totalEarned: { increment: magnitude },
+          lastUpdated: new Date()
+        },
+        create: {
+          userId,
+          points: magnitude,
+          totalEarned: magnitude,
+          totalSpent: 0
+        }
+      });
+    }
     const transaction = await tx.scoreTransaction.create({ data: { userId, amount: delta, type, parcelId, description, metadata } });
     return { score, transaction };
   });
@@ -4218,6 +4291,18 @@ export const messageThread = handle('messages.thread', async (req, res) => {
     prisma.message.findMany({
       where,
       orderBy: { createdAt: 'asc' }
+    }),
+    // La notification FCM miroir ne doit pas rester « non lue » après
+    // l'ouverture du fil, sinon la cloche et le badge divergent.
+    prisma.notification.updateMany({
+      where: {
+        userId: req.user.id,
+        senderId: peerId,
+        parcelId: parcelId === null ? null : parcelId,
+        type: 'message',
+        isRead: false
+      },
+      data: { isRead: true, readAt: new Date() }
     })
   ]);
 
@@ -4269,10 +4354,21 @@ export const conversations = handle('messages.conversations', async (req, res) =
 });
 
 export const readMessage = handle('messages.read', async (req, res) => {
-  const marked = await prisma.message.updateMany({
-    where: { id: req.params.messageId, receiverId: req.user.id, deletedAt: null },
-    data: { isRead: true, readAt: new Date() }
-  });
+  const [marked] = await prisma.$transaction([
+    prisma.message.updateMany({
+      where: { id: req.params.messageId, receiverId: req.user.id, deletedAt: null },
+      data: { isRead: true, readAt: new Date() }
+    }),
+    prisma.notification.updateMany({
+      where: {
+        userId: req.user.id,
+        type: 'message',
+        isRead: false,
+        data: { path: ['messageId'], equals: req.params.messageId }
+      },
+      data: { isRead: true, readAt: new Date() }
+    })
+  ]);
   if (marked.count === 0) {
     const exists = await prisma.message.findFirst({
       where: { id: req.params.messageId, receiverId: req.user.id, deletedAt: null },
@@ -4789,9 +4885,24 @@ export const searchParcels = handle('search.parcels', async (req, res) => {
 });
 
 export const searchDrivers = handle('drivers.search', async (req, res) => {
+  const verifiedOnly = ['true', '1'].includes(String(req.query.verifiedOnly || '').toLowerCase());
   const drivers = await prisma.user.findMany({
-    where: cleanUndefined({ role: 'driver', status: 'active', city: req.query.city, garageId: req.query.garageId }),
+    where: cleanUndefined({
+      role: 'driver',
+      status: 'active',
+      city: req.query.city,
+      garageId: req.query.garageId,
+      isVerified: verifiedOnly ? true : undefined
+    }),
     select: publicDriverSelect,
+    // La vérification prime, puis la réputation et l'expérience départagent
+    // les chauffeurs. Le nom stabilise l'ordre à scores identiques.
+    orderBy: [
+      { isVerified: 'desc' },
+      { rating: 'desc' },
+      { completedDeliveries: 'desc' },
+      { fullName: 'asc' }
+    ],
     take: Number(req.query.limit || 100)
   });
   return ok(res, { message: 'Chauffeurs', data: { drivers: drivers.map((d) => serializePublicDriver(d)) } });
@@ -4804,7 +4915,22 @@ export const publicDriverDetail = handle('drivers.detail', async (req, res) => {
 });
 
 export const garagePublicDrivers = handle('drivers.garage', async (req, res) => {
-  const drivers = await prisma.user.findMany({ where: { role: 'driver', garageId: req.params.garageId, status: 'active' }, select: publicDriverSelect });
+  const verifiedOnly = ['true', '1'].includes(String(req.query.verifiedOnly || '').toLowerCase());
+  const drivers = await prisma.user.findMany({
+    where: {
+      role: 'driver',
+      garageId: req.params.garageId,
+      status: 'active',
+      ...(verifiedOnly ? { isVerified: true } : {})
+    },
+    select: publicDriverSelect,
+    orderBy: [
+      { isVerified: 'desc' },
+      { rating: 'desc' },
+      { completedDeliveries: 'desc' },
+      { fullName: 'asc' }
+    ]
+  });
   return ok(res, { message: 'Chauffeurs zone', data: { drivers: drivers.map((d) => serializePublicDriver(d)) } });
 });
 
@@ -4847,6 +4973,12 @@ export const saveDriverLocation = handle('driver.location', async (req, res) => 
   if (!parcel || parcel.deletedAt) throw new NotFoundError('Colis introuvable');
   if (parcel.assignedDriverId !== req.user.id) {
     throw new ForbiddenError("Vous n'êtes pas assigné à ce colis");
+  }
+  // Une position ne doit être persistée que pendant la fenêtre où le suivi est
+  // réellement actif. Cela évite qu'un mobile en retard ou resté ouvert publie
+  // la position privée du chauffeur avant la prise en charge ou après livraison.
+  if (!GPS_LIVE_PARCEL_STATUSES.includes(parcel.status)) {
+    throw new ConflictError("Le suivi GPS n'est pas actif pour le statut actuel du colis");
   }
 
   const location = await prisma.driverLocation.create({
@@ -5893,14 +6025,15 @@ export const driverStats = handle('driver.stats', async (req, res) => {
   // ✅ On utilise req.user.id directement, pas besoin de driverId
   const driverId = req.user.id;
 
-  const [assignedParcels, activeParcels, completedDeliveries, score, pendingBids, openAdvertisements, wallet] = await Promise.all([
+  const [assignedParcels, activeParcels, completedDeliveries, score, pendingBids, openAdvertisements, wallet, debtLimit] = await Promise.all([
     prisma.parcel.count({ where: { assignedDriverId: driverId } }),
     prisma.parcel.count({ where: { assignedDriverId: driverId, status: { in: ACTIVE_PARCEL_STATUSES } } }),
     prisma.parcel.count({ where: { assignedDriverId: driverId, status: 'delivered' } }),
     prisma.score.findUnique({ where: { userId: driverId } }),
     prisma.bid.count({ where: { driverId: driverId, status: 'pending' } }),
     prisma.advertisement.count({ where: { driverId: driverId, status: 'open' } }),
-    prisma.wallet.findUnique({ where: { userId: driverId } })
+    prisma.wallet.findUnique({ where: { userId: driverId } }),
+    getDebtLimit(prisma)
   ]);
 
   // Récupérer le véhicule du chauffeur
@@ -5928,7 +6061,8 @@ export const driverStats = handle('driver.stats', async (req, res) => {
         rating: Number(req.user.rating || 0),
         scoreBalance: score?.points || 0,
         commissionDebt: number(wallet?.commissionDebt),
-        canAcceptNewDeliveries: canAcceptNewDeliveries(wallet?.commissionDebt),
+        debtLimit,
+        canAcceptNewDeliveries: canAcceptNewDeliveries(wallet?.commissionDebt, debtLimit),
         pendingBids,
         openAdvertisements,
         proposals,
@@ -6410,9 +6544,9 @@ async function readPublicConfig() {
     return typeof raw === 'object' ? raw.value ?? fallback : raw;
   };
 
-  // Contenu d'aide : stocke en JSON dans `systemConfig` (`help.topics` /
-  // `help.faqs`), avec un contenu par defaut tant que l'administrateur n'a
-  // rien personnalise. Le mobile n'a donc plus rien de code en dur.
+  // Contenu d'aide stocké en JSON dans `systemConfig` (`help.topics` /
+  // `help.faqs`). Une configuration absente renvoie une liste vide : l'API ne
+  // doit jamais inventer des coordonnées de support ou du contenu éditorial.
   const listValue = (key, fallback) => {
     const raw = map[key];
     if (Array.isArray(raw)) return raw.length ? raw : fallback;
@@ -6429,54 +6563,6 @@ async function readPublicConfig() {
       ? packsRaw.value.map(Number).filter((n) => Number.isFinite(n) && n > 0)
       : [];
 
-  const defaultHelpTopics = [
-    { icon: 'inventory', title: 'Créer et envoyer un colis' },
-    { icon: 'sell', title: 'Libre service et offres' },
-    { icon: 'qr_code', title: 'Suivi et livraison' },
-    { icon: 'wallet', title: 'Points et paiements' },
-    { icon: 'shield', title: 'Sécurité et litiges' },
-    { icon: 'person', title: 'Mon compte' }
-  ];
-
-  const defaultHelpFaqs = [
-    {
-      question: 'Comment fonctionne le libre service ?',
-      answer: 'Vous publiez votre colis, des chauffeurs vérifiés font des offres, vous acceptez celle qui vous convient.'
-    },
-    {
-      question: 'Que se passe-t-il à la livraison ?',
-      answer: 'Le destinataire communique un code PIN au chauffeur pour confirmer la remise du colis.'
-    },
-    {
-      question: 'Comment sont calculés les points ?',
-      answer: 'Chaque colis livré crédite des points utilisables en réductions sur vos prochains envois.'
-    },
-    {
-      question: 'Comment payer mes envois ?',
-      answer: 'Vous pouvez payer par carte, Orange Money, Wave, Free Money ou en espèces. Le paiement est débité une fois le colis livré.'
-    },
-    {
-      question: 'Comment suivre mon colis ?',
-      answer: 'Connectez-vous à votre compte et allez dans « Suivi ». Entrez votre numéro de suivi pour voir les statuts en temps réel.'
-    },
-    {
-      question: 'Puis-je annuler un colis ?',
-      answer: 'Oui, vous pouvez annuler un colis tant qu\'il n\'a pas encore été confirmé par un chauffeur. Au-delà, contactez notre support.'
-    },
-    {
-      question: 'Comment devenir chauffeur ?',
-      answer: 'Créez un compte en sélectionnant le rôle « Conduire », remplissez votre profil, ajoutez vos documents et votre véhicule. Notre équipe vérifiera vos informations.'
-    },
-    {
-      question: 'Comment sont protégés mes paiements ?',
-      answer: 'Tous les paiements sont sécurisés via PayDunya. Les fonds sont conservés sur un compte séquestre jusqu\'à la confirmation de livraison.'
-    },
-    {
-      question: 'Que faire en cas de colis endommagé ?',
-      answer: 'Contactez notre support dans les 48 heures avec des photos du colis et votre numéro de suivi. Nous traiterons votre réclamation rapidement.'
-    }
-  ];
-
   return {
     commission: commissionCfg
       ? {
@@ -6484,7 +6570,7 @@ async function readPublicConfig() {
           minAmount: Number(commissionCfg.minAmount),
           maxAmount: Number(commissionCfg.maxAmount)
         }
-      : { percentage: 5, minAmount: 100, maxAmount: 500 },
+      : { percentage: 0, minAmount: 0, maxAmount: 0 },
     points: {
       deliveryCompleted: Number(value('score.deliveryCompleted', 0)),
       signupBonus: Number(value('score.signupBonus', 0)),
@@ -6493,23 +6579,23 @@ async function readPublicConfig() {
       packs
     },
     withdrawal: {
-      minAmount: Number(value('withdrawal.minAmount', 500)),
+      minAmount: Number(value('withdrawal.minAmount', env.PAYDUNYA_MIN_WITHDRAWAL)),
       maxAmount: Number(value('withdrawal.maxAmount', 0)),
       maxPerDay: Number(value('withdrawal.maxPerDay', 0))
     },
     insufficientPolicy: String(value('commission.insufficient_rule', 'block')),
     debtLimit: Number(value('commission.debtLimit', 0)),
     support: {
-      phone: String(value('support.phone', '+221 33 123 45 67')),
-      email: String(value('support.email', 'support-commercial@sendprocolis.com')),
-      technicalEmail: String(value('support.technicalEmail', 'support-technic@sendprocolis.com')),
-      technicalPhone: String(value('support.technicalPhone', '+221 76 516 27 96')),
-      responseTime: String(value('support.responseTime', '24h')),
-      availability: String(value('support.availability', '7j/7'))
+      phone: String(value('support.phone', '')),
+      email: String(value('support.email', '')),
+      technicalEmail: String(value('support.technicalEmail', '')),
+      technicalPhone: String(value('support.technicalPhone', '')),
+      responseTime: String(value('support.responseTime', '')),
+      availability: String(value('support.availability', ''))
     },
     help: {
-      topics: listValue('help.topics', defaultHelpTopics),
-      faqs: listValue('help.faqs', defaultHelpFaqs)
+      topics: listValue('help.topics', []),
+      faqs: listValue('help.faqs', [])
     },
     // Motifs d'annulation (value/label uniquement) : les règles financières
     // restent côté serveur, seul le libellé est exposé pour l'affichage.

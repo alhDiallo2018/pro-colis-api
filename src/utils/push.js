@@ -184,7 +184,11 @@ function stringifyData(data) {
  */
 export async function countUnreadForUser(userId) {
   const [notifications, messages] = await Promise.all([
-    prisma.notification.count({ where: { userId, isRead: false } }),
+    // Un message crée aussi une Notification pour déclencher FCM. La compter
+    // ici en plus de la ligne Message afficherait 2 pour un seul message.
+    prisma.notification.count({
+      where: { userId, isRead: false, type: { not: 'message' } }
+    }),
     prisma.message.count({ where: { receiverId: userId, isRead: false, deletedAt: null } })
   ]);
   return { notifications, messages, total: notifications + messages };

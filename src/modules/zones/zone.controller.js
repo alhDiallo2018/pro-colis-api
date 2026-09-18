@@ -4,6 +4,7 @@ import { ok, fail } from '../../utils/api-response.js';
 import { getPagination, paginationMeta } from '../../utils/pagination.js';
 import { NotFoundError, ValidationError, normalizeError } from '../../utils/errors.js';
 import { serializePublicDriver } from '../../utils/mobile-serializers.js';
+import { meaningfulLocationLabel } from '../../utils/location-label.js';
 
 const DEFAULT_RADIUS_KM = 30;
 
@@ -17,6 +18,7 @@ const publicDriverSelect = {
   city: true,
   region: true,
   driverStatus: true,
+  isVerified: true,
   rating: true,
   completedDeliveries: true
 };
@@ -396,14 +398,33 @@ export const resolveZone = handle('zones.resolve', async (req, res) => {
     });
   }
 
+  // Une création hors des zones connues doit porter une vraie localité. On
+  // accepte plusieurs niveaux administratifs, mais jamais « Ma position » ni
+  // une paire lat/lng qui rendrait la zone incompréhensible dans les listes.
+  const resolvedName =
+    meaningfulLocationLabel(name) ||
+    meaningfulLocationLabel(city) ||
+    meaningfulLocationLabel(displayName) ||
+    meaningfulLocationLabel(region) ||
+    meaningfulLocationLabel(country);
+  if (!resolvedName) {
+    throw new ValidationError([
+      {
+        path: 'body.name',
+        message: 'Un nom de localité lisible est requis ; les coordonnées seules sont refusées'
+      }
+    ]);
+  }
+  const resolvedDisplayName = meaningfulLocationLabel(displayName) || resolvedName;
+
   // 3) Création à la volée en attente de validation. Rattachement best-effort au
   // plus proche parent approuvé (≤ 150 km) pour amorcer la hiérarchie.
   const parentId = nearestAny && nearestAnyDist <= 150 ? nearestAny.id : undefined;
   const { zone: created, garage } = await prisma.$transaction(async (tx) => {
     const zone = await tx.zone.create({
       data: cleanUndefined({
-        name: name || displayName || city || 'Zone',
-        displayName: displayName || name,
+        name: resolvedName,
+        displayName: resolvedDisplayName,
         placeId: placeId || undefined,
         type: 'CIRCLE',
         country,
@@ -874,10 +895,21 @@ export const zonePublicDrivers = handle('zones.publicDrivers', async (req, res) 
   if (zone) filters.push({ driverZones: { some: { zoneId: zone.id } } });
   if (garageId) filters.push({ garageId });
 
+  const verifiedOnly = ['true', '1'].includes(String(req.query.verifiedOnly || '').toLowerCase());
   const drivers = await prisma.user.findMany({
-    where: { role: 'driver', status: 'active', OR: filters },
+    where: {
+      role: 'driver',
+      status: 'active',
+      OR: filters,
+      ...(verifiedOnly ? { isVerified: true } : {})
+    },
     select: publicDriverSelect,
-    orderBy: { fullName: 'asc' }
+    orderBy: [
+      { isVerified: 'desc' },
+      { rating: 'desc' },
+      { completedDeliveries: 'desc' },
+      { fullName: 'asc' }
+    ]
   });
 
   return ok(res, {

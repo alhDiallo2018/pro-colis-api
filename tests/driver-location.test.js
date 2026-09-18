@@ -55,6 +55,10 @@ describe('driver location (GPS tracking)', () => {
     otherDriverToken = other.accessToken;
     driverId = driver.user.id;
     otherDriverId = other.user.id;
+    await prisma.user.update({
+      where: { id: driverId },
+      data: { isVerified: true, rating: 4.7 }
+    });
   });
 
   afterAll(async () => {
@@ -120,6 +124,24 @@ describe('driver location (GPS tracking)', () => {
     expect(count).toBe(0);
   });
 
+  // Le mobile peut envoyer une dernière trame après un changement de statut :
+  // le backend doit la refuser pour ne pas conserver une position privée hors
+  // de la fenêtre de transport.
+  it.each(['confirmed', 'delivered', 'cancelled'])(
+    'refuses a position while parcel status is %s',
+    async (status) => {
+      const parcel = await createParcel(status, driverId);
+
+      const res = await request(app)
+        .post('/api/v1/driver/location')
+        .set('Authorization', `Bearer ${driverToken}`)
+        .send({ parcelId: parcel.id, latitude: 14.6928, longitude: -17.4467, accuracy: 10 });
+
+      expect(res.status).toBe(409);
+      expect(await prisma.driverLocation.count({ where: { parcelId: parcel.id } })).toBe(0);
+    }
+  );
+
   // Cas 3 — suivi avec position : available=true avec coordonnees reelles.
   it('exposes the last position on the public tracking endpoint', async () => {
     const parcel = await createParcel('in_transit', driverId);
@@ -139,6 +161,10 @@ describe('driver location (GPS tracking)', () => {
     expect(location.longitude).toBe(-17.4501);
     expect(location.accuracy).toBe(12);
     expect(location.updatedAt).toBeTruthy();
+    // Le client reçoit seulement les attributs publics utiles du chauffeur,
+    // sans identité ou donnée KYC sensible.
+    expect(res.body.parcel.driver.isVerified).toBe(true);
+    expect(Number(res.body.parcel.driver.rating)).toBe(4.7);
   });
 
   // Cas 4 — suivi sans position : available=false.

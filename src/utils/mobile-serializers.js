@@ -110,6 +110,9 @@ export function serializePublicDriver(driver, { detailed = false } = {}) {
     city: driver.city ?? null,
     region: driver.region ?? null,
     driverStatus: driver.driverStatus ?? null,
+    // Le statut de vérification est public et permet aux clients de privilégier
+    // les chauffeurs dont l'identité a été validée, sans exposer le KYC.
+    isVerified: driver.isVerified === true,
     rating: decimalToString(driver.rating),
     completedDeliveries: driver.completedDeliveries ?? 0
   };
@@ -486,8 +489,18 @@ export function serializeParcel(parcel, options = {}) {
 export function serializePublicTrackingParcel(parcel) {
   if (!parcel) return null;
 
+  const vehicle = Array.isArray(parcel.assignedDriver?.vehicles)
+    ? parcel.assignedDriver.vehicles[0]
+    : null;
   const driver = parcel.assignedDriver
-    ? { id: parcel.assignedDriver.id, name: parcel.assignedDriver.fullName }
+    ? {
+        id: parcel.assignedDriver.id,
+        name: parcel.assignedDriver.fullName,
+        profilePhoto: parcel.assignedDriver.profilePhoto ?? null,
+        rating: decimalToString(parcel.assignedDriver.rating),
+        isVerified: parcel.assignedDriver.isVerified === true,
+        vehicleType: vehicle?.type ?? null
+      }
     : null;
 
   return {

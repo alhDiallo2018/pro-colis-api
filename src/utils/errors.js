@@ -45,17 +45,24 @@ export class ValidationError extends AppError {
  * montant dû afin que le mobile affiche un message métier explicite.
  */
 export class CommissionDebtRequiredError extends AppError {
-  constructor(debtAmount) {
+  constructor(debtAmount, debtLimit) {
     const amount = Number(debtAmount || 0);
+    const limit = Number(debtLimit || 0);
     super(
-      `Vous avez une dette de commission de ${amount} FCFA. Veuillez la régler avant d'accepter un nouveau colis.`,
+      `Votre dette de commission de ${amount} FCFA a atteint le seuil de ${limit} FCFA. Veuillez la régler avant d'accepter un nouveau colis.`,
       {
         statusCode: 403,
         code: 'COMMISSION_DEBT_REQUIRED',
-        details: [{ path: 'commissionDebt', message: `Dette impayée : ${amount} FCFA` }]
+        details: [{
+          path: 'commissionDebt',
+          message: `Dette impayée : ${amount} FCFA (seuil : ${limit} FCFA)`,
+          debtAmount: amount,
+          debtLimit: limit
+        }]
       }
     );
     this.commissionDebt = amount;
+    this.debtLimit = limit;
   }
 }
 
@@ -131,17 +138,25 @@ export class CancellationExemptReasonForbiddenError extends AppError {
  * que sa dette n'est pas réglée. Expose le montant dû pour un message métier.
  */
 export class CancellationDebtLimitExceededError extends AppError {
-  constructor(debtAmount) {
+  constructor(debtAmount, debtLimit, debts = []) {
     const amount = Number(debtAmount || 0);
+    const limit = Number(debtLimit || 0);
     super(
-      `Vous avez ${amount} FCFA de pénalités d'annulation impayées. Veuillez les régler avant de créer un nouveau colis.`,
+      `Vos pénalités impayées de ${amount} FCFA ont atteint le seuil de ${limit} FCFA. Veuillez les régler avant de créer un nouveau colis.`,
       {
         statusCode: 403,
         code: 'CANCELLATION_DEBT_LIMIT_EXCEEDED',
-        details: [{ path: 'clientDebt', message: `Pénalités impayées : ${amount} FCFA` }]
+        details: [{
+          path: 'clientDebt',
+          message: `Pénalités impayées : ${amount} FCFA (seuil : ${limit} FCFA)`,
+          debtAmount: amount,
+          debtLimit: limit,
+          debts
+        }]
       }
     );
     this.clientDebt = amount;
+    this.debtLimit = limit;
   }
 }
 

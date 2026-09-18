@@ -45,6 +45,7 @@ describe('public drivers & bids — driver PII never exposed', () => {
         email: SENTINEL_EMAIL,
         address: SENTINEL_ADDRESS,
         gender: SENTINEL_GENDER,
+        isVerified: true,
         lastLogin: SENTINEL_LAST_LOGIN,
         lastActiveAt: SENTINEL_LAST_LOGIN
       }
@@ -105,6 +106,14 @@ describe('public drivers & bids — driver PII never exposed', () => {
     expect(driver).toHaveProperty('rating');
     expect(driver).toHaveProperty('completedDeliveries');
     expect(driver).toHaveProperty('driverStatus');
+    expect(driver.isVerified).toBe(true);
+  });
+
+  it('searchDrivers can hide non-verified drivers explicitly', async () => {
+    const res = await request(app).get('/api/v1/public/drivers/search?verifiedOnly=true');
+    expect(res.status).toBe(200);
+    expect(res.body.drivers.length).toBeGreaterThan(0);
+    expect(res.body.drivers.every((driver) => driver.isVerified === true)).toBe(true);
   });
 
   // ------------------------------------------------------------

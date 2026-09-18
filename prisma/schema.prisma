@@ -609,7 +609,7 @@ model Wallet {
   // Dette de commission non réglée (FCFA) : alimentée quand un chauffeur
   // effectue une livraison espèces sans solde suffisant et que la règle
   // configurée (`commission.insufficient_rule`) autorise la dette. La limite
-  // `commission.debtLimit` (0 = dette interdite) est appliquée par le backend.
+  // `commission.debtLimit` (0 = aucune limite) est appliquée par le backend.
   commissionDebt      Decimal             @default(0) @map("commission_debt") @db.Decimal(12, 2)
   status               WalletStatus        @default(active)
   lastDepositAt        DateTime?           @map("last_deposit_at") @db.Timestamptz

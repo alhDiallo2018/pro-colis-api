@@ -218,7 +218,8 @@ describe('commission debt management', () => {
     expect(Number(wallet.balance)).toBe(4500);
   });
 
-  it('case 3: dette > 0 → nouvelle acceptation refusée avec code stable', async () => {
+  it('case 3: dette égale au seuil → nouvelle acceptation refusée avec code stable', async () => {
+    await setDebtLimit(500);
     await setDriverWallet(driverId, { balance: 0, commissionDebt: 500 });
     const parcel = await createProposalParcel();
 
@@ -229,7 +230,8 @@ describe('commission debt management', () => {
 
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('COMMISSION_DEBT_REQUIRED');
-    expect(res.body.message).toContain('dette de commission de 500 FCFA');
+    expect(res.body.message).toContain('atteint le seuil de 500 FCFA');
+    expect(res.body.error.details[0].debtLimit).toBe(500);
 
     // Aucune modification partielle : le colis reste non assigné.
     const persisted = await prisma.parcel.findUnique({ where: { id: parcel.id } });
@@ -273,8 +275,8 @@ describe('commission debt management', () => {
     expect(persisted.paymentStatus).toBeNull();
   });
 
-  it('case 6: remboursement partiel → dette résiduelle, acceptations toujours bloquées', async () => {
-    await setDebtLimit(0);
+  it('case 6: remboursement partiel → dette résiduelle sous le seuil', async () => {
+    await setDebtLimit(1000);
     await setDriverWallet(driverId, { balance: 0, commissionDebt: 1000 });
     await setDriverScore(driverId, 0);
 
@@ -329,6 +331,7 @@ describe('commission debt management', () => {
   });
 
   it('case 9: règlement de la dette depuis le solde wallet', async () => {
+    await setDebtLimit(500);
     await setDriverWallet(driverId, { balance: 4500, commissionDebt: 500 });
     await setDriverScore(driverId, 0);
 
@@ -349,6 +352,7 @@ describe('commission debt management', () => {
   });
 
   it('case 10: règlement partiel borné par le solde disponible', async () => {
+    await setDebtLimit(500);
     await setDriverWallet(driverId, { balance: 300, commissionDebt: 500 });
     await setDriverScore(driverId, 0);
 
@@ -360,7 +364,9 @@ describe('commission debt management', () => {
     expect(res.status).toBe(200);
     expect(res.body.debtRepaid).toBe(300);
     expect(res.body.commissionDebt).toBe(200);
-    expect(res.body.canAcceptNewDeliveries).toBe(false);
+    // Le règlement ramène la dette sous le seuil : les nouvelles missions sont
+    // de nouveau possibles, même si un reliquat reste à payer.
+    expect(res.body.canAcceptNewDeliveries).toBe(true);
 
     const wallet = await getWallet(driverId);
     expect(Number(wallet.commissionDebt)).toBe(200);
@@ -399,5 +405,26 @@ describe('commission debt management', () => {
     const wallet = await getWallet(driverId);
     expect(Number(wallet.commissionDebt)).toBe(0);
     expect(Number(wallet.balance)).toBe(1000);
+  });
+
+  it('case 13: deux règlements concurrents ne consomment la dette qu une fois', async () => {
+    await setDriverWallet(driverId, { balance: 1000, commissionDebt: 1000 });
+    await setDriverScore(driverId, 0);
+    const pay = () => request(app)
+      .post('/api/v1/driver/wallet/pay-debt')
+      .set(driverAuth())
+      .send({});
+
+    const results = await Promise.all([pay(), pay()]);
+    expect(results.map((res) => res.status).sort()).toEqual([200, 422]);
+
+    const wallet = await getWallet(driverId);
+    expect(Number(wallet.commissionDebt)).toBe(0);
+    expect(Number(wallet.balance)).toBe(0);
+
+    const payments = await prisma.walletTransaction.findMany({
+      where: { walletUserId: driverId, type: 'commission', origin: 'debt_repayment' }
+    });
+    expect(payments.filter((tx) => Number(tx.amount) === 1000)).toHaveLength(1);
   });
 });
