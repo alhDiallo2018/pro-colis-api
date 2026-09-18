@@ -1,6 +1,9 @@
 import { z } from 'zod';
 
-const roleSchema = z.enum(['client', 'driver', 'admin', 'super_admin']);
+// Seuls les rôles publics sont créables via l'inscription publique : CLIENT et
+// DRIVER. Les rôles staff (admin, super_admin, support, support_technique,
+// support_commercial) sont provisionnés par un super admin, jamais par le client.
+const roleSchema = z.enum(['client', 'driver']);
 const pinSchema = z.string().regex(/^\d{6}$/, 'Le code PIN doit contenir exactement 6 chiffres');
 
 export const registerSchema = z.object({

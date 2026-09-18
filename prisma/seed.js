@@ -1,3 +1,12 @@
+// Seed de DEMONSTRATION — STRICTEMENT DEV/TEST.
+//
+// Il cree des comptes factices (PIN 123456, mot de passe Password123!, emails
+// @procolis.test) pour developper et tester l'application. Ces identifiants ne
+// doivent JAMAIS exister en production : le script refuse de s'executer quand
+// NODE_ENV=production. Pour creer un vrai compte privilegie en production,
+// utiliser `npm run seed:super-admin`, qui lit ses identifiants depuis les
+// variables d'environnement et refuse les PIN/mots de passe trop faibles.
+
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 
@@ -789,13 +798,45 @@ async function seedScoreConfigs() {
     { key: 'pricing.urgentFee', value: 1000 },
     { key: 'pricing.insuranceFee', value: 1000 },
     { key: 'score.cfaPerPoint', value: 1 },
-    { key: 'score.deliveryCompleted', value: 120 },
+    { key: 'score.deliveryCompleted', value: 0 },
     { key: 'score.commitmentFee', value: 1 },
+    { key: 'score.packs', value: [500, 1000, 3000, 5000, 10000] },
     { key: 'score.standardThreshold', value: 100 },
     { key: 'score.premiumThreshold', value: 500 },
     { key: 'score.eliteThreshold', value: 1000 },
     { key: 'score.signupBonus', value: 0 },
-    { key: 'commission.insufficient_rule', value: 'block' }
+    { key: 'commission.insufficient_rule', value: 'block' },
+    { key: 'commission.debtLimit', value: 0 },
+    { key: 'cancellation.allowedStatuses', value: ['pending', 'free', 'proposal_sent', 'negotiating', 'confirmed', 'picked_up', 'in_transit', 'arrived', 'out_for_delivery'] },
+    { key: 'cancellation.freeCancellationStatuses', value: ['pending', 'free', 'proposal_sent', 'negotiating'] },
+    { key: 'cancellation.penalty.percentage', value: 10 },
+    { key: 'cancellation.penalty.minAmount', value: 500 },
+    { key: 'cancellation.penalty.maxAmount', value: 5000 },
+    { key: 'cancellation.penalty.clientSharePercent', value: 50 },
+    { key: 'cancellation.fee.paydunyaPercentage', value: 2 },
+    { key: 'cancellation.fee.technicalFixed', value: 200 },
+    { key: 'cancellation.fee.technicalPercentage', value: 0 },
+    { key: 'cancellation.reasons', value: [
+      { value: 'client_change_of_mind', label: 'Changement d’avis', responsibility: 'client', exempt: false },
+      { value: 'driver_no_show', label: 'Chauffeur ne s’est pas présenté', responsibility: 'driver', exempt: false },
+      { value: 'mutual_agreement', label: 'Accord mutuel', responsibility: 'shared', exempt: false },
+      { value: 'force_majeure', label: 'Force majeure', responsibility: 'exempt', exempt: true }
+    ] },
+    { key: 'support.phone', value: '+221 33 123 45 67' },
+    { key: 'support.email', value: 'support-commercial@sendprocolis.com' },
+    { key: 'support.technicalEmail', value: 'support-technic@sendprocolis.com' },
+    { key: 'support.technicalPhone', value: '+221 76 516 27 96' },
+    { key: 'legal.companyName', value: 'SendProColis' },
+    { key: 'legal.address', value: 'Dakar, Sénégal' },
+    { key: 'legal.registrationNumber', value: '' },
+    { key: 'legal.cdpAuthorization', value: '' },
+    { key: 'legal.privacyEmail', value: '' },
+    { key: 'legal.publisherName', value: 'Serigne Fallou Ndao' },
+    { key: 'legal.hostName', value: '' },
+    { key: 'legal.directorName', value: 'Serigne Fallou Ndao' },
+    { key: 'legal.directorEmail', value: 'fallou.edu.uad@gmail.com' },
+    { key: 'legal.technicalDirectorName', value: 'Thierno Alhassane Diallo Garki' },
+    { key: 'legal.technicalDirectorEmail', value: 'dialloalhassanegarki2018@gmail.com' }
   ];
 
   for (const cfg of configs) {
@@ -808,6 +849,12 @@ async function seedScoreConfigs() {
 }
 
 async function main() {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'Seed de demonstration refuse en production : il cree des comptes factices avec des identifiants connus (PIN 123456 / Password123!). Utiliser `npm run seed:super-admin` pour un compte reel.'
+    );
+  }
+
   const garages = await seedGarages();
   const users = await seedUsers(garages.dakar);
   await seedProfileUsage({ ...users, garages });

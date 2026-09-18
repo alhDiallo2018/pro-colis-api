@@ -31,6 +31,7 @@ mobileRouter.post('/client/parcels/create', authenticate, requireRoles('client')
 mobileRouter.get('/client/parcels/:parcelId', authenticate, requireRoles('client'), mobileController.getParcelDetail);
 mobileRouter.put('/client/parcels/:parcelId', authenticate, requireRoles('client'), mobileController.updateParcel);
 mobileRouter.get('/client/parcels/:parcelId/delivery-code', authenticate, requireRoles('client'), mobileController.clientDeliveryCode);
+mobileRouter.get('/client/parcels/:parcelId/cancel/quote', authenticate, requireRoles('client'), mobileController.getCancellationQuote);
 mobileRouter.post('/client/parcels/:parcelId/cancel', authenticate, requireRoles('client'), mobileController.cancelParcel);
 
 // ============================================================
@@ -164,6 +165,10 @@ mobileRouter.put('/driver/parcels/:parcelId/arrived', authenticate, requireRoles
 mobileRouter.put('/driver/parcels/:parcelId/out-for-delivery', authenticate, requireRoles('driver'), mobileController.driverOutForDelivery);
 mobileRouter.put('/driver/parcels/:parcelId/deliver', authenticate, requireRoles('driver'), mobileController.driverDeliver);
 
+// Annulation d'une mission engagée par le chauffeur : même moteur central que
+// l'annulation client (responsabilité calculée côté serveur).
+mobileRouter.post('/driver/parcels/:parcelId/cancel', authenticate, requireRoles('driver'), mobileController.driverCancelParcel);
+
 // ============================================================
 // DRIVER - CASH & FINANCES
 // ============================================================
@@ -222,6 +227,7 @@ mobileRouter.get('/super-admin/export', authenticate, supportReadRoles, mobileCo
 mobileRouter.get('/super-admin/audit-logs', authenticate, supportReadRoles, mobileController.auditLogs);
 mobileRouter.get('/super-admin/payments/cash-declarations', authenticate, supportReadRoles, mobileController.pendingCashDeclarations);
 mobileRouter.get('/public/broadcasts', optionalAuthenticate, mobileController.getPublicBroadcasts);
+mobileRouter.get('/public/config', optionalAuthenticate, mobileController.getPublicConfig);
 mobileRouter.get('/super-admin/config', authenticate, supportReadRoles, mobileController.getSystemConfig);
 mobileRouter.get('/super-admin/system/health', authenticate, supportReadRoles, mobileController.systemHealth);
 
@@ -233,7 +239,7 @@ const supportWriteRoles = requireRoles('super_admin', 'support');
 
 mobileRouter.post('/super-admin/users', authenticate, supportWriteRoles, mobileController.superAdminCreateUser);
 mobileRouter.put('/super-admin/users/:userId', authenticate, supportWriteRoles, mobileController.superAdminUpdateUser);
-mobileRouter.patch('/super-admin/users/:userId/role', authenticate, supportWriteRoles, mobileController.superAdminUpdateUserRole);
+mobileRouter.patch('/super-admin/users/:userId/role', authenticate, requireRoles('super_admin'), mobileController.superAdminUpdateUserRole);
 mobileRouter.patch('/super-admin/users/:userId/status', authenticate, supportWriteRoles, mobileController.superAdminUpdateUserStatus);
 mobileRouter.delete('/super-admin/users/:userId', authenticate, supportWriteRoles, mobileController.superAdminDeleteUser);
 mobileRouter.post('/super-admin/users/:userId/reset-pin', authenticate, supportWriteRoles, mobileController.superAdminResetUserPin);
@@ -295,7 +301,10 @@ mobileRouter.post('/parcels/estimate', optionalAuthenticate, mobileController.es
 // ============================================================
 
 mobileRouter.post('/payments/initiate', authenticate, mobileController.initiatePayment);
-mobileRouter.post('/payments/:paymentId/confirm', authenticate, mobileController.confirmPayment);
+// La confirmation d'un paiement est une opération de réconciliation financière :
+// seuls les rôles staff peuvent la déclencher. Un client ne confirme jamais son
+// propre paiement (la source de vérité est PayDunya ou la validation d'encaissement).
+mobileRouter.post('/payments/:paymentId/confirm', authenticate, requireRoles('super_admin', 'support'), mobileController.confirmPayment);
 mobileRouter.get('/payments/history', authenticate, mobileController.paymentHistory);
 
 // ============================================================
@@ -304,16 +313,20 @@ mobileRouter.get('/payments/history', authenticate, mobileController.paymentHist
 
 mobileRouter.get('/score', authenticate, mobileController.getScore);
 mobileRouter.get('/score/balance', authenticate, mobileController.getScoreBalance);
-mobileRouter.get('/driver/wallet', authenticate, mobileController.getDriverWallet);
-mobileRouter.post('/driver/wallet/withdraw', authenticate, mobileController.withdrawWallet);
-mobileRouter.get('/driver/wallet/withdrawals', authenticate, mobileController.getDriverWithdrawals);
-mobileRouter.delete('/driver/wallet/withdrawals/:withdrawalId', authenticate, mobileController.cancelWithdrawal);
+mobileRouter.get('/driver/wallet', authenticate, requireRoles('driver'), mobileController.getDriverWallet);
+mobileRouter.post('/driver/wallet/pay-debt', authenticate, requireRoles('driver'), mobileController.driverPayWalletDebt);
+mobileRouter.post('/driver/wallet/withdraw', authenticate, requireRoles('driver'), mobileController.withdrawWallet);
+mobileRouter.get('/driver/wallet/withdrawals', authenticate, requireRoles('driver'), mobileController.getDriverWithdrawals);
+mobileRouter.delete('/driver/wallet/withdrawals/:withdrawalId', authenticate, requireRoles('driver'), mobileController.cancelWithdrawal);
 mobileRouter.get('/score/history', authenticate, mobileController.getScoreHistory);
 mobileRouter.post('/score/purchase', authenticate, mobileController.purchaseScore);
 mobileRouter.post('/score/purchase/wallet', authenticate, mobileController.purchaseScoreWithWallet);
-mobileRouter.post('/score/debit', authenticate, mobileController.debitScore);
-mobileRouter.post('/score/credit', authenticate, mobileController.creditScore);
-mobileRouter.post('/score/refund', authenticate, mobileController.refundScore);
+// Les opérations d'administration des points sont réservées aux rôles staff.
+// Un CLIENT ou un DRIVER ne doit jamais pouvoir s'auto-créditer, débiter autrui
+// ou déclencher un remboursement arbitraire.
+mobileRouter.post('/score/debit', authenticate, requireRoles('super_admin', 'support'), mobileController.debitScore);
+mobileRouter.post('/score/credit', authenticate, requireRoles('super_admin', 'support'), mobileController.creditScore);
+mobileRouter.post('/score/refund', authenticate, requireRoles('super_admin', 'support'), mobileController.refundScore);
 mobileRouter.get('/score/stats', authenticate, mobileController.scoreStats);
 
 // ============================================================

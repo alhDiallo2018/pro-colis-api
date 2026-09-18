@@ -111,6 +111,12 @@ export async function registerUser(payload) {
   const passwordHash = payload.password ? await bcrypt.hash(payload.password, 12) : null;
   const pinHash = payload.pin ? await bcrypt.hash(payload.pin, 12) : null;
 
+  // Whitelist serveur : l'inscription publique n'autorise que CLIENT et DRIVER.
+  // Le rôle du body n'est jamais repris tel quel (défense en profondeur, même si
+  // le validateur le restreint déjà) : toute valeur inconnue ou privilégiée
+  // retombe sur `client`, jamais sur un rôle staff.
+  const role = payload.role === 'driver' ? 'driver' : 'client';
+
   // Registration creates the user, initial score row and audit entry atomically.
   const user = await prisma.$transaction(async (tx) => {
     const createdUser = await tx.user.create({
@@ -120,12 +126,12 @@ export async function registerUser(payload) {
         fullName: payload.fullName,
         passwordHash,
         pinHash,
-        role: payload.role,
+        role,
         address: payload.address,
         city: payload.city,
         region: payload.region,
         garageId: payload.garageId,
-        driverStatus: payload.role === 'driver' ? 'offline' : null,
+        driverStatus: role === 'driver' ? 'offline' : null,
         isProfileComplete: Boolean(payload.fullName && payload.phone)
       },
       include: USER_INCLUDE

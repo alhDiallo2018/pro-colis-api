@@ -12,11 +12,13 @@ describe('paydunya admin config (DB prime sur env)', () => {
       phone,
       fullName: 'Super Admin PayDunya',
       pin: '123456',
-      role: 'super_admin'
+      role: 'client'
     });
     token = res.body.accessToken;
     adminId = res.body.user?.id;
     expect(token).toBeTruthy();
+    // Rôle staff non créable en inscription publique : promotion en base.
+    await prisma.user.update({ where: { id: adminId }, data: { role: 'super_admin' } });
   });
 
   afterAll(async () => {

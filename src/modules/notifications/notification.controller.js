@@ -34,10 +34,10 @@ export async function listNotifications(req, res) {
 
 export async function unreadCount(req, res) {
   try {
-    // Le badge de l'icone doit compter tout ce qui reste a lire, notifications
-    // et messages confondus : deux compteurs separes donneraient deux chiffres
-    // contradictoires entre l'ecran et l'icone. `count` reste le nombre de
-    // notifications pour les clients deja deployes, `total` porte le badge.
+    // Le badge de l'icone compte chaque élément une seule fois : notifications
+    // métier + messages. Les notifications FCM miroir de type `message` sont
+    // exclues par `countUnreadForUser` afin qu'un message ne vaille jamais 2.
+    // `count` reste le compteur de notifications pour les anciens clients.
     const { notifications, messages, total } = await countUnreadForUser(req.user.id);
 
     return ok(res, {

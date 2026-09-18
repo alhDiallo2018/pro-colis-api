@@ -1,13 +1,17 @@
 // Seed des espaces support : deux comptes agents, une file de tickets, des
 // incidents et un pipeline commercial.
 //
+// STRICTEMENT DEV/TEST : les deux agents sont crees avec des identifiants
+// factices connus (PIN 123456, mot de passe Password123!). Le script refuse de
+// s'executer quand NODE_ENV=production.
+//
 // Idempotent : upsert sur des identifiants fixes, donc relancer le script
-// remet les données dans le même état plutôt que de les dupliquer.
+// remet les donnees dans le meme etat plutot que de les dupliquer.
 //
 // Les valeurs sont choisies pour que les dashboards racontent quelque chose de
-// cohérent : des tickets réellement en dépassement de SLA, des résolus datés du
-// mois en cours pour alimenter les moyennes, un objectif commercial atteint à
-// ~80 %. Un seed « tout propre » afficherait des écrans vides et ne prouverait
+// coherent : des tickets reellement en depassement de SLA, des resolus dates du
+// mois en cours pour alimenter les moyennes, un objectif commercial atteint a
+// ~80 %. Un seed « tout propre » afficherait des ecrans vides et ne prouverait
 // rien.
 //
 // Usage : npm run seed:support
@@ -294,6 +298,12 @@ const leads = [
 ];
 
 async function main() {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'Seed support refuse en production : il cree des agents avec des identifiants factices connus (PIN 123456 / Password123!).'
+    );
+  }
+
   // --- Agents ---
   const created = {};
   for (const agent of agents) {
