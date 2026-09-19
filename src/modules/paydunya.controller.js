@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { prisma } from '../config/prisma.js'
 import { env } from '../config/env.js'
 import { ok, fail } from '../utils/api-response.js'
@@ -552,6 +553,46 @@ export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', asyn
 
   const config = await loadPaydunyaConfig(true)
   const payload = req.body ?? {}
+
+  // --- DIAGNOSTIC TEMPORAIRE (à retirer après investigation) ---
+  // Journalise uniquement le contenu NON-sensible du callback pour comprendre
+  // la divergence de hash. Jamais de masterKey/privateKey/token/credentials.
+  // Le hash SHA-512 n'est pas un secret et peut être affiché en entier.
+  const diagnosticBodyKeys = Object.keys(payload)
+  const diagnosticContentType = String(req.get('content-type') ?? '')
+  const diagnosticReceivedHash = String(payload.hash ?? '').trim().toLowerCase()
+  const diagnosticExpectedHash = createHash('sha512').update(config.masterKey).digest('hex').toLowerCase()
+  const diagnosticHashMatches = diagnosticReceivedHash.length > 0 && diagnosticReceivedHash === diagnosticExpectedHash
+  req.log?.info?.(
+    {
+      paydunyaDisburseCallbackDiagnostic: {
+        requestId: req.requestId,
+        contentType: diagnosticContentType,
+        bodyKeys: diagnosticBodyKeys,
+        fieldTypes: diagnosticBodyKeys.map((k) => `${k}->${typeof payload[k]}`),
+        hashPresent: Boolean(payload.hash),
+        hashLength: String(payload.hash ?? '').length,
+        hashReceived: diagnosticReceivedHash,
+        hashExpected: diagnosticExpectedHash,
+        hashMatches: diagnosticHashMatches,
+        hashReceivedLength: diagnosticReceivedHash.length,
+        hashExpectedLength: diagnosticExpectedHash.length,
+        status: payload.status ?? null,
+        tokenPresent: Boolean(payload.token ?? payload.disburse_invoice),
+        withdrawMode: payload.withdraw_mode ?? null,
+        amount: payload.amount ?? null,
+        disburseId: payload.disburse_id ?? null,
+        transactionId: payload.transaction_id ?? null,
+        disburseTxId: payload.disburse_tx_id ?? null,
+        updatedAt: payload.updated_at ?? null,
+        dataHashPresent: Boolean(payload.data?.hash),
+        dataKeys: payload.data && typeof payload.data === 'object' ? Object.keys(payload.data) : null
+      }
+    },
+    'PayDunya disburse callback diagnostic'
+  )
+  // --- FIN DIAGNOSTIC TEMPORAIRE ---
+
   if (!verifyCallbackHash(payload.hash, config.masterKey)) {
     req.log?.warn?.({ requestId: req.requestId }, 'PayDunya disburse callback rejected: invalid hash')
     return fail(res, { status: 403, message: 'Signature invalide', code: 'FORBIDDEN' })
