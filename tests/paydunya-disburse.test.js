@@ -224,6 +224,78 @@ describe('PayDunya disburse client (API PUSH)', () => {
     expect(res.status).toBe(400);
   });
 
+  // --- Formats réels du callback PayDunya (form-urlencoded, clé `data`) ---
+  // Le body brut ci-dessous reproduit EXACTEMENT ce que le middleware reçoit :
+  // PayDunya encode le JSON, et le JSON arrive encore percent-encodé (double
+  // passe) dans `req.body.data`. C'est le cas qui faisait échouer JSON.parse.
+
+  function rawFormBody(dataValue) {
+    return `data=${encodeURIComponent(dataValue)}`;
+  }
+
+  it('accepte un data JSON percent-encodé (une passe après le middleware) avec hash valide', async () => {
+    const masterKey = `mk-${suffix}`;
+    const hash = createHash('sha512').update(masterKey).digest('hex');
+    const json = JSON.stringify({
+      hash,
+      status: 'success',
+      token: 'unknown-token',
+      withdraw_mode: 'wave-senegal',
+      amount: '500',
+      updated_at: '11/01/2024 14:30:32'
+    });
+    // Double-encodage : PayDunya encode le JSON ; superagent n'y touche plus
+    // (body string), express décode une fois → `data` reste percent-encodé.
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send(rawFormBody(encodeURIComponent(json)));
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Transaction inconnue');
+  });
+
+  it('accepte un data JSON double-encodé (deux passes) avec hash valide', async () => {
+    const masterKey = `mk-${suffix}`;
+    const hash = createHash('sha512').update(masterKey).digest('hex');
+    const json = JSON.stringify({ hash, status: 'success', token: 'unknown-token' });
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send(rawFormBody(encodeURIComponent(encodeURIComponent(json))));
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Transaction inconnue');
+  });
+
+  it('rejette un data JSON percent-encodé avec hash invalide (403)', async () => {
+    const json = JSON.stringify({ hash: 'forged', status: 'success', token: 'unknown-token' });
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send(rawFormBody(encodeURIComponent(json)));
+    expect(res.status).toBe(403);
+    expect(res.body.message).toBe('Signature invalide');
+  });
+
+  it('accepte un data sous forme de query-string form-urlencoded (hash=...&status=...)', async () => {
+    const masterKey = `mk-${suffix}`;
+    const hash = createHash('sha512').update(masterKey).digest('hex');
+    const innerQuery = new URLSearchParams({ hash, status: 'success', token: 'unknown-token' }).toString();
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send(`data=${encodeURIComponent(innerQuery)}`);
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Transaction inconnue');
+  });
+
+  it('rejette un data absent de data malformé (400)', async () => {
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send('data=%E0%A4%A');
+    expect(res.status).toBe(400);
+  });
+
   it('le callback traite un body encodé en form-urlencoded (Content-Type PayDunya)', async () => {
     const masterKey = `mk-${suffix}`;
     const hash = createHash('sha512').update(masterKey).digest('hex');

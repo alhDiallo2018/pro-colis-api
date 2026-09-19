@@ -548,36 +548,89 @@ export const paydunyaCancel = (_req, res) => {
 // Doc : https://developers.paydunya.com/doc/FR/api_deboursement
 //
 // PayDunya envoie ce callback en application/x-www-form-urlencoded avec les
-// données regroupées sous la clé `data` (chaîne JSON). L'ancien format
-// « champs à plat » (hash/status/token au niveau racine) reste accepté.
-// On ne fait jamais confiance au contenu reçu : le `data` est validé/parsé
-// avant toute vérification, et un JSON invalide est rejeté en 400.
+// données regroupées sous la clé `data`. L'ancien format « champs à plat »
+// (hash/status/token au niveau racine) reste accepté.
+//
+// IMPORTANT : la clé `data` n'est PAS nécessairement un JSON déjà décodé. En
+// production, `JSON.parse(data)` a échoué (INVALID_JSON) car la valeur reçue
+// par Express est encore encodée (percent-encoding, parfois en double passe)
+// ou se présente comme une query-string form-urlencoded. On décode donc dans
+// l'ordre le format attendu, sans jamais faire confiance au contenu reçu : le
+// payload est normalisé AVANT la vérification de signature, et un `data` qui
+// ne se laisse pas décoder en objet est rejeté en 400.
+function tryParseJsonObject(value) {
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+// Décodage d'un composant form-urlencoded : percent-encoding + '+' → espace.
+// Retourne null si la chaîne contient une séquence '%' invalide.
+function decodeFormComponent(value) {
+  try {
+    return decodeURIComponent(String(value).replace(/\+/g, ' '))
+  } catch {
+    return null
+  }
+}
+
+// Interprète `data` comme une query-string form-urlencoded (hash=...&status=...).
+function parseFormQuery(value) {
+  try {
+    const params = new URLSearchParams(String(value))
+    const obj = {}
+    for (const [key, val] of params.entries()) {
+      if (!(key in obj)) obj[key] = val
+    }
+    return obj
+  } catch {
+    return null
+  }
+}
+
 function normalizeDisburseCallbackPayload(body) {
-  const source = body && typeof body === 'object' ? body : {}
+  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {}
   const data = source.data
 
   if (data === undefined || data === null) {
-    return { payload: source, error: null }
-  }
-
-  if (typeof data === 'string') {
-    let parsed
-    try {
-      parsed = JSON.parse(data)
-    } catch {
-      return { payload: null, error: 'INVALID_JSON' }
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return { payload: null, error: 'INVALID_JSON' }
-    }
-    return { payload: parsed, error: null }
+    return { payload: source, error: null, format: 'flat' }
   }
 
   if (typeof data === 'object' && !Array.isArray(data)) {
-    return { payload: data, error: null }
+    return { payload: data, error: null, format: 'object' }
   }
 
-  return { payload: null, error: 'INVALID_DATA' }
+  if (typeof data !== 'string') {
+    return { payload: null, error: 'INVALID_DATA', format: typeof data }
+  }
+
+  // 1. JSON directement lisible (objet déjà désérialisé côté serveur).
+  const direct = tryParseJsonObject(data)
+  if (direct) return { payload: direct, error: null, format: 'json' }
+
+  // 2. JSON encodé en form-urlencoded (percent-encoding), puis éventuellement
+  //    en double passe. C'est le cas réel observé en production.
+  const once = decodeFormComponent(data)
+  if (once !== null) {
+    const onceParsed = tryParseJsonObject(once)
+    if (onceParsed) return { payload: onceParsed, error: null, format: 'urlencoded-json' }
+    const twice = decodeFormComponent(once)
+    if (twice !== null) {
+      const twiceParsed = tryParseJsonObject(twice)
+      if (twiceParsed) return { payload: twiceParsed, error: null, format: 'double-urlencoded-json' }
+    }
+  }
+
+  // 3. Query-string form-urlencoded directement sous `data` (hash=...&status=...).
+  const query = parseFormQuery(data)
+  if (query && typeof query === 'object' && query.hash !== undefined) {
+    return { payload: query, error: null, format: 'query-string' }
+  }
+
+  return { payload: null, error: 'INVALID_JSON', format: 'unknown' }
 }
 
 export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', async (req, res) => {
@@ -587,16 +640,18 @@ export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', asyn
 
   const config = await loadPaydunyaConfig(true)
   const rawBody = req.body ?? {}
-  const { payload: normalizedPayload, error: dataError } = normalizeDisburseCallbackPayload(rawBody)
+  const { payload: normalizedPayload, error: dataError, format: dataFormat } = normalizeDisburseCallbackPayload(rawBody)
   const payload = normalizedPayload ?? {}
 
   // --- DIAGNOSTIC TEMPORAIRE (à retirer après investigation) ---
-  // Journalise uniquement le contenu NON-sensible du callback pour comprendre
-  // la divergence de hash. Jamais de masterKey/privateKey/token/Authorization/
-  // cookies/credentials. Le hash = SHA-512(masterKey) EST le secret du callback :
-  // on ne journalise que sa longueur et le résultat de la comparaison, jamais sa
-  // valeur en clair (elle permettrait de forger un callback).
+  // Journalise uniquement le contenu NON-sensible du callback pour déterminer
+  // la représentation exacte de `req.body.data` SANS en révéler la valeur.
+  // Jamais de masterKey/privateKey/token/Authorization/cookies/credentials.
+  // Le hash = SHA-512(masterKey) EST le secret du callback : on ne journalise
+  // que sa longueur et le résultat de la comparaison, jamais sa valeur en clair.
   const hasData = rawBody.data !== undefined && rawBody.data !== null
+  const rawDataString = typeof rawBody.data === 'string' ? rawBody.data : String(rawBody.data ?? '')
+  const trimmedData = rawDataString.trim()
   const diagnosticBodyKeys = Object.keys(rawBody)
   const diagnosticContentType = String(req.get('content-type') ?? '')
   const diagnosticDataType = typeof rawBody.data
@@ -611,6 +666,20 @@ export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', asyn
         contentType: diagnosticContentType,
         bodyKeys: diagnosticBodyKeys,
         dataType: diagnosticDataType,
+        dataFormat,
+        dataLength: rawDataString.length,
+        dataFirstCharCode: rawDataString.length ? rawDataString.charCodeAt(0) : null,
+        dataLastCharCode: rawDataString.length ? rawDataString.charCodeAt(rawDataString.length - 1) : null,
+        dataFirstChar: rawDataString.length ? rawDataString[0] : null,
+        dataLastChar: rawDataString.length ? rawDataString[rawDataString.length - 1] : null,
+        dataLooksLikeJson:
+          (trimmedData.startsWith('{') && trimmedData.endsWith('}')) ||
+          (trimmedData.startsWith('[') && trimmedData.endsWith(']')),
+        dataStartsWithPercentEncoding: rawDataString.startsWith('%'),
+        dataStartsWithPlus: rawDataString.startsWith('+'),
+        dataContainsPercent: rawDataString.includes('%'),
+        dataContainsBraces: rawDataString.includes('{') || rawDataString.includes('}'),
+        dataContainsHashKey: rawDataString.includes('hash'),
         dataKeys: diagnosticDataKeys,
         hashPresent: Boolean(payload.hash),
         hashReceivedLength: diagnosticReceivedHashLength,
