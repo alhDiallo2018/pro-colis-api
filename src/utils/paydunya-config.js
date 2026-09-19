@@ -5,7 +5,7 @@ import { env } from '../config/env.js';
 // clés "paydunya.*" (convention existante du checkout). La base PRIME sur
 // l'env, qui ne sert que de valeur par défaut. Snapshot mémoire TTL 30s.
 const TTL_MS = 30_000;
-const KEYS = ['masterKey', 'privateKey', 'token', 'mode', 'storeName'];
+const KEYS = ['masterKey', 'privateKey', 'token', 'mode', 'storeName', 'debitAccountNumber'];
 
 let dbConfig = null;
 let loadedAt = 0;
@@ -50,7 +50,8 @@ function effective() {
     privateKey: db.privateKey || env.PAYDUNYA_PRIVATE_KEY || '',
     token: db.token || env.PAYDUNYA_TOKEN || '',
     mode: db.mode || env.PAYDUNYA_MODE || 'test',
-    storeName: db.storeName || env.PAYDUNYA_STORE_NAME || 'ProColis'
+    storeName: db.storeName || env.PAYDUNYA_STORE_NAME || 'ProColis',
+    debitAccountNumber: db.debitAccountNumber || env.PAYDUNYA_DEBIT_ACCOUNT_NUMBER || ''
   };
 }
 

@@ -37,14 +37,16 @@ describe('paydunya admin config (DB prime sur env)', () => {
     const put = await request(app)
       .put('/api/v1/admin/payments/paydunya-config')
       .set(auth())
-      .send({ masterKey: 'mk-secret-ABCD', privateKey: 'pk-secret-EFGH', token: 'tk-secret-IJKL', mode: 'test', storeName: 'ProColis Test' });
+      .send({ masterKey: 'mk-secret-ABCD', privateKey: 'pk-secret-EFGH', token: 'tk-secret-IJKL', mode: 'test', storeName: 'ProColis Test', debitAccountNumber: 'BSN0349122881' });
     expect(put.status).toBe(200);
     expect(put.body.config.masterKey).toBe('****ABCD');
     expect(put.body.config.configured).toBe(true);
+    expect(put.body.config.debitAccountNumber).toBe('BSN0349122881');
 
     const get = await request(app).get('/api/v1/admin/payments/paydunya-config').set(auth());
     expect(get.body.config.privateKey).toBe('****EFGH');
     expect(get.body.config.storeName).toBe('ProColis Test');
+    expect(get.body.config.debitAccountNumber).toBe('BSN0349122881');
   });
 
   it('ignores masked values sent back by the admin screen', async () => {

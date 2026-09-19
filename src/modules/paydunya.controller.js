@@ -577,7 +577,7 @@ export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', asyn
 
 // --- Config PayDunya gérable par le super admin (SystemConfig "paydunya.*") ---
 // Les clés sont des secrets financiers : masquées en lecture (4 derniers caractères).
-const PAYDUNYA_CONFIG_FIELDS = ['masterKey', 'privateKey', 'token', 'mode', 'storeName']
+const PAYDUNYA_CONFIG_FIELDS = ['masterKey', 'privateKey', 'token', 'mode', 'storeName', 'debitAccountNumber']
 const PAYDUNYA_SECRET_FIELDS = ['masterKey', 'privateKey', 'token']
 
 function maskSecret(value) {
@@ -598,6 +598,7 @@ export const getPaydunyaAdminConfig = handle('paydunya.configGet', async (_req, 
         token: maskSecret(cfg.token),
         mode: cfg.mode,
         storeName: cfg.storeName,
+        debitAccountNumber: cfg.debitAccountNumber || '',
         configured: Boolean(cfg.masterKey && cfg.privateKey && cfg.token)
       }
     }
@@ -655,6 +656,7 @@ export const updatePaydunyaAdminConfig = handle('paydunya.configUpdate', async (
         token: maskSecret(cfg.token),
         mode: cfg.mode,
         storeName: cfg.storeName,
+        debitAccountNumber: cfg.debitAccountNumber || '',
         configured: Boolean(cfg.masterKey && cfg.privateKey && cfg.token)
       }
     }
