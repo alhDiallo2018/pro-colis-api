@@ -186,8 +186,7 @@ export async function checkStatus(disburseToken) {
  * Le callback PayDunya inclut `hash` = SHA-512 de la MasterKey — garantit
  * que la notification provient bien de leurs serveurs.
  */
-export function verifyCallbackHash(hash) {
-  const { masterKey } = paydunyaConfigSnapshot();
+export function verifyCallbackHash(hash, masterKey) {
   if (!masterKey || !hash) return false;
   const expected = createHash('sha512').update(masterKey).digest('hex');
   return String(hash).toLowerCase() === expected;

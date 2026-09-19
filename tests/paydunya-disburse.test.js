@@ -1,6 +1,9 @@
+import { createHash } from 'node:crypto';
 import { jest } from '@jest/globals';
+import request from 'supertest';
+import { app } from '../src/app.js';
 import { prisma } from '../src/config/prisma.js';
-import { getInvoice, withdrawModeFor, toAccountAlias } from '../src/utils/paydunya-disburse.js';
+import { getInvoice, withdrawModeFor, toAccountAlias, verifyCallbackHash } from '../src/utils/paydunya-disburse.js';
 
 /**
  * Cible la cause du 4002 sur l'API PUSH PayDunya :
@@ -133,5 +136,56 @@ describe('PayDunya disburse client (API PUSH)', () => {
   it("retire l'indicatif 221 du numéro bénéficiaire", () => {
     expect(toAccountAlias('+221771234567')).toBe('771234567');
     expect(toAccountAlias('771234567')).toBe('771234567');
+  });
+
+  it('le callback charge la Master Key depuis SystemConfig et accepte un hash valide', async () => {
+    const masterKey = `mk-${suffix}`;
+    const hash = createHash('sha512').update(masterKey).digest('hex');
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .send({ hash, status: 'success', token: 'unknown-token' });
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Transaction inconnue');
+  });
+
+  it('le callback rejette un hash invalide (403 Signature invalide)', async () => {
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .send({ hash: 'forged', status: 'success', token: 'unknown-token' });
+    expect(res.status).toBe(403);
+    expect(res.body.message).toBe('Signature invalide');
+  });
+});
+
+describe('verifyCallbackHash (signature du callback PayDunya)', () => {
+  const MASTER_KEY = 'master-key-test';
+
+  it('produit le hash SHA-512 attendu pour une Master Key donnée', () => {
+    const expected = '5981ff46dbf843cbf7697daad21c650947cc344d51c1b2e48e314990c4643dbfcb86ab3d045393c28565b68cc3420be560724ac5162f1a56c722e9a9ee02e839';
+    expect(createHash('sha512').update(MASTER_KEY).digest('hex')).toBe(expected);
+    expect(verifyCallbackHash(expected, MASTER_KEY)).toBe(true);
+  });
+
+  it('accepte un hash correct avec la bonne Master Key', () => {
+    const hash = createHash('sha512').update(MASTER_KEY).digest('hex');
+    expect(verifyCallbackHash(hash, MASTER_KEY)).toBe(true);
+    expect(verifyCallbackHash(hash.toUpperCase(), MASTER_KEY)).toBe(true);
+  });
+
+  it('refuse un hash incorrect', () => {
+    expect(verifyCallbackHash('forged-hash', MASTER_KEY)).toBe(false);
+  });
+
+  it('refuse une Master Key absente', () => {
+    const hash = createHash('sha512').update(MASTER_KEY).digest('hex');
+    expect(verifyCallbackHash(hash, '')).toBe(false);
+    expect(verifyCallbackHash(hash, undefined)).toBe(false);
+    expect(verifyCallbackHash(hash, null)).toBe(false);
+  });
+
+  it('refuse un hash absent', () => {
+    expect(verifyCallbackHash('', MASTER_KEY)).toBe(false);
+    expect(verifyCallbackHash(undefined, MASTER_KEY)).toBe(false);
+    expect(verifyCallbackHash(null, MASTER_KEY)).toBe(false);
   });
 });
