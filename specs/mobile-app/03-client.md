@@ -566,3 +566,25 @@ Statut : `SPEC`
 | PATCH | `/messages/:messageId/read` | aucun | `{ "success": true, "message": "Message lu" }` |
 | POST | `/support/messages` | `{ "subject": "Question", "message": "Texte" }` | `{ "success": true, "supportMessage": {} }` |
 | POST | `/ratings` | `{ "parcelId": "uuid", "driverId": "uuid", "rating": 5, "comment": "Tres bien" }` | `{ "success": true, "rating": {} }` |
+
+## Mes dettes
+
+Implémenté : accès depuis **Profil → Mes dettes**.
+
+`GET /client/debts?page=1&limit=20` (authentification client obligatoire).
+Le filtre optionnel `status` accepte `pending`, `partially_paid` ou `paid`.
+La réponse contient :
+
+- `debts` : `id`, `parcelId`, `trackingNumber`, `reference`, `reason`, `amount`,
+  `remaining`, `status`, `createdAt`, `updatedAt`, `settledAt` ;
+- `summary` : `totalDebt` (FCFA), `currency: "XOF"`, `debtLimit`, `canCreateParcel` ;
+- `pagination` : `page`, `limit`, `total`, `totalPages`.
+
+Le total porte sur toutes les dettes encore dues du compte connecté, même si
+la liste est filtrée ou paginée. Aucun paramètre `userId` n'est pris en compte.
+Les dettes réglées restent consultables dans l'historique.
+
+Le bouton de règlement réutilise `POST /payments/paydunya/create` avec
+`type: "penalty_debt"` et l'`id` réel comme `debtId` ; `amount` est facultatif
+pour un paiement partiel. Le retour du prestataire provoque une relecture des
+montants serveur, jamais une remise à zéro locale du reliquat.

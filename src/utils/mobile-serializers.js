@@ -1,3 +1,4 @@
+import { meaningfulLocationLabel } from './location-label.js';
 import { snapshotToCancellation } from './cancellation.js';
 
 function decimalToString(value) {
@@ -654,6 +655,19 @@ export function serializeScoreTransaction(transaction) {
 
 export function serializeAdvertisement(advertisement) {
   if (!advertisement) return null;
+  // Un libellé vide en base ne doit pas masquer la zone chargée ; les anciennes
+  // annonces utilisent les garages, les annonces libres seulement la ville.
+  const location = (side) => {
+    const zone = advertisement[`${side}Zone`];
+    const garage = advertisement[`${side}Garage`];
+    const city = [advertisement[`${side}City`], zone?.city, garage?.city,
+      zone?.displayName, zone?.name, garage?.name].map(meaningfulLocationLabel).find(Boolean) || null;
+    const name = [zone?.displayName, zone?.name, garage?.name, city]
+      .map(meaningfulLocationLabel).find(Boolean) || null;
+    return { city, name, zone, garage };
+  };
+  const departure = location('departure');
+  const arrival = location('arrival');
   return {
     id: advertisement.id,
     driverId: advertisement.driverId,
@@ -662,8 +676,14 @@ export function serializeAdvertisement(advertisement) {
     arrivalGarageId: advertisement.arrivalGarageId,
     departureZoneId: advertisement.departureZoneId,
     arrivalZoneId: advertisement.arrivalZoneId,
-    departureCity: advertisement.departureCity,
-    arrivalCity: advertisement.arrivalCity,
+    departureCity: departure.city,
+    arrivalCity: arrival.city,
+    departureZoneName: departure.zone?.name ?? null,
+    arrivalZoneName: arrival.zone?.name ?? null,
+    departureGarageName: departure.garage?.name ?? null,
+    arrivalGarageName: arrival.garage?.name ?? null,
+    departureName: departure.name,
+    arrivalName: arrival.name,
     departureAt: dateToIso(advertisement.departureAt),
     availableWeight: decimalToString(advertisement.availableWeight),
     proposedPrice: decimalToString(advertisement.proposedPrice),

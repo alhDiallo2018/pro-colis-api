@@ -4,7 +4,7 @@ import { prisma } from '../../config/prisma.js';
 import { fail, ok } from '../../utils/api-response.js';
 import { isBrevoConfigured, sendNotificationEmail, sendNotificationSms, sendOtpSms } from '../../utils/brevo.js';
 import { assertCanAcceptNewDelivery, calculateCommission, calculateCommissionSync, canAcceptNewDeliveries, deductCashCommission, getCfaPerPoint, getCommitmentFee, getDebtLimit, getDeliveryPoints, settleCommissionDebtFromWallet } from '../../utils/commission.js';
-import { assertClientCanCreateParcel } from '../../utils/client-debt.js';
+import { assertClientCanCreateParcel, getClientDebtLimit, getClientPenaltyDebtTotal, isClientDebtLimitReached } from '../../utils/client-debt.js';
 import { ConflictError, ForbiddenError, NotFoundError, ParcelAlreadyCancelledError, ValidationError, normalizeError } from '../../utils/errors.js';
 import {
   applyCancellation,
@@ -707,6 +707,51 @@ export const userStats = handle('users.stats', async (req, res) => {
         scoreBalance: score?.points || 0
       }
     }
+  });
+});
+
+// Le filtrage propriétaire est imposé côté serveur ; un userId fourni par le
+// mobile ne doit jamais permettre de consulter les dettes d'un autre compte.
+// `handle` enveloppe aussi cet accès BD dans le try/catch avec journalisation.
+export const clientDebts = handle('client.debts', async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const status = req.query.status;
+  if (status && !['pending', 'partially_paid', 'paid'].includes(status)) {
+    throw new ValidationError([{ path: 'query.status', message: 'Statut de dette invalide' }]);
+  }
+  const where = cleanUndefined({ userId: req.user.id, status });
+  // Le total dû reste global, indépendamment du filtre et de la page affichés.
+  const snapshot = await prisma.$transaction(async (tx) => {
+    const [total, debts, totalDebt, debtLimit] = await Promise.all([
+      tx.clientPenaltyDebt.count({ where }),
+      tx.clientPenaltyDebt.findMany({
+        where, skip, take: limit,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        include: { parcel: { select: { trackingNumber: true } } }
+      }),
+      getClientPenaltyDebtTotal(tx, req.user.id),
+      getClientDebtLimit(tx)
+    ]);
+    return { total, debts, totalDebt, debtLimit };
+  }, { isolationLevel: 'RepeatableRead' });
+  return ok(res, {
+    message: 'Mes dettes',
+    data: {
+      debts: snapshot.debts.map((debt) => ({
+        id: debt.id, parcelId: debt.parcelId,
+        trackingNumber: debt.parcel.trackingNumber,
+        reference: debt.reference, reason: debt.reason,
+        amount: Number(debt.amount), remaining: Number(debt.remaining),
+        status: debt.status, createdAt: debt.createdAt,
+        settledAt: debt.settledAt, updatedAt: debt.updatedAt
+      })),
+      summary: {
+        totalDebt: snapshot.totalDebt, currency: 'XOF',
+        debtLimit: snapshot.debtLimit,
+        canCreateParcel: !isClientDebtLimitReached(snapshot.totalDebt, snapshot.debtLimit)
+      }
+    },
+    meta: paginationMeta({ page, limit, total: snapshot.total })
   });
 });
 
@@ -5070,6 +5115,13 @@ const ADVERTISEMENT_EDITABLE_ID_FIELDS = [
   'arrivalZoneId'
 ];
 
+// Les listes et le détail doivent charger les mêmes lieux, y compris les
+// anciennes annonces rattachées uniquement à un garage.
+const advertisementLocationInclude = {
+  departureZone: true, arrivalZone: true,
+  departureGarage: true, arrivalGarage: true
+};
+
 const ADVERTISEMENT_EDITABLE_STATUSES = ['open'];
 const ADVERTISEMENT_LIVE_OFFER_STATUSES = ['pending', 'countered'];
 const PARCEL_OFFERABLE_STATUSES = ['pending', 'free'];
@@ -5077,7 +5129,7 @@ const PARCEL_OFFERABLE_STATUSES = ['pending', 'free'];
 async function findOwnedAdvertisement(user, advertisementId, include) {
   const advertisement = await prisma.advertisement.findUnique({
     where: { id: advertisementId },
-    ...(include ? { include } : {})
+    include: { ...advertisementLocationInclude, ...include }
   });
   if (!advertisement) throw new NotFoundError('Annonce introuvable');
   if (user.role !== 'super_admin' && advertisement.driverId !== user.id) {
@@ -5120,13 +5172,13 @@ export const listAdvertisements = handle('advertisements.list', async (req, res)
   const where = cleanUndefined({ status: req.query.status });
   const [total, advertisements] = await Promise.all([
     prisma.advertisement.count({ where }),
-    prisma.advertisement.findMany({ where, include: { driver: { include: { garage: true } }, offers: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
+    prisma.advertisement.findMany({ where, include: { ...advertisementLocationInclude, driver: { include: { garage: true } }, offers: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
   ]);
   return ok(res, { message: 'Annonces', data: { advertisements: advertisements.map(serializeAdvertisement) }, meta: paginationMeta({ page, limit, total }) });
 });
 
 export const myAdvertisements = handle('advertisements.my', async (req, res) => {
-  const advertisements = await prisma.advertisement.findMany({ where: { driverId: req.user.id }, include: { driver: true, offers: { include: { client: true, parcel: { include: { media: true } } } } }, orderBy: { createdAt: 'desc' } });
+  const advertisements = await prisma.advertisement.findMany({ where: { driverId: req.user.id }, include: { ...advertisementLocationInclude, driver: true, offers: { include: { client: true, parcel: { include: { media: true } } } } }, orderBy: { createdAt: 'desc' } });
   return ok(res, { message: 'Mes annonces', data: { advertisements: advertisements.map(serializeAdvertisement) } });
 });
 
@@ -5150,7 +5202,7 @@ export const createAdvertisement = handle('advertisements.create', async (req, r
         description: req.body.description,
         audioUrl: req.body.audioUrl
       },
-      include: { driver: true, offers: true }
+      include: { ...advertisementLocationInclude, driver: true, offers: true }
     });
 
     await audit(tx, req, {
@@ -5174,6 +5226,7 @@ export const advertisementDetail = handle('advertisements.detail', async (req, r
   const advertisement = await prisma.advertisement.findUnique({
     where: { id: req.params.advertisementId },
     include: {
+      ...advertisementLocationInclude,
       driver: { include: { garage: true } },
       offers: { include: { client: true, parcel: { include: { media: true } } } }
     }
@@ -5230,7 +5283,7 @@ export const updateAdvertisement = handle('advertisements.update', async (req, r
     const result = await tx.advertisement.update({
       where: { id: advertisement.id },
       data,
-      include: { driver: true, offers: true }
+      include: { ...advertisementLocationInclude, driver: true, offers: true }
     });
 
     await audit(tx, req, {
@@ -5358,7 +5411,7 @@ export const closeAdvertisement = handle('advertisements.close', async (req, res
           closedAt: new Date().toISOString()
         }
       },
-      include: { driver: true, offers: true }
+      include: { ...advertisementLocationInclude, driver: true, offers: true }
     });
 
     await audit(tx, req, {
