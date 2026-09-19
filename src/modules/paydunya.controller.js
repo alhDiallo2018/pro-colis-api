@@ -593,14 +593,16 @@ export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', asyn
   // --- DIAGNOSTIC TEMPORAIRE (à retirer après investigation) ---
   // Journalise uniquement le contenu NON-sensible du callback pour comprendre
   // la divergence de hash. Jamais de masterKey/privateKey/token/Authorization/
-  // cookies/credentials. Le hash SHA-512 reçu/attendu est un dérivé, pas un secret.
+  // cookies/credentials. Le hash = SHA-512(masterKey) EST le secret du callback :
+  // on ne journalise que sa longueur et le résultat de la comparaison, jamais sa
+  // valeur en clair (elle permettrait de forger un callback).
   const hasData = rawBody.data !== undefined && rawBody.data !== null
   const diagnosticBodyKeys = Object.keys(rawBody)
   const diagnosticContentType = String(req.get('content-type') ?? '')
   const diagnosticDataType = typeof rawBody.data
   const diagnosticDataKeys = hasData && !dataError ? Object.keys(payload) : null
-  const diagnosticReceivedHash = String(payload.hash ?? '')
-  const diagnosticExpectedHash = createHash('sha512').update(config.masterKey).digest('hex')
+  const diagnosticReceivedHashLength = String(payload.hash ?? '').length
+  const diagnosticExpectedHashLength = createHash('sha512').update(config.masterKey).digest('hex').length
   const diagnosticHashMatches = verifyCallbackHash(payload.hash, config.masterKey)
   req.log?.info?.(
     {
@@ -611,9 +613,8 @@ export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', asyn
         dataType: diagnosticDataType,
         dataKeys: diagnosticDataKeys,
         hashPresent: Boolean(payload.hash),
-        hashLength: String(payload.hash ?? '').length,
-        hashReceived: diagnosticReceivedHash,
-        hashExpected: diagnosticExpectedHash,
+        hashReceivedLength: diagnosticReceivedHashLength,
+        hashExpectedLength: diagnosticExpectedHashLength,
         hashMatches: diagnosticHashMatches,
         status: payload.status ?? null,
         withdrawMode: payload.withdraw_mode ?? null,
