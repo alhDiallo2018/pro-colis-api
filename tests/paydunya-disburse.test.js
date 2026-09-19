@@ -4,6 +4,7 @@ import request from 'supertest';
 import { app } from '../src/app.js';
 import { prisma } from '../src/config/prisma.js';
 import { getInvoice, withdrawModeFor, toAccountAlias, verifyCallbackHash } from '../src/utils/paydunya-disburse.js';
+import { loadPaydunyaConfig } from '../src/utils/paydunya-config.js';
 
 /**
  * Cible la cause du 4002 sur l'API PUSH PayDunya :
@@ -155,6 +156,41 @@ describe('PayDunya disburse client (API PUSH)', () => {
     expect(res.status).toBe(403);
     expect(res.body.message).toBe('Signature invalide');
   });
+
+  it('le callback rejette un hash absent (403 Signature invalide)', async () => {
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .send({ status: 'success', token: 'unknown-token' });
+    expect(res.status).toBe(403);
+    expect(res.body.message).toBe('Signature invalide');
+  });
+
+  it('le callback rejette un hash présent uniquement dans une structure non supportée (data.hash)', async () => {
+    const masterKey = `mk-${suffix}`;
+    const hash = createHash('sha512').update(masterKey).digest('hex');
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .send({ data: { hash, status: 'success' }, token: 'unknown-token' });
+    expect(res.status).toBe(403);
+    expect(res.body.message).toBe('Signature invalide');
+  });
+
+  it('le callback traite un body encodé en form-urlencoded (Content-Type PayDunya)', async () => {
+    const masterKey = `mk-${suffix}`;
+    const hash = createHash('sha512').update(masterKey).digest('hex');
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send({ hash, status: 'success', token: 'unknown-token' });
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Transaction inconnue');
+  });
+
+  it('loadPaydunyaConfig(true) charge la config actuelle depuis SystemConfig', async () => {
+    const cfg = await loadPaydunyaConfig(true);
+    expect(cfg.masterKey).toBe(`mk-${suffix}`);
+    expect(cfg.mode).toBe('test');
+  });
 });
 
 describe('verifyCallbackHash (signature du callback PayDunya)', () => {
@@ -187,5 +223,12 @@ describe('verifyCallbackHash (signature du callback PayDunya)', () => {
     expect(verifyCallbackHash('', MASTER_KEY)).toBe(false);
     expect(verifyCallbackHash(undefined, MASTER_KEY)).toBe(false);
     expect(verifyCallbackHash(null, MASTER_KEY)).toBe(false);
+  });
+
+  it('refuse un hash entouré d’espaces (comparaison stricte, sans affaiblir la sécurité)', () => {
+    const hash = createHash('sha512').update(MASTER_KEY).digest('hex');
+    expect(verifyCallbackHash(`  ${hash}  `, MASTER_KEY)).toBe(false);
+    expect(verifyCallbackHash(` ${hash}`, MASTER_KEY)).toBe(false);
+    expect(verifyCallbackHash(`${hash} `, MASTER_KEY)).toBe(false);
   });
 });
