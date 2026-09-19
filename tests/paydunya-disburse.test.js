@@ -3,7 +3,7 @@ import { jest } from '@jest/globals';
 import request from 'supertest';
 import { app } from '../src/app.js';
 import { prisma } from '../src/config/prisma.js';
-import { getInvoice, withdrawModeFor, toAccountAlias, verifyCallbackHash } from '../src/utils/paydunya-disburse.js';
+import { getInvoice, submitInvoice, checkStatus, withdrawModeFor, toAccountAlias, verifyCallbackHash } from '../src/utils/paydunya-disburse.js';
 import { loadPaydunyaConfig } from '../src/utils/paydunya-config.js';
 
 /**
@@ -44,7 +44,7 @@ describe('PayDunya disburse client (API PUSH)', () => {
       status,
       json: async () => data
     }));
-    global.fetch = fn;
+    jest.spyOn(global, 'fetch').mockImplementation(fn);
     return fn;
   }
 
@@ -147,6 +147,66 @@ describe('PayDunya disburse client (API PUSH)', () => {
       .send({ hash, status: 'success', token: 'unknown-token' });
     expect(res.status).toBe(200);
     expect(res.body.message).toBe('Transaction inconnue');
+  });
+
+  it.each([
+    ['json', {}],
+    ['form', '']
+  ])('rejette un POST %s vide sans signature ni modification financière', async (contentType, body) => {
+    const transactionSpy = jest.spyOn(prisma, '$transaction');
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type(contentType)
+      .send(body);
+    expect(res.status).toBe(403);
+    expect(res.body.message).toBe('Signature invalide');
+    expect(transactionSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([{ data: {} }, { data: '' }, { data: null }, { unexpected: 'probe' }])(
+    'rejette un callback sans signature (%j)', async (body) => {
+      const res = await request(app)
+        .post('/api/v1/payments/paydunya/disburse-callback')
+        .send(body);
+      expect([400, 403]).toContain(res.status);
+      expect(res.body.success).toBe(false);
+    }
+  );
+
+  it('accepte les champs du callback API PUSH en form-urlencoded', async () => {
+    // API PUSH §1 : champs à plat et hash SHA-512 de la MasterKey.
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send({
+        hash: createHash('sha512').update(`mk-${suffix}`).digest('hex'),
+        status: 'success', token: 'unknown-token ', withdraw_mode: 'wave-senegal',
+        amount: '203.00', updated_at: '11/01/2024 14:30:32',
+        disburse_id: 'REF-TEST', transaction_id: 'TX-TEST', disburse_tx_id: 'OP-TEST'
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Transaction inconnue');
+  });
+
+  it('accepte un succès wallet sans status, comme dans les exemples API PUSH', async () => {
+    mockFetch(200, { response_code: '00', transaction_id: 'TX-TEST', provider_ref: 'OP-TEST' });
+    const result = await submitInvoice({ disburseToken: 'token-test' });
+    expect(result).toMatchObject({ ok: true, status: 'success', transactionId: 'TX-TEST', providerRef: 'OP-TEST' });
+  });
+
+  it('ne transforme pas un statut de soumission inconnu en succès', async () => {
+    mockFetch(200, { response_code: '00', status: 'unexpected' });
+    expect((await submitInvoice({ disburseToken: 'token-test' })).ok).toBe(false);
+  });
+
+  it.each([
+    [200, { response_code: '5000', status: 'failed' }],
+    [500, { response_code: '00', status: 'failed' }],
+    [200, { response_code: '00', status: 'unexpected' }],
+    [200, { response_code: '00' }]
+  ])('ne confirme pas un statut à partir d’une réponse invalide (%i, %j)', async (httpStatus, body) => {
+    mockFetch(httpStatus, body);
+    expect((await checkStatus('token-test')).ok).toBe(false);
   });
 
   it('le callback rejette un hash invalide (403 Signature invalide)', async () => {
