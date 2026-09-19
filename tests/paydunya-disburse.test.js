@@ -150,6 +150,48 @@ describe('PayDunya disburse client (API PUSH)', () => {
   });
 
   it.each([
+    'application/x-www-form-urlencoded',
+    'application/x-www-form-urlencoded; charset=UTF-8'
+  ])('acquitte exactement la sonde data= observée en production (%s), sans accès à la base', async (contentType) => {
+    const configSpy = jest.spyOn(prisma.systemConfig, 'findMany');
+    const lookupSpy = jest.spyOn(prisma.withdrawal, 'findUnique');
+    const referenceSpy = jest.spyOn(prisma.withdrawal, 'findFirst');
+    const transactionSpy = jest.spyOn(prisma, '$transaction');
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .set('Content-Type', contentType)
+      .send('data=');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, message: 'Callback PayDunya disponible' });
+    expect(configSpy).not.toHaveBeenCalled();
+    expect(lookupSpy).not.toHaveBeenCalled();
+    expect(referenceSpy).not.toHaveBeenCalled();
+    expect(transactionSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'data=&status=success&token=unknown-token',
+    'data=&hash=forged',
+    'data=&data=',
+    'data=%20',
+    'data=%7B%7D',
+    'data[status]=success&data[token]=unknown-token',
+    'data[]=',
+    'data=null'
+  ])('ne laisse pas une notification non signée emprunter le chemin de la sonde (%s)', async (body) => {
+    const transactionSpy = jest.spyOn(prisma, '$transaction');
+    const lookupSpy = jest.spyOn(prisma.withdrawal, 'findUnique');
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send(body);
+    expect([400, 403]).toContain(res.status);
+    expect(res.body.success).toBe(false);
+    expect(transactionSpy).not.toHaveBeenCalled();
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['json', {}],
     ['form', '']
   ])('rejette un POST %s vide sans signature ni modification financière', async (contentType, body) => {

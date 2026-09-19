@@ -12,6 +12,20 @@ Source : [documentation officielle API PUSH](https://developers.paydunya.com/doc
 
 La documentation ne précise pas de protocole de sonde GET/HEAD ou POST vide. Leur réponse HTTP ne suffit donc pas à identifier la cause du refus PayDunya.
 
+## Sonde observée en production
+
+Les logs du 19 septembre 2026 à 17:43:18 UTC montrent, pendant `get-invoice`,
+un POST `application/x-www-form-urlencoded` avec une seule clé `data`, de type
+chaîne et de longueur zéro. Son rejet local en HTTP 400 est immédiatement suivi
+du refus PayDunya `4002: the callback is not accessible`.
+
+Le correctif acquitte uniquement ce formulaire `data=` en HTTP 200, sans
+lecture de configuration, recherche de retrait ni écriture en base. Cette
+compatibilité repose sur les logs observés, pas sur une sonde décrite dans la
+documentation. Les autres corps, notamment `data=` accompagné de champs de
+transaction, passent toujours par la validation habituelle. Les requêtes GET
+et les POST entièrement vides ne bénéficient d'aucune exception.
+
 ## Choix ProColis
 
 L'approbation retourne HTTP 502 et `success: false` si le versement échoue : c'est le contrat de notre API, pas une exigence PayDunya. Après une soumission, une réponse ambiguë ou un incident réseau conserve les fonds gelés. Une seule reprise immédiate est autorisée par appel ; un retrait encore incertain reste à réconcilier.
