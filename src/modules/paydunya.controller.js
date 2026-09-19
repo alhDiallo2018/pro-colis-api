@@ -546,52 +546,92 @@ export const paydunyaCancel = (_req, res) => {
 // --- Callback de déboursement (API PUSH) ---
 // PayDunya notifie le statut final d'un retrait ; `hash` = SHA-512 de la MasterKey.
 // Doc : https://developers.paydunya.com/doc/FR/api_deboursement
+//
+// PayDunya envoie ce callback en application/x-www-form-urlencoded avec les
+// données regroupées sous la clé `data` (chaîne JSON). L'ancien format
+// « champs à plat » (hash/status/token au niveau racine) reste accepté.
+// On ne fait jamais confiance au contenu reçu : le `data` est validé/parsé
+// avant toute vérification, et un JSON invalide est rejeté en 400.
+function normalizeDisburseCallbackPayload(body) {
+  const source = body && typeof body === 'object' ? body : {}
+  const data = source.data
+
+  if (data === undefined || data === null) {
+    return { payload: source, error: null }
+  }
+
+  if (typeof data === 'string') {
+    let parsed
+    try {
+      parsed = JSON.parse(data)
+    } catch {
+      return { payload: null, error: 'INVALID_JSON' }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { payload: null, error: 'INVALID_JSON' }
+    }
+    return { payload: parsed, error: null }
+  }
+
+  if (typeof data === 'object' && !Array.isArray(data)) {
+    return { payload: data, error: null }
+  }
+
+  return { payload: null, error: 'INVALID_DATA' }
+}
+
 export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', async (req, res) => {
   const { verifyCallbackHash } = await import('../utils/paydunya-disburse.js')
   const { loadPaydunyaConfig } = await import('../utils/paydunya-config.js')
   const { finalizeWithdrawalSuccess, failWithdrawal } = await import('../utils/withdrawal-flow.js')
 
   const config = await loadPaydunyaConfig(true)
-  const payload = req.body ?? {}
+  const rawBody = req.body ?? {}
+  const { payload: normalizedPayload, error: dataError } = normalizeDisburseCallbackPayload(rawBody)
+  const payload = normalizedPayload ?? {}
 
   // --- DIAGNOSTIC TEMPORAIRE (à retirer après investigation) ---
   // Journalise uniquement le contenu NON-sensible du callback pour comprendre
-  // la divergence de hash. Jamais de masterKey/privateKey/token/credentials.
-  // Le hash SHA-512 n'est pas un secret et peut être affiché en entier.
-  const diagnosticBodyKeys = Object.keys(payload)
+  // la divergence de hash. Jamais de masterKey/privateKey/token/Authorization/
+  // cookies/credentials. Le hash SHA-512 reçu/attendu est un dérivé, pas un secret.
+  const hasData = rawBody.data !== undefined && rawBody.data !== null
+  const diagnosticBodyKeys = Object.keys(rawBody)
   const diagnosticContentType = String(req.get('content-type') ?? '')
-  const diagnosticReceivedHash = String(payload.hash ?? '').trim().toLowerCase()
-  const diagnosticExpectedHash = createHash('sha512').update(config.masterKey).digest('hex').toLowerCase()
-  const diagnosticHashMatches = diagnosticReceivedHash.length > 0 && diagnosticReceivedHash === diagnosticExpectedHash
+  const diagnosticDataType = typeof rawBody.data
+  const diagnosticDataKeys = hasData && !dataError ? Object.keys(payload) : null
+  const diagnosticReceivedHash = String(payload.hash ?? '')
+  const diagnosticExpectedHash = createHash('sha512').update(config.masterKey).digest('hex')
+  const diagnosticHashMatches = verifyCallbackHash(payload.hash, config.masterKey)
   req.log?.info?.(
     {
       paydunyaDisburseCallbackDiagnostic: {
         requestId: req.requestId,
         contentType: diagnosticContentType,
         bodyKeys: diagnosticBodyKeys,
-        fieldTypes: diagnosticBodyKeys.map((k) => `${k}->${typeof payload[k]}`),
+        dataType: diagnosticDataType,
+        dataKeys: diagnosticDataKeys,
         hashPresent: Boolean(payload.hash),
         hashLength: String(payload.hash ?? '').length,
         hashReceived: diagnosticReceivedHash,
         hashExpected: diagnosticExpectedHash,
         hashMatches: diagnosticHashMatches,
-        hashReceivedLength: diagnosticReceivedHash.length,
-        hashExpectedLength: diagnosticExpectedHash.length,
         status: payload.status ?? null,
-        tokenPresent: Boolean(payload.token ?? payload.disburse_invoice),
         withdrawMode: payload.withdraw_mode ?? null,
         amount: payload.amount ?? null,
         disburseId: payload.disburse_id ?? null,
         transactionId: payload.transaction_id ?? null,
         disburseTxId: payload.disburse_tx_id ?? null,
-        updatedAt: payload.updated_at ?? null,
-        dataHashPresent: Boolean(payload.data?.hash),
-        dataKeys: payload.data && typeof payload.data === 'object' ? Object.keys(payload.data) : null
+        updatedAt: payload.updated_at ?? null
       }
     },
     'PayDunya disburse callback diagnostic'
   )
   // --- FIN DIAGNOSTIC TEMPORAIRE ---
+
+  if (dataError) {
+    req.log?.warn?.({ requestId: req.requestId, dataError }, 'PayDunya disburse callback rejected: invalid data')
+    return fail(res, { status: 400, message: 'Données callback PayDunya invalides', code: 'INVALID_CALLBACK_DATA' })
+  }
 
   if (!verifyCallbackHash(payload.hash, config.masterKey)) {
     req.log?.warn?.({ requestId: req.requestId }, 'PayDunya disburse callback rejected: invalid hash')

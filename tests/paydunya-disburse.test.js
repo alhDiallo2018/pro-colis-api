@@ -165,14 +165,63 @@ describe('PayDunya disburse client (API PUSH)', () => {
     expect(res.body.message).toBe('Signature invalide');
   });
 
-  it('le callback rejette un hash présent uniquement dans une structure non supportée (data.hash)', async () => {
+  it('accepte un hash présent dans data (objet)', async () => {
     const masterKey = `mk-${suffix}`;
     const hash = createHash('sha512').update(masterKey).digest('hex');
     const res = await request(app)
       .post('/api/v1/payments/paydunya/disburse-callback')
       .send({ data: { hash, status: 'success' }, token: 'unknown-token' });
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Transaction inconnue');
+  });
+
+  it('accepte data JSON stringifié avec hash valide (format form-urlencoded PayDunya)', async () => {
+    const masterKey = `mk-${suffix}`;
+    const hash = createHash('sha512').update(masterKey).digest('hex');
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send({
+        data: JSON.stringify({
+          hash,
+          status: 'success',
+          token: 'unknown-token',
+          withdraw_mode: 'wave-senegal',
+          amount: '500',
+          disburse_id: 'DISB-1',
+          transaction_id: 'TX-1',
+          disburse_tx_id: 'DTX-1',
+          updated_at: new Date().toISOString()
+        })
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Transaction inconnue');
+  });
+
+  it('rejette data JSON stringifié avec hash invalide (403)', async () => {
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send({ data: JSON.stringify({ hash: 'forged', status: 'success', token: 'unknown-token' }) });
     expect(res.status).toBe(403);
     expect(res.body.message).toBe('Signature invalide');
+  });
+
+  it('rejette un data JSON invalide (400)', async () => {
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send({ data: '{not-valid-json' });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Données callback PayDunya invalides');
+  });
+
+  it('rejette un data qui ne se parse pas en objet (400)', async () => {
+    const res = await request(app)
+      .post('/api/v1/payments/paydunya/disburse-callback')
+      .type('form')
+      .send({ data: '42' });
+    expect(res.status).toBe(400);
   });
 
   it('le callback traite un body encodé en form-urlencoded (Content-Type PayDunya)', async () => {
@@ -190,6 +239,119 @@ describe('PayDunya disburse client (API PUSH)', () => {
     const cfg = await loadPaydunyaConfig(true);
     expect(cfg.masterKey).toBe(`mk-${suffix}`);
     expect(cfg.mode).toBe('test');
+  });
+});
+
+describe('PayDunya disburse callback — statut success/failed', () => {
+  const suffix = Date.now().toString().slice(-7);
+  const MASTER_KEY = `cb-mk-${suffix}`;
+  const phone = `76${suffix}`;
+  const DISBURSE_TOKEN = `CB-TOKEN-${suffix}`;
+  let userId;
+  let withdrawalId;
+
+  const validHash = createHash('sha512').update(MASTER_KEY).digest('hex');
+
+  function callback({ data, type = 'json' } = {}) {
+    const req = request(app).post('/api/v1/payments/paydunya/disburse-callback');
+    return type === 'form' ? req.type('form').send({ data }) : req.send(data);
+  }
+
+  beforeAll(async () => {
+    for (const [key, value] of [
+      ['paydunya.masterKey', MASTER_KEY],
+      ['paydunya.privateKey', `cb-pk-${suffix}`],
+      ['paydunya.token', `cb-tk-${suffix}`],
+      ['paydunya.mode', 'test']
+    ]) {
+      await prisma.systemConfig.upsert({ where: { key }, update: { value }, create: { key, value } });
+    }
+
+    const user = await prisma.user.create({ data: { phone, fullName: 'Driver CB', role: 'driver' } });
+    userId = user.id;
+    await prisma.wallet.create({ data: { userId, balance: 5000, pendingBalance: 2000, totalDeposited: 5000 } });
+    const withdrawal = await prisma.withdrawal.create({
+      data: {
+        walletUserId: userId,
+        amount: 2000,
+        method: 'wave',
+        phone,
+        status: 'processing',
+        reference: `REF-${suffix}`,
+        disburseToken: DISBURSE_TOKEN
+      }
+    });
+    withdrawalId = withdrawal.id;
+  });
+
+  afterAll(async () => {
+    if (userId) {
+      await prisma.withdrawal.deleteMany({ where: { walletUserId: userId } });
+      await prisma.walletTransaction.deleteMany({ where: { walletUserId: userId } });
+      await prisma.wallet.deleteMany({ where: { userId: userId } });
+      await prisma.notification.deleteMany({ where: { userId: userId } });
+      await prisma.user.delete({ where: { id: userId } }).catch(() => {});
+    }
+    await prisma.systemConfig.deleteMany({ where: { key: { startsWith: 'paydunya.' } } });
+    await prisma.$disconnect();
+  });
+
+  it('statut success → finalise le retrait (form-urlencoded, data JSON stringifié)', async () => {
+    const res = await callback({
+      type: 'form',
+      data: JSON.stringify({
+        hash: validHash,
+        status: 'success',
+        token: DISBURSE_TOKEN,
+        transaction_id: 'TX-SUCCESS',
+        disburse_tx_id: 'DTX-SUCCESS'
+      })
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Callback traité');
+
+    const withdrawal = await prisma.withdrawal.findUnique({ where: { id: withdrawalId } });
+    expect(withdrawal.status).toBe('completed');
+    expect(withdrawal.transactionId).toBe('TX-SUCCESS');
+    expect(withdrawal.providerRef).toBe('DTX-SUCCESS');
+
+    const wallet = await prisma.wallet.findUnique({ where: { userId } });
+    expect(Number(wallet.pendingBalance)).toBe(0);
+    expect(Number(wallet.totalWithdrawn)).toBe(2000);
+  });
+
+  it('statut failed → échoue le retrait et recrédite le solde gelé', async () => {
+    const failedWithdrawal = await prisma.withdrawal.create({
+      data: {
+        walletUserId: userId,
+        amount: 1500,
+        method: 'wave',
+        phone,
+        status: 'processing',
+        reference: `REF-FAIL-${suffix}`,
+        disburseToken: `CB-TOKEN-FAIL-${suffix}`
+      }
+    });
+    const walletBefore = await prisma.wallet.findUnique({ where: { userId } });
+
+    const res = await callback({
+      type: 'form',
+      data: JSON.stringify({
+        hash: validHash,
+        status: 'failed',
+        token: `CB-TOKEN-FAIL-${suffix}`
+      })
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.message).toBe('Callback traité');
+
+    const withdrawal = await prisma.withdrawal.findUnique({ where: { id: failedWithdrawal.id } });
+    expect(withdrawal.status).toBe('failed');
+    expect(withdrawal.failureReason).toBeTruthy();
+
+    const wallet = await prisma.wallet.findUnique({ where: { userId } });
+    expect(Number(wallet.pendingBalance)).toBe(Number(walletBefore.pendingBalance) - 1500);
+    expect(Number(wallet.balance)).toBe(Number(walletBefore.balance) + 1500);
   });
 });
 
