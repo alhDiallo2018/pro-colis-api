@@ -657,3 +657,22 @@ Statut : `SPEC`
 | POST | `/identity/verify` | `{ "documentType": "driver_license" }` | `{ "success": true, "identity": {} }` |
 | POST | `/identity/upload` | multipart `file`, `side=front` | `{ "success": true, "url": "..." }` |
 | GET | `/identity/status` | aucun | `{ "success": true, "status": "pending" }` |
+
+## Lieux des annonces et accès aux dettes
+
+Le sélecteur mobile utilise les zones : après `POST /zones/resolve`, envoyer
+`data.id` dans `departureZoneId` / `arrivalZoneId`. `garageId` est uniquement
+compatible avec les anciens champs `departureGarageId` / `arrivalGarageId`.
+Une zone nouvellement créée en statut `pending` peut être utilisée pour
+publier une annonce, même si elle n'apparaît pas encore dans la liste publique.
+
+Toutes les réponses annonces (liste, mes annonces, détail, création,
+modification, fermeture) exposent `departureName` / `arrivalName`, ainsi que
+les noms des zones et garages et les villes avec repli sur un lieu lisible.
+Le mobile privilégie ces noms et ignore les chaînes vides.
+
+**Profil → Mes dettes** ouvre le portefeuille chauffeur avec le montant de la
+dette, son éventuel blocage et le règlement depuis le solde disponible.
+La lecture utilise `GET /driver/wallet` et le règlement
+`POST /driver/wallet/pay-debt`. L'achat de points existant permet également
+la régularisation automatique de la dette par le backend.

@@ -49,6 +49,7 @@ Payload register minimal :
 
 | Methode | Route | Roles | Description |
 | --- | --- | --- | --- |
+| GET | `/client/debts` | client | Dettes personnelles paginées et total restant dû (FCFA). |
 | PUT | `/client/profile` | client | Modifier profil client. |
 | PUT | `/driver/profile` | driver | Modifier profil chauffeur. |
 | PUT | `/garage-admin/profile` | admin | Modifier profil admin garage. |

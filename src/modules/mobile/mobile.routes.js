@@ -25,6 +25,7 @@ mobileRouter.put('/users/profile-photo', authenticate, mobileController.updatePr
 // CLIENT
 // ============================================================
 
+mobileRouter.get('/client/debts', authenticate, requireRoles('client'), mobileController.clientDebts);
 mobileRouter.put('/client/profile', authenticate, requireRoles('client'), mobileController.updateProfile);
 mobileRouter.get('/client/parcels/my-parcels', authenticate, requireRoles('client'), mobileController.clientParcels);
 mobileRouter.post('/client/parcels/create', authenticate, requireRoles('client'), mobileController.createParcel);

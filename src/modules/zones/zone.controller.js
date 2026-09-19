@@ -330,9 +330,9 @@ export const detectZones = handle('zones.detect', async (req, res) => {
  * proximité. Une zone créée automatiquement est en statut "pending" (à valider
  * par un admin) et n'est donc pas encore proposée publiquement.
  *
- * La réponse porte TOUJOURS le garage miroir (`garage` / `garageId`) : c'est cet
- * identifiant que les fronts doivent envoyer comme zone de départ / d'arrivée,
- * car `parcels` et `advertisements` référencent `garages.id`.
+ * `data.id` alimente departureZoneId / arrivalZoneId. Le garage miroir
+ * (`garage` / `garageId`) reste disponible pour les anciens clients qui
+ * utilisent departureGarageId / arrivalGarageId : ne pas mélanger ces FK.
  *
  * Body : { placeId?, name, displayName?, latitude, longitude, country?, region?, city? }
  */
@@ -441,8 +441,8 @@ export const resolveZone = handle('zones.resolve', async (req, res) => {
       }),
       include: { _count: { select: { driverZones: true } }, parent: { select: { id: true, name: true } } }
     });
-    // Sans miroir, la zone tout juste creee est inutilisable comme depart /
-    // arrivee : colis et annonces referencent `garages.id`, pas `zones.id`.
+    // Le miroir maintient la compatibilité des anciens clients qui utilisent
+    // encore departureGarageId / arrivalGarageId.
     const mirror = await ensureZoneGarage(tx, zone);
     await audit(tx, req, {
       action: 'zone.autocreate',
