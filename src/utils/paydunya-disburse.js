@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { env } from '../config/env.js';
+import { logger } from '../config/logger.js';
 import { loadPaydunyaConfig, paydunyaConfigSnapshot } from './paydunya-config.js';
 
 /**
@@ -39,6 +40,23 @@ export function toAccountAlias(phone) {
   return digits;
 }
 
+/**
+ * Masque un numéro de compte/téléphone pour les logs : conserve les 3 premiers
+ * et 3 derniers caractères (ex. 771234567 → 771****567, BSN0349122881 → BSN****881).
+ * Ne jamais journaliser ces valeurs en clair.
+ */
+function maskAccount(value) {
+  const v = String(value ?? '');
+  if (!v) return '';
+  if (v.length <= 6) return '****';
+  return `${v.slice(0, 3)}****${v.slice(-3)}`;
+}
+
+/** Masque toute suite de 7 chiffres ou plus dans un texte libre (description). */
+function maskSensitiveText(value) {
+  return String(value ?? '').replace(/\d{7,}/g, (run) => maskAccount(run));
+}
+
 async function headers() {
   const cfg = await loadPaydunyaConfig();
   return {
@@ -61,6 +79,25 @@ async function post(path, body) {
   } catch {
     data = { response_text: `Réponse PayDunya illisible (HTTP ${response.status})` };
   }
+  // Log sécurisé de la réponse PayDunya : jamais les clés ni le token disburse,
+  // et les comptes/numéros sont masqués avant écriture. Les références de
+  // transaction (non secrètes) permettent de tracer le flux de bout en bout.
+  logger.info(
+    {
+      type: 'PAYDUNYA_RESPONSE',
+      endpoint: path,
+      http_status: response.status,
+      response_code: data?.response_code ?? null,
+      response_text: data?.response_text ?? null,
+      description: maskSensitiveText(data?.description),
+      status: data?.status ?? null,
+      transaction_id: data?.transaction_id ?? null,
+      provider_ref: data?.disburse_tx_id ?? data?.provider_ref ?? null,
+      disburse_id: data?.disburse_id ?? null,
+      environment: env.NODE_ENV
+    },
+    'PayDunya disbursement response'
+  );
   return { httpStatus: response.status, data };
 }
 
@@ -68,14 +105,39 @@ async function post(path, body) {
  * Étape 1 — création de la requête de déboursement.
  * Retourne { ok, disburseToken, error }.
  */
-export async function getInvoice({ accountAlias, amount, withdrawMode, callbackUrl }) {
-  const { data } = await post('/get-invoice', {
+export async function getInvoice({ accountAlias, amount, withdrawMode, callbackUrl, debitAccountNumber }) {
+  const cfg = await loadPaydunyaConfig();
+  // Numéro de compte marchand à débiter. Uniquement pertinent pour les
+  // transferts compte à compte (`withdraw_mode: paydunya`) : sans lui, PayDunya
+  // débite le compte par défaut du pays du bénéficiaire, qui peut ne pas être
+  // celui approvisionné (→ 4002 « fonds insuffisants »).
+  const debitAccount = debitAccountNumber ?? cfg.debitAccountNumber;
+  const body = {
     account_alias: accountAlias,
     // "amount" ne doit pas être une valeur décimale, devise XOF.
     amount: Math.trunc(amount),
     withdraw_mode: withdrawMode,
     callback_url: callbackUrl
-  });
+  };
+  if (withdrawMode === 'paydunya' && debitAccount) {
+    body.debit_account_number = debitAccount;
+  }
+
+  // Log sécurisé de la requête de déboursement : comptes masqués, jamais de clés.
+  logger.info(
+    {
+      type: 'PAYOUT_REQUEST',
+      amount: body.amount,
+      withdraw_mode: body.withdraw_mode,
+      account_alias: maskAccount(body.account_alias),
+      callback_url: body.callback_url,
+      debit_account_number: body.debit_account_number ? maskAccount(body.debit_account_number) : null,
+      environment: env.NODE_ENV
+    },
+    'PayDunya payout request'
+  );
+
+  const { data } = await post('/get-invoice', body);
   if (data?.response_code === '00' && data?.disburse_token) {
     return { ok: true, disburseToken: String(data.disburse_token).trim() };
   }
@@ -138,8 +200,47 @@ function describeError(data) {
   const KNOWN = {
     1001: 'Mode de retrait non pris en charge',
     401: 'Initiation non autorisée (API de déboursement inactive sur le compte PayDunya)',
-    4002: 'Fonds insuffisants sur le compte marchand PayDunya, ou callback inaccessible',
     5000: 'Service PayDunya en maintenance, réessayer plus tard'
   };
-  return { code: code ?? null, message: KNOWN[code] ?? String(text) };
+
+  // Le code 4002 recouvre deux causes distinctes documentées par PayDunya :
+  //  - fonds insuffisants sur le compte marchand ;
+  //  - callback inaccessible.
+  // Le `response_text` renvoyé permet de les distinguer ; sans lui on reste
+  // explicite sur l'ambiguïté plutôt que d'accuser à tort l'un des deux.
+  if (code === '4002' || String(code).split(',').includes('4002')) {
+    const t = String(text).toLowerCase();
+    if (t.includes('callback')) {
+      return {
+        code: code ?? null,
+        kind: 'CALLBACK_UNREACHABLE',
+        message: 'Callback PayDunya inaccessible : vérifier callback_url (URL publique, HTTPS, POST 2xx)'
+      };
+    }
+    if (t.includes('fund') || t.includes('enough') || t.includes('fonds')) {
+      return {
+        code: code ?? null,
+        kind: 'MERCHANT_INSUFFICIENT_FUNDS',
+        message: 'Fonds insuffisants sur le compte marchand PayDunya'
+      };
+    }
+    return {
+      code: code ?? null,
+      kind: 'UNKNOWN_PAYDUNYA_ERROR',
+      message: 'Fonds insuffisants sur le compte marchand PayDunya, ou callback inaccessible'
+    };
+  }
+
+  return {
+    code: code ?? null,
+    kind:
+      code === '401'
+        ? 'PAYDUNYA_CONFIGURATION_ERROR'
+        : code === '5000'
+          ? 'PAYDUNYA_API_ERROR'
+          : KNOWN[code]
+            ? 'PAYDUNYA_API_ERROR'
+            : 'UNKNOWN_PAYDUNYA_ERROR',
+    message: KNOWN[code] ?? String(text)
+  };
 }

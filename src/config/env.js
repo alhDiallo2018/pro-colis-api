@@ -76,6 +76,11 @@ const envSchema = z.object({
   PAYDUNYA_TOKEN: z.string().optional(),
   PAYDUNYA_MODE: z.enum(['test', 'live']).default('test'),
   PAYDUNYA_STORE_NAME: z.string().default('ProColis'),
+  // Numéro de compte marchand PayDunya à débiter lors d'un déboursement compte à
+  // compte (`withdraw_mode: paydunya`). Laissé vide, PayDunya débite le compte
+  // marchand par défaut du pays du bénéficiaire — qui peut ne pas être celui
+  // réellement approvisionné, d'où une erreur 4002 « fonds insuffisants ».
+  PAYDUNYA_DEBIT_ACCOUNT_NUMBER: z.string().optional(),
   PAYDUNYA_DISBURSE_BASE_URL: z.string().url().default('https://app.paydunya.com/api/v2/disburse'),
   // Montant minimum accepté par les canaux PayDunya (XOF). Encaissement (pay-in)
   // et déboursement (pay-out) refusent en dessous de ce seuil.
