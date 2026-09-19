@@ -772,14 +772,25 @@ export const approveWithdrawal = handle('finance.approveWithdrawal', async (req,
   // Déboursement PayDunya automatique (API PUSH) — sinon versement manuel puis /complete.
   const disbursed = await attemptDisbursement(result.id, req.log);
   const final = disbursed ?? result;
+  const data = { status: toClientWithdrawalStatus(final.status), withdrawal: { id: final.id, status: toClientWithdrawalStatus(final.status), failureReason: final.failureReason ?? null } };
+  // L'approbation a été enregistrée, mais le versement peut être refusé par le
+  // prestataire. Exposer cet échec HTTP tout en conservant le retrait retourné
+  // permet au client d'afficher son état final et le recrédit déjà effectué.
+  if (final.status === 'failed') {
+    req.log?.warn?.({ withdrawalId: final.id, failureReason: final.failureReason }, 'Withdrawal disbursement failed');
+    return res.status(502).json({
+      success: false,
+      message: `Deboursement echoue : ${final.failureReason ?? 'erreur prestataire'} (montant recredite)`,
+      error: { code: 'WITHDRAWAL_DISBURSEMENT_FAILED', details: [] },
+      ...data
+    });
+  }
   return ok(res, {
     message:
       final.status === 'completed'
         ? 'Retrait approuve et verse via PayDunya'
-        : final.status === 'failed'
-          ? `Deboursement echoue : ${final.failureReason ?? 'erreur prestataire'} (montant recredite)`
-          : 'Retrait approuve',
-    data: { status: toClientWithdrawalStatus(final.status), withdrawal: { id: final.id, status: toClientWithdrawalStatus(final.status), failureReason: final.failureReason ?? null } }
+        : 'Retrait approuve',
+    data
   });
 });
 

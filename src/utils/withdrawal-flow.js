@@ -199,50 +199,81 @@ export async function attemptDisbursement(withdrawalId, log) {
   const mode = withdrawModeFor(method);
   if (!mode) return null;
 
-  // Retrait déjà soumis : on vérifie le statut au lieu de re-soumettre (doc officielle).
+  // Après une soumission incertaine, seule une vérification permet de décider
+  // de resoumettre. Une erreur réseau de check-status laisse les fonds gelés.
+  const verifyStatus = async (token) => {
+    try {
+      const result = await checkStatus(token);
+      if (!result.ok) log?.warn?.({ withdrawalId, error: result.error }, 'PayDunya check-status unconfirmed');
+      return result;
+    } catch {
+      // Ne pas journaliser l'exception HTTP brute, susceptible de contenir le token.
+      log?.error?.({ withdrawalId }, 'PayDunya check-status unavailable; withdrawal remains processing');
+      return { ok: false };
+    }
+  };
+
+  let processing = withdrawal;
   if (withdrawal.disburseToken) {
-    const verified = await checkStatus(withdrawal.disburseToken);
+    const verified = await verifyStatus(withdrawal.disburseToken);
     if (verified.ok && verified.status === 'success') {
       return finalizeWithdrawalSuccess(withdrawal.id, { transactionId: verified.transactionId, providerRef: verified.providerRef });
     }
     if (verified.ok && verified.status === 'failed') {
       return failWithdrawal(withdrawal.id, 'Transaction refusée par l’opérateur');
     }
-    return withdrawal; // created/pending → on attend le callback
+    if (!verified.ok || verified.status !== 'created') return withdrawal;
+    // API PUSH, section 4 : CREATED exige un Submit avec le MÊME token.
+  } else {
+    const callbackUrl = `${env.PUBLIC_BASE_URL.replace(/\/+$/, '')}/api/v1/payments/paydunya/disburse-callback`;
+    const invoice = await getInvoice({
+      accountAlias: method === 'paydunya' ? withdrawal.phone : toAccountAlias(withdrawal.phone),
+      amount: Number(withdrawal.amount),
+      withdrawMode: mode,
+      callbackUrl
+    });
+    if (!invoice.ok) {
+      log?.warn?.({ withdrawalId, error: invoice.error }, 'PayDunya get-invoice failed');
+      // Aucun Submit n'a eu lieu : le refus de création permet de libérer les fonds.
+      return failWithdrawal(withdrawal.id, invoice.error.message);
+    }
+
+    processing = await prisma.withdrawal.update({
+      where: { id: withdrawal.id },
+      data: { status: 'processing', disburseToken: invoice.disburseToken, processedAt: new Date() }
+    });
   }
 
-  const callbackUrl = `${env.PUBLIC_BASE_URL}/api/v1/payments/paydunya/disburse-callback`;
-  const invoice = await getInvoice({
-    accountAlias: method === 'paydunya' ? withdrawal.phone : toAccountAlias(withdrawal.phone),
-    amount: Number(withdrawal.amount),
-    withdrawMode: mode,
-    callbackUrl
-  });
-  if (!invoice.ok) {
-    log?.warn?.({ withdrawalId, error: invoice.error }, 'PayDunya get-invoice failed');
-    return failWithdrawal(withdrawal.id, invoice.error.message);
-  }
+  // Une reprise immédiate au maximum par appel, et seulement après CREATED
+  // confirmé. Cette limite locale évite une boucle sans fin chez le prestataire.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let submitted;
+    try {
+      submitted = await submitInvoice({ disburseToken: processing.disburseToken, disburseId: withdrawal.reference ?? withdrawal.id });
+    } catch {
+      log?.error?.({ withdrawalId }, 'PayDunya submit-invoice unavailable; checking transaction status');
+      submitted = { ok: false };
+    }
+    if (submitted.ok) {
+      if (submitted.status === 'success') {
+        return finalizeWithdrawalSuccess(withdrawal.id, { transactionId: submitted.transactionId, providerRef: submitted.providerRef });
+      }
+      if (submitted.status === 'failed') {
+        return failWithdrawal(withdrawal.id, 'Transaction refusée par l’opérateur');
+      }
+      return processing;
+    }
 
-  const processing = await prisma.withdrawal.update({
-    where: { id: withdrawal.id },
-    data: { status: 'processing', disburseToken: invoice.disburseToken, processedAt: new Date() }
-  });
-
-  const submitted = await submitInvoice({ disburseToken: invoice.disburseToken, disburseId: withdrawal.reference ?? withdrawal.id });
-  if (!submitted.ok) {
-    // Code ≠ 00 : vérifier le statut réel avant de conclure (règle officielle).
-    const verified = await checkStatus(invoice.disburseToken);
+    // API PUSH, section 4 : un code != 00 n'est pas une preuve d'échec du
+    // transfert. Ne jamais recréditer sur un timeout ou un statut inconnu.
+    const verified = await verifyStatus(processing.disburseToken);
     if (verified.ok && verified.status === 'success') {
       return finalizeWithdrawalSuccess(withdrawal.id, { transactionId: verified.transactionId, providerRef: verified.providerRef });
     }
-    if (verified.ok && ['pending', 'created'].includes(verified.status)) return processing;
-    return failWithdrawal(withdrawal.id, submitted.error.message);
-  }
-  if (submitted.status === 'success') {
-    return finalizeWithdrawalSuccess(withdrawal.id, { transactionId: submitted.transactionId, providerRef: submitted.providerRef });
-  }
-  if (submitted.status === 'failed') {
-    return failWithdrawal(withdrawal.id, 'Transaction refusée par l’opérateur');
+    if (verified.ok && verified.status === 'failed') {
+      return failWithdrawal(withdrawal.id, submitted.error?.message ?? 'Transaction refusée par l’opérateur');
+    }
+    if (!verified.ok || verified.status !== 'created') return processing;
   }
   return processing;
 }

@@ -152,13 +152,18 @@ export async function getInvoice({ accountAlias, amount, withdrawMode, callbackU
 export async function submitInvoice({ disburseToken, disburseId }) {
   const body = { disburse_invoice: disburseToken };
   if (disburseId) body.disburse_id = disburseId;
-  const { data } = await post('/submit-invoice', body);
-  if (data?.response_code === '00') {
-    // Certains wallets ne renvoient pas "status" en cas de succès immédiat.
-    const status = (data.status ?? 'success').toLowerCase();
+  const { httpStatus, data } = await post('/submit-invoice', body);
+  if (httpStatus >= 200 && httpStatus < 300 && data?.response_code === '00') {
+    // Les exemples officiels Wave/Orange Money omettent "status" lors d'un
+    // succès immédiat. Un statut explicitement inconnu ne vaut pas succès :
+    // l'orchestrateur devra alors consulter check-status.
+    const status = String(data.status ?? 'success').toLowerCase();
+    if (!['success', 'pending', 'failed'].includes(status)) {
+      return { ok: false, error: { code: '00', kind: 'UNKNOWN_PAYDUNYA_STATUS', message: 'Statut de soumission PayDunya inconnu' } };
+    }
     return {
       ok: true,
-      status: status === 'pending' ? 'pending' : status === 'failed' ? 'failed' : 'success',
+      status,
       transactionId: data.transaction_id ?? null,
       providerRef: data.provider_ref ?? null
     };
@@ -170,11 +175,14 @@ export async function submitInvoice({ disburseToken, disburseId }) {
  * Étape 3 — vérification du statut (created | pending | success | failed).
  */
 export async function checkStatus(disburseToken) {
-  const { data } = await post('/check-status', { disburse_invoice: disburseToken });
-  if (data?.response_code === '00' || data?.status) {
+  const { httpStatus, data } = await post('/check-status', { disburse_invoice: disburseToken });
+  const status = String(data?.status ?? '').toLowerCase();
+  // Une réponse d'erreur, même accompagnée d'un champ "status", ne confirme
+  // aucun mouvement d'argent. Seuls les quatre états documentés sont fiables.
+  if (httpStatus >= 200 && httpStatus < 300 && data?.response_code === '00' && ['created', 'pending', 'success', 'failed'].includes(status)) {
     return {
       ok: true,
-      status: String(data.status ?? '').toLowerCase(),
+      status,
       transactionId: data.transaction_id ?? null,
       providerRef: data.disburse_tx_id ?? data.provider_ref ?? null
     };
@@ -213,7 +221,7 @@ function describeError(data) {
       return {
         code: code ?? null,
         kind: 'CALLBACK_UNREACHABLE',
-        message: 'Callback PayDunya inaccessible : vérifier callback_url (URL publique, HTTPS, POST 2xx)'
+        message: 'PayDunya signale que callback_url est inaccessible ; vérifier l’URL envoyée et les logs du callback'
       };
     }
     if (t.includes('fund') || t.includes('enough') || t.includes('fonds')) {
