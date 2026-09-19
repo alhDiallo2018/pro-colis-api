@@ -547,10 +547,12 @@ export const paydunyaCancel = (_req, res) => {
 // Doc : https://developers.paydunya.com/doc/FR/api_deboursement
 export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', async (req, res) => {
   const { verifyCallbackHash } = await import('../utils/paydunya-disburse.js')
+  const { loadPaydunyaConfig } = await import('../utils/paydunya-config.js')
   const { finalizeWithdrawalSuccess, failWithdrawal } = await import('../utils/withdrawal-flow.js')
 
+  const config = await loadPaydunyaConfig(true)
   const payload = req.body ?? {}
-  if (!verifyCallbackHash(payload.hash)) {
+  if (!verifyCallbackHash(payload.hash, config.masterKey)) {
     req.log?.warn?.({ requestId: req.requestId }, 'PayDunya disburse callback rejected: invalid hash')
     return fail(res, { status: 403, message: 'Signature invalide', code: 'FORBIDDEN' })
   }
