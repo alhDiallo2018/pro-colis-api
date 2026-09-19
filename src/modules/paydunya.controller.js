@@ -634,12 +634,26 @@ function normalizeDisburseCallbackPayload(body) {
 }
 
 export const paydunyaDisburseCallback = handle('paydunya.disburseCallback', async (req, res) => {
+  const rawBody = req.body ?? {}
+  // Les logs de production du 19/09/2026 montrent un POST form-urlencoded
+  // contenant uniquement `data=` pendant get-invoice, avant toute transaction.
+  // Acquitter cette sonde sans charger la config ni accéder à la base. La
+  // signature reste obligatoire pour tout autre corps, même avec data vide.
+  if (
+    req.is('application/x-www-form-urlencoded') &&
+    !Array.isArray(rawBody) &&
+    Object.keys(rawBody).length === 1 &&
+    rawBody.data === ''
+  ) {
+    req.log?.info?.({ requestId: req.requestId }, 'PayDunya disburse callback availability probe acknowledged')
+    return ok(res, { message: 'Callback PayDunya disponible' })
+  }
+
   const { verifyCallbackHash } = await import('../utils/paydunya-disburse.js')
   const { loadPaydunyaConfig } = await import('../utils/paydunya-config.js')
   const { finalizeWithdrawalSuccess, failWithdrawal } = await import('../utils/withdrawal-flow.js')
 
   const config = await loadPaydunyaConfig(true)
-  const rawBody = req.body ?? {}
   const { payload: normalizedPayload, error: dataError, format: dataFormat } = normalizeDisburseCallbackPayload(rawBody)
   const payload = normalizedPayload ?? {}
 

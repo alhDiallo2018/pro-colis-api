@@ -1,4 +1,6 @@
 import { jest } from '@jest/globals';
+import request from 'supertest';
+import { app } from '../src/app.js';
 import { prisma } from '../src/config/prisma.js';
 import { loadPaydunyaConfig, invalidatePaydunyaConfigCache } from '../src/utils/paydunya-config.js';
 import { attemptDisbursement } from '../src/utils/withdrawal-flow.js';
@@ -68,6 +70,29 @@ describe('reprise du déboursement selon la documentation API PUSH', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toMatch(/\/get-invoice$/);
     await expectBalances(5000, 0);
+  });
+
+  it('acquitte la sonde pendant get-invoice puis poursuit le versement sans recrédit', async () => {
+    await prisma.withdrawal.update({ where: { id: withdrawal.id }, data: { disburseToken: null } });
+    // Reproduit la séquence des logs : le prestataire appelle le callback avant
+    // de rendre son token. Le test échoue si data= est de nouveau rejeté.
+    fetchMock.mockImplementationOnce(async () => {
+      const probe = await request(app)
+        .post('/api/v1/payments/paydunya/disburse-callback')
+        .type('form')
+        .send('data=');
+      await expectBalances(3000, 2000);
+      return probe.status === 200
+        ? response({ response_code: '00', disburse_token: 'probe-invoice-token' })
+        : response({ response_code: '4002', response_text: 'the callback is not accessible' });
+    }).mockResolvedValueOnce(statusResponse('success'));
+
+    const result = await attemptDisbursement(withdrawal.id, log);
+    expect(result.status).toBe('completed');
+    expect(fetchMock.mock.calls.map(([url]) => new URL(url).pathname.split('/').pop())).toEqual(['get-invoice', 'submit-invoice']);
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).disburse_invoice).toBe('probe-invoice-token');
+    await expectBalances(3000, 0);
+    expect(await prisma.walletTransaction.count({ where: { walletUserId: userId, type: 'refund' } })).toBe(0);
   });
 
   it('CREATED : resoumet le même token, sans recréer d’invoice', async () => {
