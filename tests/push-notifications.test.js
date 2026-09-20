@@ -43,6 +43,23 @@ describe('charge utile des notifications push', () => {
     });
   });
 
+  test('associe le logo Android à l’aperçu du message sans perdre sa destination', () => {
+    const { message } = buildFcmMessage({
+      token: 'jeton-appareil',
+      title: 'Nouveau message',
+      body: 'Votre colis est arrivé',
+      data: { type: 'message', senderId: 'expediteur' }
+    });
+
+    expect(message.android.notification).toMatchObject({
+      channel_id: 'sendprocolis_channel',
+      icon: 'ic_stat_sendprocolis',
+      color: '#018982'
+    });
+    expect(message.notification.body).toBe('Votre colis est arrivé');
+    expect(message.data).toMatchObject({ type: 'message', senderId: 'expediteur' });
+  });
+
   test('n\'expose que des chaines dans `data`, seule forme acceptee par FCM v1', () => {
     const { message } = buildFcmMessage({
       token: 'jeton',
