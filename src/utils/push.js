@@ -205,6 +205,10 @@ export function buildFcmMessage({ token, title, body, data, badge, priority }) {
         priority: highPriority ? 'HIGH' : 'NORMAL',
         notification: {
           channel_id: 'sendprocolis_channel',
+          // FCM affiche lui-même les notifications en arrière-plan : utiliser
+          // la même ressource monochrome que les notifications locales Flutter.
+          icon: 'ic_stat_sendprocolis',
+          color: '#018982',
           // Les launchers qui gerent les badges numeriques lisent ce champ ;
           // les autres l'ignorent sans erreur.
           notification_count: badge ?? 0,
