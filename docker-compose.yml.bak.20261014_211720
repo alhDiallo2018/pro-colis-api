@@ -1,0 +1,29 @@
+services:
+  api:
+    build: .
+    container_name: procolis-node-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # La base n'est plus conteneurisee. En local elle n'ecoute que sur une
+      # socket Unix : ce chemin ne fonctionne qu'une fois PostgreSQL ouvert en
+      # TCP (voir docker-compose.override.yml). Le developpement courant lance
+      # l'API sur l'hote avec le DATABASE_URL du fichier .env.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://procolis:procolis@host.docker.internal:5433/procolis?schema=public}
+      PORT: 8080
+    ports:
+      - "${API_PORT:-18081}:8080"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./backups:/app/backups
+    networks: [default, observability]
+    logging:
+      driver: local
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  observability:
+    name: ${PROCOLIS_DOCKER_NETWORK:-procolis-observability-shared}
