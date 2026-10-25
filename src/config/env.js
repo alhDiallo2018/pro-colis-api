@@ -120,7 +120,9 @@ const envSchema = z.object({
   FIREBASE_SERVICE_ACCOUNT_PATH: z.string().optional(),
   FIREBASE_SERVICE_ACCOUNT_JSON: z.string().optional(),
   BREVO_API_KEY: z.string().optional(),
-  BREVO_SENDER_EMAIL: z.string().email().optional(),
+  // Compose transmet une chaine vide lorsque l'envoi email n'est pas configure.
+  // Une adresse renseignee doit toutefois rester valide.
+  BREVO_SENDER_EMAIL: z.union([z.literal(''), z.string().email()]).optional(),
   BREVO_SENDER_NAME: z.string().optional(),
   BREVO_SMS_SENDER: z.string().optional()
 }).superRefine((value, context) => {

@@ -12,6 +12,7 @@ services:
       # l'API sur l'hote avec le DATABASE_URL du fichier .env.
       DATABASE_URL: ${DATABASE_URL:-postgresql://procolis:procolis@host.docker.internal:5433/procolis?schema=public}
       PORT: 8080
+      METRICS_TOKEN: "${METRICS_TOKEN:?METRICS_TOKEN doit être défini dans .env}"
     ports:
       - "${API_PORT:-18081}:8080"
     volumes:

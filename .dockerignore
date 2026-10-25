@@ -9,3 +9,7 @@ uploads
 # Les dumps contiennent des donnees privees et restent sur le volume de sauvegarde.
 backups
 .DS_Store
+
+# Sauvegardes et fichiers de recuperation locaux : jamais dans les images.
+*.bak.*
+*.save
