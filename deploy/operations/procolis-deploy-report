@@ -1,0 +1,107 @@
+#!/usr/bin/python3 -I
+"""Etat et causes connues des deploiements ProColis, sans journal brut ni secret."""
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+STATE = Path('/var/lib/procolis-deploy')
+BASE = Path('/home/debian/procolis')
+REVISIONS = {'SendProColis-Api': '49f0b2a3bd7c3b5d4c5e6a25d7152384f4e511e5',
+             'SendProColis-Web': 'fc2150fcd2840fa665dedc1bc49e3c0a649e4690'}
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
+
+
+def protected(path, directory=False):
+    info = path.lstat()
+    valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if not valid_type or info.st_uid != 0 or info.st_mode & 0o077:
+        raise RuntimeError('Etat prive non protege')
+
+
+def known_errors(content):
+    # Retourner uniquement des categories fixes : les lignes npm/SQL peuvent
+    # contenir une URL de connexion ou une valeur d'environnement sensible.
+    patterns = {
+        'git_non_fast_forward': r'Not possible to fast-forward|not an ancestor',
+        'git_conflict': r'CONFLICT|would be overwritten',
+        'git_authentication': r'fatal: Authentication failed|could not read Username|Permission denied \(publickey\)',
+        'git_missing_revision': r'Not a valid commit|unknown revision|bad object',
+        'npm_lockfile': r'can only install packages when|Missing: .+ from lock file|EUSAGE',
+        'typescript_build': r'error TS\d+',
+        'invalid_environment': r'Invalid environment configuration',
+        'brevo_sender_email': r'BREVO_SENDER_EMAIL',
+        'metrics_configuration': r'METRICS_TOKEN',
+        'database_authentication': r'password authentication failed',
+        'database_unreachable': r'could not connect to server|Connection refused',
+        'dump_version': r'server version mismatch',
+        'disk_full': r'No space left on device',
+        'docker_build': r'failed to solve|failed to build',
+    }
+    result = [label for label, pattern in patterns.items() if re.search(pattern, content, re.I)]
+    result += sorted(set(re.findall(r'\bP[1236]\d{3}\b', content)))
+    return result
+
+
+def git(repo, *args):
+    result = subprocess.run(['/usr/sbin/runuser', '-u', 'debian', '--', '/usr/bin/env', '-i',
+        'HOME=/home/debian', 'PATH=/usr/bin:/bin', 'GIT_TERMINAL_PROMPT=0', '/usr/bin/git',
+        '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', str(repo), *args],
+        cwd='/', env=ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+    return result.returncode, result.stdout
+
+
+def inspect():
+    protected(STATE, directory=True)
+    releases = []
+    for path in STATE.glob('release-*'):
+        protected(path, directory=True)
+        releases.append(path)
+    result = {'latest': None, 'repositories': []}
+    if releases:
+        latest = max(releases, key=lambda path: path.stat().st_mtime_ns)
+        details = {'release': latest.name}
+        if (latest / 'report.json').exists():
+            protected(latest / 'report.json')
+            raw = json.loads((latest / 'report.json').read_text())
+            details.update({key: raw.get(key) for key in ('status', 'stage', 'operation', 'repository',
+                            'command', 'exitCode', 'errorType', 'api', 'web')})
+        log = latest / 'operations.log'
+        if log.exists():
+            protected(log)
+            with log.open('rb') as stream:
+                stream.seek(max(0, log.stat().st_size - 262144))
+                details['errorCategories'] = known_errors(stream.read().decode(errors='replace'))
+        result['latest'] = details
+    for name, target in REVISIONS.items():
+        repo = BASE / name
+        rc, revision = git(repo, 'rev-parse', 'HEAD')
+        changes_rc, changes = git(repo, 'diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--name-only')
+        ancestor_rc, _ = git(repo, 'merge-base', '--is-ancestor', 'HEAD', target)
+        result['repositories'].append({'name': name, 'revision': revision.strip() if rc == 0 else None,
+            'target': target, 'ancestorExitCode': ancestor_rc,
+            'trackedFilesChanged': changes.splitlines() if changes_rc == 0 else None})
+    return result
+
+
+def main(args):
+    if args:
+        print('Aucun argument accepte.', file=sys.stderr)
+        return 2
+    if os.geteuid() != 0:
+        print('Executer via sudo.', file=sys.stderr)
+        return 1
+    try:
+        print(json.dumps(inspect(), ensure_ascii=False, indent=2))
+        return 0
+    except Exception as error:
+        # Le message d'une exception externe peut contenir des secrets.
+        print('Rapport indisponible : ' + type(error).__name__, file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

@@ -118,16 +118,20 @@ fixes. La regle contient `""` pour refuser tout argument, ainsi que `NOSETENV`.
 Le programme refuse lui-meme les arguments et une execution hors root.
 
 Seules ces revisions sont autorisees :
-- API : `5779764acc6ec8f69e3c297fb97954ce2eb694f8` ;
-- web : `1a88896599f7c90717a142aad8944282216648a2`.
+- API : `49f0b2a3bd7c3b5d4c5e6a25d7152384f4e511e5` ;
+- web : `fc2150fcd2840fa665dedc1bc49e3c0a649e4690`.
 
 Une nouvelle livraison exige une mise a jour revue par l'administrateur.
 Les depots restent sous `/home/debian` en mode 0700 ; ops n'en obtient aucun
 acces en ecriture. Les fichiers de build sont controles (proprietaire, droits,
 absence de liens). Git s'execute sous debian, sans hooks. Les modifications
-locales des fichiers Compose/Caddy sont conservees dans un stash, appliquees
-apres fast-forward et jamais supprimees automatiquement. D'autres modifications
-locales ou un conflit interrompent la procedure avant la migration.
+locales des fichiers Compose/Caddy/Dockerfile doivent correspondre exactement
+au SHA-256 du patch web examine. Elles sont conservees dans un stash, sans
+reapplication : les corrections de production sont integrees aux commits cibles,
+et le contournement `npm install` est remplace par le lockfile Linux corrige.
+Tout nouveau patch local interrompt la procedure avant modification du depot.
+L'historique API inclut maintenant le commit propre au VPS `ab431d9` ; les deux
+mises a jour restent des fast-forward, sans reset ni push force.
 
 La topologie Docker est controlee : services et volumes ProColis uniquement,
 pas de bind mount, de socket Docker, de mode privilegie ni de port API publie.
@@ -180,3 +184,37 @@ sudo visudo -c
 
 Cela retire le droit de lancer un nouveau deploiement ; une execution deja en
 cours doit etre arretee separement par l'administrateur si necessaire.
+
+
+### Mise a jour de la livraison et droits de diagnostic
+
+`update-procolis-deploy.sh` remplace uniquement l'ancien helper dont le SHA-256
+est connu et sa regle sudoers. Il ajoute une commande exacte, sans argument :
+
+```sh
+sudo -n /usr/local/sbin/procolis-deploy-report
+```
+
+Ce rapport donne l'etape, l'operation, le code de sortie, les revisions et les
+causes reconnues (Git, npm, Prisma, configuration). Les journaux bruts, valeurs
+de configuration et dumps restent reserves a root. Le compte ops ne recoit
+aucun shell administrateur, aucune commande Docker libre, ni acces en ecriture
+aux sources. Les droits de diagnostic precedents sont conserves.
+
+L'administrateur copie l'installateur dans `/root`, controle son SHA-256 puis
+l'execute. L'installateur utilise le meme verrou que le deploiement, valide
+Python/sudoers avant installation, conserve une sauvegarde root et restaure
+les anciens fichiers si la validation globale echoue. Il ne lance pas la
+livraison. Le compte ops peut ensuite la lancer avec sa commande existante.
+
+Les installateurs autonomes sont regeneres depuis les fichiers revus avec :
+
+```sh
+python3 deploy/operations/build-deployment-installers.py
+```
+
+Validation de cette mise a jour : 35 tests Python, construction des deux images,
+repetition Git sur les bundles reels API/web et le patch web du VPS, puis
+installation neuve et mise a jour dans un conteneur Debian Bookworm. Les appels
+sudo non autorises et les arguments supplementaires sont refuses pendant le
+test Debian. Ces controles ne remplacent pas la verification de production.

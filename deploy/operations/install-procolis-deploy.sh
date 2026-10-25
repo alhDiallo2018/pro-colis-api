@@ -1,41 +1,54 @@
 #!/bin/bash
-# Installation par l'administrateur uniquement. Ne lance aucun deploiement.
+# Installation administrateur seulement. Aucun deploiement ni changement de donnees.
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-[ "$EUID" -eq 0 ] || { echo "Executer depuis la session administrateur avec sudo." >&2; exit 1; }
-[ "$#" -eq 0 ] || { echo "Aucun argument accepte." >&2; exit 2; }
-helper=/usr/local/sbin/procolis-deploy
-rule=/etc/sudoers.d/procolis-deploy
-for target in "$helper" "$rule"; do
-  if [ -e "$target" ] || [ -L "$target" ]; then
-    echo "Installation refusee : $target existe deja." >&2
-    exit 1
-  fi
-done
-/usr/bin/python3 -I - <<'CHECK'
+[ "$EUID" -eq 0 ] || { echo 'Executer avec sudo depuis la session administrateur.' >&2; exit 1; }
+[ "$#" -eq 0 ] || { echo 'Aucun argument accepte.' >&2; exit 2; }
+/usr/bin/python3 -I - <<'CHECK_PARENTS'
 import os, stat
-for path in ['/root', '/usr/local/sbin', '/etc/sudoers.d']:
+from pathlib import Path
+for path in ['/root', '/usr/local/sbin', '/etc/sudoers.d', '/var/lib']:
     st = os.lstat(path)
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
         raise SystemExit('Repertoire administrateur non protege : ' + path)
-CHECK
-work=$(mktemp -d /root/procolis-deploy-install.XXXXXXXX)
-installed_helper=0
-installed_rule=0
+state = Path('/var/lib/procolis-deploy')
+state.mkdir(mode=0o700, exist_ok=True)
+st = state.lstat()
+if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o077:
+    raise SystemExit('Etat de deploiement non protege')
+CHECK_PARENTS
+# Partage le verrou du deploiement : ne jamais remplacer un helper en cours.
+exec 9>/var/lib/procolis-deploy/lock
+flock -n 9 || { echo 'Un deploiement est en cours.' >&2; exit 1; }
+/usr/bin/python3 -I - <<'CHECK_EXISTING'
+import hashlib, os, stat
+from pathlib import Path
+if os.path.lexists('/usr/local/sbin/procolis-deploy'):
+    raise SystemExit('Installation refusee : fichier deja present ' + '/usr/local/sbin/procolis-deploy')
+if os.path.lexists('/usr/local/sbin/procolis-deploy-report'):
+    raise SystemExit('Installation refusee : fichier deja present ' + '/usr/local/sbin/procolis-deploy-report')
+if os.path.lexists('/etc/sudoers.d/procolis-deploy'):
+    raise SystemExit('Installation refusee : fichier deja present ' + '/etc/sudoers.d/procolis-deploy')
+CHECK_EXISTING
+work=$(mktemp -d /root/procolis-deploy-update.XXXXXXXX)
+changed=0
 committed=0
 cleanup() {
-  if [ "$committed" -eq 0 ]; then
-    [ "$installed_rule" -eq 0 ] || rm -f -- "$rule"
-    [ "$installed_helper" -eq 0 ] || rm -f -- "$helper"
+  if [ "$changed" -eq 1 ] && [ "$committed" -eq 0 ]; then
+    rm -f -- "/usr/local/sbin/procolis-deploy"
+    rm -f -- "/usr/local/sbin/procolis-deploy-report"
+    rm -f -- "/etc/sudoers.d/procolis-deploy"
+    echo 'Installation interrompue : permissions precedentes restaurees.' >&2
   fi
-  rm -rf -- "$work"
+  echo "Copie administrateur conservee : $work"
 }
 trap cleanup EXIT
-cat > "$work/helper" <<'PROCOLIS_DEPLOY_PY'
+cat > "$work/procolis-deploy" <<'PROCOLIS_FILE_0'
 #!/usr/bin/python3 -I
 """Deploiement unique des deux revisions approuvees, sans argument operateur."""
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -53,8 +66,8 @@ import urllib.request
 BASE = Path('/home/debian/procolis')
 API = BASE / 'SendProColis-Api'
 WEB = BASE / 'SendProColis-Web'
-REVISIONS = {API: '5779764acc6ec8f69e3c297fb97954ce2eb694f8',
-             WEB: '1a88896599f7c90717a142aad8944282216648a2'}
+REVISIONS = {API: '49f0b2a3bd7c3b5d4c5e6a25d7152384f4e511e5',
+             WEB: 'fc2150fcd2840fa665dedc1bc49e3c0a649e4690'}
 CLIENT = '856894814285-liup8k5nqvth5f10h2bcnd82obc4v5vi.apps.googleusercontent.com'
 STATE = Path('/var/lib/procolis-deploy')
 RUNTIME = Path('/etc/procolis/deployment-runtime.json')
@@ -63,6 +76,26 @@ ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-
        'APP_RELEASE': REVISIONS[WEB]}
 SNAPSHOT = 'import {env} from "./src/config/env.js"; process.stdout.write(JSON.stringify(env));'
 LOG = None
+REPORT_PATH = None
+REPORT = {}
+# Le patch du VPS a ete examine : routage/configuration integres aux commits,
+# remplacement npm install inutile depuis la correction du lockfile Linux.
+REVIEWED_WEB_PATCH = '23aa6d9a273b5395d38335d6a5e85c4b5ff6fd53c9b9bef92ff57e3678172268'
+
+
+def report(**values):
+    """Rapport structure sans stdout, stderr, arguments ou valeurs de secrets."""
+    REPORT.update(values)
+    if REPORT_PATH:
+        pending = REPORT_PATH.with_suffix('.pending')
+        pending.write_text(json.dumps(REPORT))
+        os.replace(pending, REPORT_PATH)
+
+
+def stage(name):
+    print('Etape : ' + name + '.', flush=True)
+    report(stage=name)
+
 
 
 def run(args, *, cwd='/', output=None, timeout=1800):
@@ -71,6 +104,7 @@ def run(args, *, cwd='/', output=None, timeout=1800):
     Les sorties completes restent privees : une erreur de build peut inclure
     une configuration. Tuer tout le groupe evite un deploiement orphelin.
     """
+    report(command=Path(args[0]).name, exitCode=None)
     with subprocess.Popen(args, cwd=cwd, env=ENV, stdin=subprocess.DEVNULL,
                           stdout=output or subprocess.PIPE, stderr=LOG,
                           start_new_session=True) as process:
@@ -83,17 +117,19 @@ def run(args, *, cwd='/', output=None, timeout=1800):
                 pass
             process.wait()
             raise
+        report(exitCode=process.returncode)
         if process.returncode:
             if stdout and LOG:
                 LOG.write(stdout)
                 LOG.flush()
-            raise RuntimeError('Echec de commande ; consulter le journal prive avec le compte administrateur.')
+            raise RuntimeError('Echec de commande (code %s) ; consulter sudo -n /usr/local/sbin/procolis-deploy-report.' % process.returncode)
         return stdout or b''
 
 
 def git(repo, *args):
     # Git reste sous l'identite du proprietaire des depots, jamais root. Les
     # hooks sont desactives et les deux commits sont figes dans ce programme.
+    report(operation='git ' + args[0], repository=repo.name)
     return run(['/usr/sbin/runuser', '-u', 'debian', '--', '/usr/bin/env', '-i',
                 'HOME=/home/debian', 'PATH=/usr/bin:/bin', 'GIT_TERMINAL_PROMPT=0',
                 '/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
@@ -101,10 +137,13 @@ def git(repo, *args):
 
 
 def docker(*args, **kwargs):
+    if args[0] != 'compose':
+        report(operation='docker ' + args[0], repository=None)
     return run(['/usr/bin/docker', *map(str, args)], **kwargs)
 
 
 def compose(*args, overlay=False, **kwargs):
+    report(operation='docker compose ' + args[0], repository=None)
     files = ['-f', str(WEB / 'docker-compose.yml')]
     if overlay:
         files += ['-f', str(RUNTIME)]
@@ -173,11 +212,14 @@ def validate_config(config):
 
 
 def update_repo(repo, backup):
-    allowed = {'docker-compose.yml', 'Caddyfile'} if repo == WEB else set()
+    allowed = {'docker-compose.yml', 'Caddyfile', 'Dockerfile'} if repo == WEB else set()
     changed = set(git(repo, 'diff', 'HEAD', '--name-only').decode().splitlines())
     if changed - allowed:
         raise RuntimeError('Modifications locales a examiner : ' + ', '.join(sorted(changed - allowed)))
-    (backup / (repo.name + '.patch')).write_bytes(git(repo, 'diff', 'HEAD'))
+    delta = git(repo, 'diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD')
+    (backup / (repo.name + '.patch')).write_bytes(delta)
+    if changed and (repo != WEB or hashlib.sha256(delta).hexdigest() != REVIEWED_WEB_PATCH):
+        raise RuntimeError('Le patch local differe de la copie examinee ; aucune modification appliquee.')
     git(repo, 'fetch', 'origin')
     target = REVISIONS[repo]
     git(repo, 'merge-base', '--is-ancestor', 'HEAD', target)
@@ -187,10 +229,9 @@ def update_repo(repo, backup):
         stash = git(repo, 'rev-parse', 'refs/stash').decode().strip()
         (backup / (repo.name + '.stash')).write_text(stash)
     git(repo, 'merge', '--ff-only', target)
-    if stash:
-        # Garder le stash apres application permet une recuperation manuelle.
-        # Un conflit interrompt la procedure avant toute migration/redemarrage.
-        git(repo, 'stash', 'apply', '--index', stash)
+    # Le stash reste disponible pour recuperation. Ne pas le reappliquer :
+    # les corrections examinees sont integrees a la revision cible, et le
+    # contournement npm install doit laisser place au lockfile corrige.
     if git(repo, 'rev-parse', 'HEAD').decode().strip() != target:
         raise RuntimeError('Revision finale inattendue.')
 
@@ -219,7 +260,7 @@ def probe(url):
 
 
 def deploy(backup):
-    print('Etape : verification des depots et de la topologie actuelle.', flush=True)
+    stage('verification des depots et de la topologie actuelle')
     debian_uid = pwd.getpwnam('debian').pw_uid
     home = Path('/home/debian').lstat()
     if not stat.S_ISDIR(home.st_mode) or home.st_uid != debian_uid or home.st_mode & 0o077:
@@ -248,7 +289,7 @@ def deploy(backup):
     for repo in REVISIONS:
         if (repo / '.env').exists():
             shutil.copyfile(repo / '.env', backup / (repo.name + '.env'))
-        print('Etape : preparation de ' + repo.name + '.', flush=True)
+        stage('preparation de ' + repo.name)
         update_repo(repo, backup)
         trusted_tree(repo, debian_uid)
     validate_config(json.loads(compose('config', '--format', 'json')))
@@ -266,7 +307,7 @@ def deploy(backup):
     os.replace(pending, RUNTIME)
     config = json.loads(compose('config', '--format', 'json', overlay=True))
     validate_config(config)
-    print('Etape : construction des images API et web.', flush=True)
+    stage('construction des images API et web')
     compose('build', 'api', 'caddy', overlay=True)
     new = json.loads(compose('run', '--rm', '--no-deps', '-T', 'api', 'node', '--input-type=module', '-e', SNAPSHOT, overlay=True))
     keys = {'DATABASE_URL', 'JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET', 'METRICS_TOKEN'}
@@ -287,7 +328,7 @@ const result = spawnSync('pg_dump', ['--format=custom', '--no-owner', '--no-acl'
  ...(u.searchParams.get('sslmode') ? {PGSSLMODE:u.searchParams.get('sslmode')} : {})}, stdio:'inherit'});
 process.exit(result.status ?? 1);
 '''
-    print('Etape : sauvegarde PostgreSQL avant migration.', flush=True)
+    stage('sauvegarde PostgreSQL avant migration')
     with (backup / 'database.dump').open('wb') as output:
         compose('run', '--rm', '--no-deps', '-T', 'api', 'node', '--input-type=module', '-e', dump, overlay=True, output=output)
     if (backup / 'database.dump').stat().st_size < 100:
@@ -297,7 +338,7 @@ process.exit(result.status ?? 1);
     fresh = json.loads(docker('inspect', 'sendprocolis-api', 'sendprocolis-caddy'))
     if [row['Id'] for row in fresh] != [row['Id'] for row in current]:
         raise RuntimeError('Les conteneurs ont change pendant la preparation.')
-    print('Etape : migrations puis remplacement de l API.', flush=True)
+    stage('migrations puis remplacement de l API')
     compose('run', '--rm', '--no-deps', '-T', 'api', 'npx', 'prisma', 'migrate', 'deploy', overlay=True)
     compose('up', '-d', '--no-deps', '--no-build', 'api', overlay=True)
     # Verifier directement l'instance de reference depuis le proxy existant.
@@ -311,7 +352,7 @@ process.exit(result.status ?? 1);
             time.sleep(2)
     if not ready:
         raise RuntimeError('La nouvelle API ne repond pas ; web non remplace.')
-    print('Etape : remplacement du web et controles HTTPS.', flush=True)
+    stage('remplacement du web et controles HTTPS')
     compose('up', '-d', '--no-deps', '--no-build', 'caddy', overlay=True)
     probe('https://sendprocolis.com/api/v1/health')
     result = probe('https://sendprocolis.com/api/v1/auth/google/config')
@@ -329,7 +370,7 @@ process.exit(result.status ?? 1);
 
 
 def main(args):
-    global LOG
+    global LOG, REPORT_PATH
     if args:
         print('Cette commande refuse tout argument.', file=sys.stderr)
         return 2
@@ -350,36 +391,157 @@ def main(args):
                 print('Cette livraison a deja ete deployee ; aucune action.')
                 return 0
             backup = Path(tempfile.mkdtemp(prefix='release-', dir=STATE))
-            print('Deploiement des revisions API 5779764 / web 1a88896. Journal prive : ' + str(backup), flush=True)
+            REPORT_PATH = backup / 'report.json'
+            report(status='running', release=backup.name, api=REVISIONS[API], web=REVISIONS[WEB])
+            print('Deploiement des revisions API ' + REVISIONS[API][:7] + ' / web ' + REVISIONS[WEB][:7] + '. Journal prive : ' + str(backup), flush=True)
             with (backup / 'operations.log').open('ab', buffering=0) as LOG:
                 deploy(backup)
             marker.write_text(str(backup))
+            report(status='succeeded')
             print('SUCCESS : API, web, migrations et configuration Google verifies.')
             return 0
     except Exception as error:
+        report(status='failed', errorType=type(error).__name__)
         print('ARRET : ' + str(error) + ' Aucun retour arriere de base automatique.', file=sys.stderr)
         return 1
 
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv[1:]))
-PROCOLIS_DEPLOY_PY
-cat > "$work/rule" <<'PROCOLIS_DEPLOY_RULE'
+PROCOLIS_FILE_0
+cat > "$work/procolis-deploy-report" <<'PROCOLIS_FILE_1'
+#!/usr/bin/python3 -I
+"""Etat et causes connues des deploiements ProColis, sans journal brut ni secret."""
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+STATE = Path('/var/lib/procolis-deploy')
+BASE = Path('/home/debian/procolis')
+REVISIONS = {'SendProColis-Api': '49f0b2a3bd7c3b5d4c5e6a25d7152384f4e511e5',
+             'SendProColis-Web': 'fc2150fcd2840fa665dedc1bc49e3c0a649e4690'}
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
+
+
+def protected(path, directory=False):
+    info = path.lstat()
+    valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if not valid_type or info.st_uid != 0 or info.st_mode & 0o077:
+        raise RuntimeError('Etat prive non protege')
+
+
+def known_errors(content):
+    # Retourner uniquement des categories fixes : les lignes npm/SQL peuvent
+    # contenir une URL de connexion ou une valeur d'environnement sensible.
+    patterns = {
+        'git_non_fast_forward': r'Not possible to fast-forward|not an ancestor',
+        'git_conflict': r'CONFLICT|would be overwritten',
+        'git_authentication': r'fatal: Authentication failed|could not read Username|Permission denied \(publickey\)',
+        'git_missing_revision': r'Not a valid commit|unknown revision|bad object',
+        'npm_lockfile': r'can only install packages when|Missing: .+ from lock file|EUSAGE',
+        'typescript_build': r'error TS\d+',
+        'invalid_environment': r'Invalid environment configuration',
+        'brevo_sender_email': r'BREVO_SENDER_EMAIL',
+        'metrics_configuration': r'METRICS_TOKEN',
+        'database_authentication': r'password authentication failed',
+        'database_unreachable': r'could not connect to server|Connection refused',
+        'dump_version': r'server version mismatch',
+        'disk_full': r'No space left on device',
+        'docker_build': r'failed to solve|failed to build',
+    }
+    result = [label for label, pattern in patterns.items() if re.search(pattern, content, re.I)]
+    result += sorted(set(re.findall(r'\bP[1236]\d{3}\b', content)))
+    return result
+
+
+def git(repo, *args):
+    result = subprocess.run(['/usr/sbin/runuser', '-u', 'debian', '--', '/usr/bin/env', '-i',
+        'HOME=/home/debian', 'PATH=/usr/bin:/bin', 'GIT_TERMINAL_PROMPT=0', '/usr/bin/git',
+        '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', str(repo), *args],
+        cwd='/', env=ENV, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+    return result.returncode, result.stdout
+
+
+def inspect():
+    protected(STATE, directory=True)
+    releases = []
+    for path in STATE.glob('release-*'):
+        protected(path, directory=True)
+        releases.append(path)
+    result = {'latest': None, 'repositories': []}
+    if releases:
+        latest = max(releases, key=lambda path: path.stat().st_mtime_ns)
+        details = {'release': latest.name}
+        if (latest / 'report.json').exists():
+            protected(latest / 'report.json')
+            raw = json.loads((latest / 'report.json').read_text())
+            details.update({key: raw.get(key) for key in ('status', 'stage', 'operation', 'repository',
+                            'command', 'exitCode', 'errorType', 'api', 'web')})
+        log = latest / 'operations.log'
+        if log.exists():
+            protected(log)
+            with log.open('rb') as stream:
+                stream.seek(max(0, log.stat().st_size - 262144))
+                details['errorCategories'] = known_errors(stream.read().decode(errors='replace'))
+        result['latest'] = details
+    for name, target in REVISIONS.items():
+        repo = BASE / name
+        rc, revision = git(repo, 'rev-parse', 'HEAD')
+        changes_rc, changes = git(repo, 'diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--name-only')
+        ancestor_rc, _ = git(repo, 'merge-base', '--is-ancestor', 'HEAD', target)
+        result['repositories'].append({'name': name, 'revision': revision.strip() if rc == 0 else None,
+            'target': target, 'ancestorExitCode': ancestor_rc,
+            'trackedFilesChanged': changes.splitlines() if changes_rc == 0 else None})
+    return result
+
+
+def main(args):
+    if args:
+        print('Aucun argument accepte.', file=sys.stderr)
+        return 2
+    if os.geteuid() != 0:
+        print('Executer via sudo.', file=sys.stderr)
+        return 1
+    try:
+        print(json.dumps(inspect(), ensure_ascii=False, indent=2))
+        return 0
+    except Exception as error:
+        # Le message d'une exception externe peut contenir des secrets.
+        print('Rapport indisponible : ' + type(error).__name__, file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+PROCOLIS_FILE_1
+cat > "$work/procolis-deploy.sudoers" <<'PROCOLIS_FILE_2'
 # Livraison precise uniquement ; "" interdit tout argument supplementaire.
 procolis-ops ALL=(root) NOPASSWD: NOSETENV: /usr/local/sbin/procolis-deploy ""
-PROCOLIS_DEPLOY_RULE
-/usr/bin/python3 -I - "$work/helper" <<'CHECK'
+# Rapport fixe : historique Git et causes connues, sans sortie brute.
+procolis-ops ALL=(root) NOPASSWD: NOSETENV: /usr/local/sbin/procolis-deploy-report ""
+PROCOLIS_FILE_2
+/usr/bin/python3 -I - "$work" <<'CHECK_PYTHON'
 from pathlib import Path
 import sys
-compile(Path(sys.argv[1]).read_text(), sys.argv[1], 'exec')
-CHECK
-/usr/sbin/visudo -cf "$work/rule"
-install -o root -g root -m 0555 "$work/helper" "$helper"
-installed_helper=1
-install -o root -g root -m 0440 "$work/rule" "$rule"
-installed_rule=1
+for name in ['procolis-deploy', 'procolis-deploy-report']:
+    path = Path(sys.argv[1]) / name
+    compile(path.read_text(), str(path), 'exec')
+CHECK_PYTHON
+/usr/sbin/visudo -cf "$work/procolis-deploy.sudoers"
+changed=1
+install -o root -g root -m 0555 "$work/procolis-deploy" "/usr/local/sbin/procolis-deploy.new"
+mv -f -- "/usr/local/sbin/procolis-deploy.new" "/usr/local/sbin/procolis-deploy"
+install -o root -g root -m 0555 "$work/procolis-deploy-report" "/usr/local/sbin/procolis-deploy-report.new"
+mv -f -- "/usr/local/sbin/procolis-deploy-report.new" "/usr/local/sbin/procolis-deploy-report"
+install -o root -g root -m 0440 "$work/procolis-deploy.sudoers" "/etc/sudoers.d/procolis-deploy.new"
+mv -f -- "/etc/sudoers.d/procolis-deploy.new" "/etc/sudoers.d/procolis-deploy"
 /usr/sbin/visudo -c
 committed=1
-echo 'INSTALLE : une seule commande de deploiement ProColis, sans argument.'
+echo 'INSTALLE : livraison revue API/web et rapport de diagnostic.'
 echo 'Aucun deploiement lance. Aucun droit sudo general ni acces Docker direct ajoute.'
-echo 'Commande autorisee : sudo -n /usr/local/sbin/procolis-deploy'
+echo 'Commandes : sudo -n /usr/local/sbin/procolis-deploy-report'
+echo '            sudo -n /usr/local/sbin/procolis-deploy'

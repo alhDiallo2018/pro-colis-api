@@ -89,6 +89,25 @@ class DeploymentTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): deploy.update_repo(deploy.API, Path('/unused'))
             self.assertEqual(git.call_count, 1)
 
+    def test_unreviewed_configuration_stops_before_fetch_or_stash(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(deploy, 'git', side_effect=[b'Dockerfile\n', b'unreviewed patch']) as git:
+            with self.assertRaisesRegex(RuntimeError, 'differe'):
+                deploy.update_repo(deploy.WEB, Path(directory))
+            self.assertEqual(git.call_count, 2)
+
+    def test_reviewed_patch_is_saved_without_reapplying_obsolete_workaround(self):
+        import hashlib
+        delta = b'reviewed patch'
+        responses = [b'Dockerfile\n', delta, b'', b'', b'', b'stash-id\n', b'', deploy.REVISIONS[deploy.WEB].encode()]
+        with tempfile.TemporaryDirectory() as directory, patch.object(deploy, 'git', side_effect=responses) as git, patch.object(deploy, 'REVIEWED_WEB_PATCH', hashlib.sha256(delta).hexdigest()):
+            backup = Path(directory)
+            deploy.update_repo(deploy.WEB, backup)
+            self.assertEqual((backup / (deploy.WEB.name + '.patch')).read_bytes(), delta)
+            self.assertEqual((backup / (deploy.WEB.name + '.stash')).read_text(), 'stash-id')
+            commands = [call.args[1:] for call in git.call_args_list]
+            self.assertIn(('merge', '--ff-only', deploy.REVISIONS[deploy.WEB]), commands)
+            self.assertFalse(any(args[:2] == ('stash', 'apply') for args in commands))
+
     def test_process_cannot_inherit_operator_environment_or_stdin(self):
         process = Mock(returncode=0)
         process.communicate.return_value = (b'ok', None)

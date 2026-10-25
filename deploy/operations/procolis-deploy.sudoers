@@ -1,2 +1,4 @@
 # Livraison precise uniquement ; "" interdit tout argument supplementaire.
 procolis-ops ALL=(root) NOPASSWD: NOSETENV: /usr/local/sbin/procolis-deploy ""
+# Rapport fixe : historique Git et causes connues, sans sortie brute.
+procolis-ops ALL=(root) NOPASSWD: NOSETENV: /usr/local/sbin/procolis-deploy-report ""
