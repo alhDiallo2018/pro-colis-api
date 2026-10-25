@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { env } from '../config/env.js';
+import { UnauthorizedError } from './errors.js';
 
 // Un compte staff lit les colis, les paiements et les messages de toute la
 // plateforme : sa session doit se refermer en heures, la ou un client garde la
@@ -55,13 +56,13 @@ export function signAccessToken(user, sid) {
       ...(sid ? { sid } : {})
     },
     env.JWT_ACCESS_SECRET,
-    { expiresIn: env.JWT_ACCESS_EXPIRES_IN }
+    { expiresIn: durationToMs(env.JWT_ACCESS_EXPIRES_IN) / 1000 }
   );
 }
 
 /** Delai d'inactivite, en millisecondes. */
-export function sessionIdleTimeoutMs() {
-  return durationToMs(env.SESSION_IDLE_TIMEOUT);
+export function sessionIdleTimeoutMs(role) {
+  return durationToMs(isStaffRole(role) ? env.SESSION_IDLE_TIMEOUT_STAFF : env.SESSION_IDLE_TIMEOUT);
 }
 
 /**
@@ -71,19 +72,38 @@ export function sessionIdleTimeoutMs() {
  * ligne du compte — supportable tant qu'il n'y a qu'une session, ruineux des
  * que la rotation empile une ligne revoquee par renouvellement.
  */
-export function signRefreshToken(user, jti = randomUUID()) {
-  const token = jwt.sign({ sub: user.id, jti }, env.JWT_REFRESH_SECRET, {
-    expiresIn: refreshTokenTtl(user.role)
-  });
+export function signRefreshToken(user, jti = randomUUID(), issuedAt = new Date(), expiresAt = refreshTokenExpiresAt(user.role, issuedAt)) {
+  // Des dates explicites permettent de restituer exactement le meme JWT lors
+  // d'un retry, sans enregistrer le jeton en clair dans la base.
+  const token = jwt.sign({
+    sub: user.id, jti,
+    iat: Math.floor(issuedAt.getTime() / 1000),
+    exp: Math.floor(expiresAt.getTime() / 1000)
+  }, env.JWT_REFRESH_SECRET);
   return { token, jti };
 }
 
+function verifyToken(token, secret, kind) {
+  try {
+    return jwt.verify(token, secret, { algorithms: ['HS256'] });
+  } catch (error) {
+    // Seules les erreurs cryptographiques sont des 401. Une panne technique
+    // reste une erreur serveur et ne doit pas provoquer un effacement local.
+    if (error instanceof jwt.JsonWebTokenError) {
+      const expired = error instanceof jwt.TokenExpiredError;
+      throw new UnauthorizedError(expired ? 'Jeton expire' : 'Jeton invalide',
+        `${kind}_TOKEN_${expired ? 'EXPIRED' : 'INVALID'}`);
+    }
+    throw error;
+  }
+}
+
 export function verifyAccessToken(token) {
-  return jwt.verify(token, env.JWT_ACCESS_SECRET);
+  return verifyToken(token, env.JWT_ACCESS_SECRET, 'ACCESS');
 }
 
 export function verifyRefreshToken(token) {
-  return jwt.verify(token, env.JWT_REFRESH_SECRET);
+  return verifyToken(token, env.JWT_REFRESH_SECRET, 'REFRESH');
 }
 
 export async function hashSecret(secret) {

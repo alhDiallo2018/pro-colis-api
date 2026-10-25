@@ -229,6 +229,9 @@ mobileRouter.get('/super-admin/audit-logs', authenticate, supportReadRoles, mobi
 mobileRouter.get('/super-admin/payments/cash-declarations', authenticate, supportReadRoles, mobileController.pendingCashDeclarations);
 mobileRouter.get('/public/broadcasts', optionalAuthenticate, mobileController.getPublicBroadcasts);
 mobileRouter.get('/public/config', optionalAuthenticate, mobileController.getPublicConfig);
+mobileRouter.get('/public/mobile-update', mobileController.getAppUpdate);
+// Alias de la premiere integration mobile.
+mobileRouter.get('/public/app-update', mobileController.getAppUpdate);
 mobileRouter.get('/super-admin/config', authenticate, supportReadRoles, mobileController.getSystemConfig);
 mobileRouter.get('/super-admin/system/health', authenticate, supportReadRoles, mobileController.systemHealth);
 

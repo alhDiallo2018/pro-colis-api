@@ -1,0 +1,241 @@
+#!/bin/bash
+set -euo pipefail
+# Installation initiale uniquement. Le compte SSH ne peut modifier ni l'outil
+# installe ni les regles sudoers : toutes les destinations appartiennent a root.
+if [ "$(id -u)" != 0 ]; then
+  echo "Executer cet installateur via sudo depuis la session debian." >&2
+  exit 1
+fi
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+helper=/usr/local/sbin/procolis-ops
+rules=/etc/sudoers.d/procolis-ops
+if [ -e "$helper" ] || [ -L "$helper" ] || [ -e "$rules" ] || [ -L "$rules" ]; then
+  echo "Installation existante detectee : aucun fichier remplace." >&2
+  exit 1
+fi
+command -v python3 >/dev/null
+command -v docker >/dev/null
+command -v visudo >/dev/null
+id procolis-ops >/dev/null
+visudo -c
+helper_tmp=$(mktemp /usr/local/sbin/.procolis-ops.XXXXXX)
+rules_tmp=$(mktemp /etc/sudoers.d/.procolis-ops.XXXXXX)
+trap 'rm -f "$helper_tmp" "$rules_tmp"' EXIT
+cat > "$helper_tmp" <<'PROCOLIS_HELPER_EOF'
+#!/usr/bin/python3 -I
+"""Diagnostics fixes ProColis. Installer en root:root, jamais en mode inscriptible par ops."""
+import json
+import logging
+import os
+import secrets
+import subprocess
+import sys
+
+DOCKER = '/usr/bin/docker'
+API_NAMES = ('sendprocolis-api', 'procolis-node-api')
+CONTAINERS = (*API_NAMES, 'sendprocolis-caddy', 'sendprocolis-postgres')
+PROJECTS = (
+    '/home/debian/procolis/SendProColis-Web',
+    '/home/debian/procolis/SendProColis-Api',
+)
+# Aucun contexte Docker, PATH, HOME, module Python ou dossier courant fourni
+# par le compte SSH ne doit influencer une commande privilegiee.
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
+
+
+def run(args, optional=False):
+    result = subprocess.run(args, cwd='/', env=ENV, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=25)
+    if result.returncode and not optional:
+        raise RuntimeError('Commande de diagnostic en echec (code %s)' % result.returncode)
+    return result
+
+
+def containers():
+    return json.loads(run([DOCKER, 'inspect', *CONTAINERS]).stdout)
+
+
+def summary(row):
+    state = row.get('State', {})
+    labels = row.get('Config', {}).get('Labels') or {}
+    # inspect contient aussi les secrets d'environnement : seule cette liste
+    # explicite de champs non secrets peut etre renvoyee au compte operateur.
+    return {
+        'name': row['Name'].lstrip('/'), 'image': row['Config']['Image'],
+        'imageId': row['Image'], 'status': state.get('Status'),
+        'startedAt': state.get('StartedAt'),
+        'health': state.get('Health', {}).get('Status'),
+        'ports': row.get('NetworkSettings', {}).get('Ports'),
+        'composeDirectory': labels.get('com.docker.compose.project.working_dir'),
+        'composeService': labels.get('com.docker.compose.service'),
+        'composeFiles': labels.get('com.docker.compose.project.config_files'),
+    }
+
+
+def status():
+    return [summary(row) for row in containers()]
+
+
+def routing():
+    networks = []
+    for row in containers():
+        networks.append({'name': row['Name'].lstrip('/'), 'networks': {
+            name: {'ip': value.get('IPAddress'), 'aliases': value.get('Aliases')}
+            for name, value in row.get('NetworkSettings', {}).get('Networks', {}).items()
+        }})
+    # Resolution depuis Caddy, et non depuis l'hote : le nom api peut etre
+    # partage par deux projets Compose connectes au meme reseau Docker.
+    lookup = run([DOCKER, 'exec', 'sendprocolis-caddy', 'getent', 'hosts', 'api'], optional=True)
+    if lookup.returncode:
+        lookup = run([DOCKER, 'exec', 'sendprocolis-caddy', 'nslookup', 'api'], optional=True)
+    return {'networks': networks, 'caddyDns': lookup.stdout[:8000], 'dnsExitCode': lookup.returncode}
+
+
+def health():
+    probe = run([DOCKER, 'exec', 'sendprocolis-caddy', 'wget', '-qO-', '-T', '8',
+                 'http://api:8080/health'], optional=True)
+    return {'upstream': 'api:8080', 'exitCode': probe.returncode, 'response': probe.stdout[:4000]}
+
+
+def logs():
+    # Historique court et conteneurs fixes ; aucun chemin ni argument Docker
+    # arbitraire n'est accepte. Les logs restent des donnees operationnelles privees.
+    return {name: (lambda r: {'stdout': r.stdout[-60000:], 'stderr': r.stderr[-60000:],
+                             'exitCode': r.returncode})(
+        run([DOCKER, 'logs', '--since', '15m', '--tail', '120', name], optional=True))
+        for name in API_NAMES}
+
+
+def compare_configs(configs):
+    names = ('DATABASE_URL', 'JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET',
+             'SESSION_IDLE_TIMEOUT', 'SESSION_IDLE_TIMEOUT_STAFF',
+             'JWT_REFRESH_EXPIRES_IN', 'JWT_REFRESH_EXPIRES_IN_STAFF')
+    result = {}
+    for field in names:
+        values = [configs.get(name, {}).get(field, {}) for name in API_NAMES]
+        present = [bool(value.get('present')) for value in values]
+        result[field] = {'present': dict(zip(API_NAMES, present)),
+                         'equal': values[0].get('fingerprint') == values[1].get('fingerprint')
+                         if all(present) else None}
+    return result
+
+
+def session_configuration():
+    # Lire la configuration effective tient compte du .env eventuellement
+    # embarque dans les anciennes images. Aucune valeur ni empreinte de secret
+    # n'est restituee : seuls presence et resultat de comparaison sont publics.
+    # La cle HMAC est aleatoire par appel, sans stockage persistant.
+    nonce = secrets.token_hex(32)
+    program = r"""
+import {env} from './src/config/env.js';
+import {createHmac} from 'node:crypto';
+const fields = ['DATABASE_URL', 'JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET',
+ 'SESSION_IDLE_TIMEOUT', 'SESSION_IDLE_TIMEOUT_STAFF',
+ 'JWT_REFRESH_EXPIRES_IN', 'JWT_REFRESH_EXPIRES_IN_STAFF'];
+const result = {};
+for (const field of fields) {
+  const value = env[field];
+  const present = value !== undefined && value !== null && value !== '';
+  result[field] = {present, fingerprint: present
+    ? createHmac('sha256', process.argv[1]).update(String(value)).digest('hex') : null};
+}
+process.stdout.write(JSON.stringify(result));
+"""
+    configs = {}
+    unavailable = []
+    for name in API_NAMES:
+        probe = run([DOCKER, 'exec', '--workdir', '/app', name, 'node',
+                     '--input-type=module', '-e', program, nonce], optional=True)
+        try:
+            if probe.returncode:
+                raise ValueError('Configuration inaccessible')
+            configs[name] = json.loads(probe.stdout)
+        except (ValueError, TypeError):
+            unavailable.append(name)
+    return {'comparisons': compare_configs(configs), 'unavailable': unavailable}
+
+
+def deployment_info():
+    projects = []
+    for path in PROJECTS:
+        config = json.loads(run([DOCKER, 'compose', '--project-directory', path,
+                                 '-f', path + '/docker-compose.yml',
+                                 'config', '--no-interpolate', '--format', 'json']).stdout)
+        services = {}
+        for name, service in config.get('services', {}).items():
+            build = service.get('build')
+            if isinstance(build, dict):
+                build = {key: build.get(key) for key in ('context', 'dockerfile')}
+            services[name] = {'image': service.get('image'), 'build': build,
+                             'containerName': service.get('container_name'),
+                             'networks': list((service.get('networks') or {}).keys()),
+                             'privileged': bool(service.get('privileged', False)),
+                             'user': service.get('user'),
+                             'volumes': service.get('volumes', []),
+                             'capAdd': service.get('cap_add', [])}
+        # Git est lance avec l'identite du proprietaire du depot. Les variables
+        # d'environnement, arguments de build et secrets Compose ne sont pas exposes.
+        revision = run(['/usr/sbin/runuser', '-u', 'debian', '--', '/usr/bin/git',
+                        '-C', path, 'rev-parse', 'HEAD'], optional=True)
+        branch = run(['/usr/sbin/runuser', '-u', 'debian', '--', '/usr/bin/git',
+                      '-C', path, 'branch', '--show-current'], optional=True)
+        dirty = run(['/usr/sbin/runuser', '-u', 'debian', '--', '/usr/bin/git',
+                     '-C', path, 'status', '--porcelain', '--untracked-files=no'], optional=True)
+        projects.append({'directory': path, 'revision': revision.stdout.strip(),
+                         'branch': branch.stdout.strip(), 'trackedChanges': bool(dirty.stdout.strip()),
+                         'gitStatusExitCode': dirty.returncode,
+                         'gitExitCode': revision.returncode, 'services': services})
+    return {'projects': projects, 'sessionConfiguration': session_configuration()}
+
+
+ACTIONS = {'status': status, 'routing': routing, 'health': health,
+           'logs': logs, 'deployment-info': deployment_info}
+
+
+def main(argv):
+    # Verification redondante avec sudoers : pas de jokers ni d'arguments
+    # supplementaires permettant de transformer le diagnostic en shell root.
+    if len(argv) != 1 or argv[0] not in ACTIONS:
+        print('Action autorisee : ' + ', '.join(ACTIONS), file=sys.stderr)
+        return 2
+    if os.geteuid() != 0:
+        print('Executer via sudo et la regle dediee.', file=sys.stderr)
+        return 1
+    action = argv[0]
+    try:
+        print(json.dumps(ACTIONS[action](), ensure_ascii=False, indent=2))
+        logging.info('Diagnostic ProColis termine : %s', action)
+        return 0
+    except Exception as error:
+        # Ne pas journaliser stdout/stderr d'une commande de configuration :
+        # une erreur de Compose pourrait y inclure des valeurs sensibles.
+        logging.error('Diagnostic ProColis echoue : action=%s erreur=%s', action, type(error).__name__)
+        print('Diagnostic impossible. Verifier les services et chemins avec le compte administrateur.', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
+    sys.exit(main(sys.argv[1:]))
+PROCOLIS_HELPER_EOF
+cat > "$rules_tmp" <<'PROCOLIS_RULES_EOF'
+# Diagnostic uniquement : commandes et arguments exacts, aucun joker.
+Cmnd_Alias PROCOLIS_DIAGNOSTICS = /usr/local/sbin/procolis-ops status, /usr/local/sbin/procolis-ops routing, /usr/local/sbin/procolis-ops health, /usr/local/sbin/procolis-ops logs, /usr/local/sbin/procolis-ops deployment-info
+procolis-ops ALL=(root) NOPASSWD: NOSETENV: PROCOLIS_DIAGNOSTICS
+PROCOLIS_RULES_EOF
+chown root:root "$helper_tmp" "$rules_tmp"
+chmod 755 "$helper_tmp"
+chmod 440 "$rules_tmp"
+# Le fichier temporaire contient un point : sudo ignore ce fichier tant que
+# la syntaxe n'a pas ete validee et qu'il n'a pas ete renomme atomiquement.
+visudo -cf "$rules_tmp"
+mv "$helper_tmp" "$helper"
+mv "$rules_tmp" "$rules"
+if ! visudo -c; then
+  rm -f "$rules" "$helper"
+  echo "Validation globale echouee : autorisations retirees." >&2
+  exit 1
+fi
+echo "Diagnostics ProColis installes : status, routing, health, logs, deployment-info."
+echo "Les droits de deploiement et de redemarrage ne sont pas encore accordes."

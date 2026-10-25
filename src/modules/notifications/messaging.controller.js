@@ -1,4 +1,8 @@
 import { prisma } from '../../config/prisma.js';
+import { z } from 'zod';
+import { dispatchManualMessage, getManualMessage } from './manual-message.service.js';
+import { recipientScope } from './recipient-scope.js';
+import { userSearchWhere } from '../../utils/user-search.js';
 import { env } from '../../config/env.js';
 import { ok, fail } from '../../utils/api-response.js';
 import { ValidationError, normalizeError } from '../../utils/errors.js';
@@ -13,6 +17,59 @@ import {
 } from '../../utils/brevo.js';
 
 const BREVO_CONFIG_KEY = 'brevo';
+
+const manualMessageSchema = z.object({
+  requestId: z.string().uuid(),
+  userId: z.string().uuid(),
+  channel: z.enum(['email', 'sms', 'in_app', 'chat']),
+  kind: z.enum(['message', 'account_summary']).default('message'),
+  subject: z.string().trim().min(1).max(160),
+  content: z.string().trim().max(5000).default('')
+}).superRefine((value, context) => {
+  if (value.kind === 'message' && !value.content) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['content'], message: 'Message requis' });
+  }
+  if (value.channel === 'sms' && value.content.length > 1600) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['content'], message: 'SMS limité à 1600 caractères' });
+  }
+});
+
+// Recherche et pagination précèdent la sélection : les destinataires ne sont
+// jamais limités à la première page du répertoire ni fournis avec leurs secrets.
+export const listMessageRecipients = handle('notifications.recipients', async (req, res) => {
+  const parsed = z.object({ search: z.string().max(200).optional(),
+    role: z.enum(['client', 'driver', 'admin', 'super_admin', 'support', 'support_technique', 'support_commercial']).optional(),
+    page: z.coerce.number().int().min(1).max(100000).default(1),
+    limit: z.coerce.number().int().min(1).max(50).default(20)
+  }).safeParse(req.query);
+  if (!parsed.success) throw new ValidationError(parsed.error.issues.map(issue => ({ path: issue.path.join('.'), message: issue.message })));
+  const { search, role, page, limit } = parsed.data;
+  const where = { AND: [recipientScope(req.user), { deletedAt: null, status: { not: 'deleted' } },
+    role ? { role } : {}, userSearchWhere(search)] };
+  const [total, users] = await prisma.$transaction([
+    prisma.user.count({ where }),
+    prisma.user.findMany({ where, select: { id: true, fullName: true, email: true, phone: true,
+      role: true, city: true, status: true, driverStatus: true, profilePhoto: true, rating: true, completedDeliveries: true },
+      orderBy: [{ fullName: 'asc' }, { id: 'asc' }], skip: (page - 1) * limit, take: limit })
+  ]);
+  return ok(res, { data: { users, pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } } });
+});
+
+export const sendManualMessage = handle('notifications.manualSend', async (req, res) => {
+  const parsed = manualMessageSchema.safeParse(req.body);
+  if (!parsed.success) throw new ValidationError(parsed.error.issues.map(issue => ({ path: issue.path.join('.'), message: issue.message })));
+  const result = await dispatchManualMessage(req.user, parsed.data, req.log);
+  return ok(res, { data: { result } });
+});
+
+export const manualMessageResult = handle('notifications.manualResult', async (req, res) => {
+  if (!z.string().uuid().safeParse(req.params.requestId).success) {
+    throw new ValidationError([{ path: 'requestId', message: 'Référence invalide' }]);
+  }
+  const result = await getManualMessage(req.user.id, req.params.requestId);
+  if (!result) return fail(res, { status: 404, message: 'Envoi introuvable', code: 'NOT_FOUND' });
+  return ok(res, { data: { result } });
+});
 
 function handle(action, fn) {
   return async (req, res) => {

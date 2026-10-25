@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { googleRouter } from './google.routes.js';
 import { authenticate } from '../../middlewares/auth.middleware.js';
 import { validate } from '../../middlewares/validate.middleware.js';
 import { authRateLimit } from '../../middlewares/rate-limit.middleware.js';
@@ -6,6 +7,7 @@ import { loginWithPinSchema, logoutSchema, refreshSchema, registerSchema, sendOt
 import * as authController from './auth.controller.js';
 
 export const authRouter = Router();
+authRouter.use('/google', googleRouter);
 
 authRouter.post('/register', authRateLimit, validate(registerSchema), authController.register);
 authRouter.post('/login', authRateLimit, validate(loginWithPinSchema), authController.loginWithPin);

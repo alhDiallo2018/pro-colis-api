@@ -98,6 +98,12 @@ Filtres :
 - `page`
 - `limit`
 
+`from` et `to` sont aussi acceptes comme alias de `dateFrom` et `dateTo`.
+Une date de fin sans heure inclut toute la journee UTC. Une periode inversee
+est rejetee en 422. `search` recherche dans l'action, le type d'entite, le nom
+de l'auteur et le request ID ; un UUID permet aussi de retrouver l'auteur ou
+l'entite. Le total de pagination respecte les memes filtres que les lignes.
+
 Actions recommandees :
 
 - `user.create`

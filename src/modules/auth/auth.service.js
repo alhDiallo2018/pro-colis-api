@@ -1,12 +1,15 @@
 import bcrypt from 'bcryptjs';
+import { releaseSupportSession } from '../support/chat.service.js';
 import { prisma } from '../../config/prisma.js';
 import { env } from '../../config/env.js';
+import { logger } from '../../config/logger.js';
+import { touchSession, withSessionLock } from './session.service.js';
 import { ConflictError, UnauthorizedError, ValidationError } from '../../utils/errors.js';
 import {
   compareSecret,
+  durationToMs,
   hashSecret,
   refreshTokenExpiresAt,
-  sessionIdleTimeoutMs,
   signAccessToken,
   signRefreshToken,
   verifyRefreshToken
@@ -38,17 +41,19 @@ const USER_INCLUDE = {
  * l'ancienne version ecrivait 30 jours en dur, si bien qu'une session staff
  * raccourcie par configuration serait restee ouverte un mois cote base.
  */
-async function createTokenPair(user) {
-  const { token: refreshToken, jti } = signRefreshToken(user);
-  const tokenHash = await hashSecret(refreshToken);
+async function createTokenPair(user, client = prisma) {
   const now = new Date();
+  const expiresAt = refreshTokenExpiresAt(user.role, now);
+  const { token: refreshToken, jti } = signRefreshToken(user, undefined, now, expiresAt);
+  const tokenHash = await hashSecret(refreshToken);
 
-  await prisma.refreshToken.create({
+  await client.refreshToken.create({
     data: {
       userId: user.id,
       jti,
       tokenHash,
-      expiresAt: refreshTokenExpiresAt(user.role),
+      expiresAt,
+      createdAt: now,
       lastUsedAt: now
     }
   });
@@ -58,17 +63,27 @@ async function createTokenPair(user) {
   return { accessToken: signAccessToken(user, jti), refreshToken };
 }
 
+/** Une connexion Google utilise exactement les memes sessions que le PIN.
+ * Le client transactionnel permet de consommer le challenge et d'ouvrir la
+ * session atomiquement, sans compte partiellement associe en cas d'erreur.
+ */
+export async function openGoogleSession(userId, client = prisma) {
+  const user = await client.user.findUnique({ where: { id: userId } });
+  if (!user || user.status !== 'active' || user.deletedAt) {
+    throw new UnauthorizedError('Connexion impossible pour ce compte');
+  }
+  const updated = await client.user.update({
+    where: { id: userId }, data: { lastLogin: new Date(), lastActiveAt: new Date() }, include: USER_INCLUDE
+  });
+  return { status: 'authenticated', user: serializeUser(updated), ...await createTokenPair(updated, client) };
+}
+
 /** Coupe toutes les sessions ouvertes d'un compte. */
 async function revokeAllSessions(userId, reason, client = prisma) {
   return client.refreshToken.updateMany({
     where: { userId, revokedAt: null },
     data: { revokedAt: new Date(), revokedReason: reason }
   });
-}
-
-/** Une session inactive depuis plus longtemps que le delai configure est morte. */
-export function isSessionIdle(session, now = Date.now()) {
-  return now - session.lastUsedAt.getTime() > sessionIdleTimeoutMs();
 }
 
 /**
@@ -183,116 +198,92 @@ export async function loginWithPin({ identifier, pin }) {
 }
 
 /**
- * Renouvelle la session en faisant tourner le refresh token.
- *
- * Le jeton presente est consomme : il est revoque et remplace. Un jeton vole ne
- * vaut donc plus un mois d'acces mais une seule utilisation, et sa reutilisation
- * est detectable — c'est tout l'interet de la rotation.
- *
- * Reutilisation d'un jeton deja revoque : soit la victime a continue de s'en
- * servir apres le vol, soit c'est l'attaquant qui rejoue. Impossible de trancher,
- * donc on coupe toutes les sessions du compte et on force une reconnexion.
+ * Consomme un refresh sous verrou BD, puis ouvre un unique successeur dans la
+ * meme famille. Les retries proches rendent le successeur existant, sans
+ * prolonger la fenetre de grace ; un rejeu tardif ne ferme que cet appareil.
  */
 export async function refreshAccessToken(refreshToken) {
   const payload = verifyRefreshToken(refreshToken);
-  const user = await prisma.user.findUnique({
-    where: { id: payload.sub },
-    include: USER_INCLUDE
-  });
+  const found = await findSessionForToken(payload.sub, refreshToken, payload.jti);
+  if (!found) throw new UnauthorizedError('Refresh token invalide', 'REFRESH_TOKEN_INVALID');
 
-  if (!user || user.status !== 'active') {
-    throw new UnauthorizedError('Session invalide');
-  }
+  const result = await withSessionLock(payload.sub, async (tx) => {
+    const user = await tx.user.findUnique({ where: { id: payload.sub }, include: USER_INCLUDE });
+    if (!user || user.status !== 'active') {
+      return { error: new UnauthorizedError('Session invalide', 'SESSION_INVALID') };
+    }
+    // La lecture apres le verrou est indispensable : un autre serveur peut
+    // avoir consomme le jeton pendant sa verification cryptographique.
+    const session = await tx.refreshToken.findUnique({ where: { id: found.id } });
+    const now = new Date();
+    if (!session) return { error: new UnauthorizedError('Session fermee', 'SESSION_REVOKED') };
 
-  const session = await findSessionForToken(user.id, refreshToken, payload.jti);
-
-  if (!session) {
-    throw new UnauthorizedError('Refresh token invalide');
-  }
-
-  // Seule une revocation par rotation signe un rejeu. Une session fermee pour
-  // inactivite ou par deconnexion est un evenement normal : la representer
-  // couperait les autres appareils du compte sans raison.
-  if (session.revokedReason === 'rotated') {
-    await revokeAllSessions(user.id, 'reuse');
-    throw new UnauthorizedError('Session revoquee, reconnexion requise');
-  }
-
-  if (session.revokedAt || session.expiresAt <= new Date()) {
-    throw new UnauthorizedError('Session expiree, reconnexion requise');
-  }
-
-  if (isSessionIdle(session)) {
-    await prisma.refreshToken.update({
-      where: { id: session.id },
-      data: { revokedAt: new Date(), revokedReason: 'idle' }
-    });
-    throw new UnauthorizedError('Session expiree pour inactivite');
-  }
-
-  const { token: nextRefreshToken, jti } = signRefreshToken(user);
-  const accessToken = signAccessToken(user, jti);
-  const tokenHash = await hashSecret(nextRefreshToken);
-  const now = new Date();
-
-  await prisma.$transaction([
-    prisma.refreshToken.update({
-      where: { id: session.id },
-      data: { revokedAt: now, revokedReason: 'rotated' }
-    }),
-    prisma.refreshToken.create({
-      data: {
-        userId: user.id,
-        jti,
-        tokenHash,
-        expiresAt: refreshTokenExpiresAt(user.role),
-        lastUsedAt: now
+    if (session.revokedReason === 'rotated') {
+      const withinGrace = now.getTime() - session.revokedAt.getTime() <= env.REFRESH_RETRY_GRACE_SECONDS * 1000;
+      if (!withinGrace) {
+        await tx.refreshToken.updateMany({
+          where: { familyId: session.familyId, userId: user.id, revokedAt: null },
+          data: { revokedAt: now, revokedReason: 'reuse' }
+        });
+        logger.warn({ action: 'auth.session.revoked', reason: 'reuse', userId: user.id, familyId: session.familyId }, 'Rejeu hors delai : famille revoquee');
+        return { error: new UnauthorizedError('Session revoquee, reconnexion requise', 'REFRESH_TOKEN_REUSED') };
       }
-    }),
-    // Les lignes revoquees restent le temps de detecter un rejeu, puis n'ont
-    // plus d'utilite : sans cette purge la table grossit d'une ligne par
-    // renouvellement, soit des centaines par compte et par mois.
-    prisma.refreshToken.deleteMany({
-      where: { userId: user.id, expiresAt: { lt: new Date() } }
-    })
-  ]);
+      const next = await tx.refreshToken.findFirst({ where: { familyId: session.familyId, userId: user.id, revokedAt: null } });
+      if (!next) return { error: new UnauthorizedError('Session fermee', 'SESSION_REVOKED') };
+      const error = await touchSession(tx, next, user.role, now);
+      if (error) return { error };
+      return {
+        user: serializeUser(user), accessToken: signAccessToken(user, next.jti),
+        refreshToken: signRefreshToken(user, next.jti, next.createdAt, next.expiresAt).token
+      };
+    }
+    if (session.revokedAt) return { error: new UnauthorizedError('Session fermee', 'SESSION_REVOKED') };
+    const error = await touchSession(tx, session, user.role, now);
+    if (error) return { error };
 
-  return {
-    user: serializeUser(user),
-    accessToken,
-    refreshToken: nextRefreshToken
-  };
+    const expiresAt = refreshTokenExpiresAt(user.role, now);
+    const { token, jti } = signRefreshToken(user, undefined, now, expiresAt);
+    const tokenHash = await hashSecret(token);
+    await tx.refreshToken.update({ where: { id: session.id }, data: { revokedAt: now, revokedReason: 'rotated' } });
+    await tx.refreshToken.create({ data: {
+      userId: user.id, familyId: session.familyId, jti, tokenHash,
+      expiresAt, createdAt: now, lastUsedAt: now
+    } });
+    // Conserver les ancetres tant qu'un access token pourrait encore les citer.
+    await tx.refreshToken.deleteMany({ where: {
+      userId: user.id, expiresAt: { lt: new Date(now.getTime() - durationToMs(env.JWT_ACCESS_EXPIRES_IN)) }
+    } });
+    return { user: serializeUser(user), accessToken: signAccessToken(user, jti), refreshToken: token };
+  });
+  // Lever apres le commit conserve les revocations idle/reuse en base.
+  if (result.error) throw result.error;
+  return result;
 }
 
-/**
- * Ferme une session. Detenir le refresh token vaut preuve de possession, aucune
- * authentification supplementaire n'est exigee : un client dont l'access token
- * a deja expire doit pouvoir se deconnecter proprement.
- */
+/** Un logout ferme aussi le successeur si une rotation etait deja en vol. */
 export async function logout(refreshToken) {
   let payload;
   try {
     payload = verifyRefreshToken(refreshToken);
-  } catch {
-    // Un jeton expire ou illisible ne designe aucune session : il n'y a rien a
-    // fermer, et le dire reviendrait a renseigner un attaquant.
-    return { loggedOut: true };
+  } catch (error) {
+    if (error.statusCode === 401) return { loggedOut: true };
+    throw error;
   }
-
   const session = await findSessionForToken(payload.sub, refreshToken, payload.jti);
-  if (session && !session.revokedAt) {
-    await prisma.refreshToken.update({
-      where: { id: session.id },
+  if (session) {
+    await withSessionLock(payload.sub, (tx) => tx.refreshToken.updateMany({
+      where: { userId: payload.sub, familyId: session.familyId, revokedAt: null },
       data: { revokedAt: new Date(), revokedReason: 'logout' }
-    });
+    }));
+    await releaseSupportSession(payload.sub, session.familyId);
   }
-
   return { loggedOut: true };
 }
 
-/** Ferme toutes les sessions du compte (appareil perdu, doute sur un acces). */
+/** Le meme verrou empeche un refresh en vol de survivre au logout global. */
 export async function logoutAllSessions(userId) {
-  const { count } = await revokeAllSessions(userId, 'logout');
+  const { count } = await withSessionLock(userId, (tx) => revokeAllSessions(userId, 'logout', tx));
+  await releaseSupportSession(userId);
   return { loggedOut: true, sessions: count };
 }
 

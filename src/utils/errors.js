@@ -10,8 +10,8 @@ export class AppError extends Error {
 }
 
 export class UnauthorizedError extends AppError {
-  constructor(message = 'Authentification requise') {
-    super(message, { statusCode: 401, code: 'UNAUTHORIZED' });
+  constructor(message = 'Authentification requise', code = 'UNAUTHORIZED') {
+    super(message, { statusCode: 401, code });
   }
 }
 

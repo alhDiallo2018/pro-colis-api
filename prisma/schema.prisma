@@ -221,6 +221,7 @@ enum NegotiationRole {
 model User {
   id                      String                 @id @default(uuid()) @db.Uuid
   email                   String?                @unique
+  googleSubject           String?                @unique @map("google_subject")
   phone                   String                 @unique
   fullName                String                 @map("full_name")
   passwordHash            String?                @map("password_hash")
@@ -300,6 +301,10 @@ model User {
   commercialLeads         CommercialLead[]       @relation("LeadOwner")
   commercialObjectives    CommercialObjective[]  @relation("ObjectiveOwner")
   negotiationMessages     NegotiationMessage[]   @relation("NegotiationSender")
+  supportChat             SupportChatConversation? @relation("SupportChatRequester")
+  assignedSupportChats    SupportChatConversation[] @relation("SupportChatAssignee")
+  supportChatMessages     SupportChatEntry[]
+  supportPresences        SupportPresence[]
 
   @@map("users")
 }
@@ -722,6 +727,23 @@ model CommissionConfig {
   @@map("commission_configs")
 }
 
+// Journal d'envoi manuel : une cle client unique evite les doublons lors d'un
+// retry HTTP, meme apres redemarrage ou sur plusieurs instances de l'API.
+model ManualMessageDispatch {
+  id          String   @id @db.Uuid
+  actorId     String   @map("actor_id") @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  channel     String
+  contentHash String   @map("content_hash")
+  status      String   @default("processing")
+  result      Json     @default("{}")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([actorId, createdAt])
+  @@map("manual_message_dispatches")
+}
+
 model Notification {
   id         String               @id @default(uuid()) @db.Uuid
   userId     String               @map("user_id") @db.Uuid
@@ -769,6 +791,8 @@ model RefreshToken {
   // comparer le hash de chaque session. Nullable pour les jetons emis avant la
   // rotation, qui restent valides jusqu'a leur expiration naturelle.
   jti       String?   @unique @db.Uuid
+  // Une famille represente un appareil/une connexion, stable apres rotation.
+  familyId  String    @default(dbgenerated("gen_random_uuid()")) @map("family_id") @db.Uuid
   tokenHash String    @unique @map("token_hash")
   expiresAt DateTime  @map("expires_at") @db.Timestamptz
   // Derniere requete authentifiee rattachee a cette session : c'est elle qui
@@ -783,6 +807,7 @@ model RefreshToken {
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  @@index([familyId])
   @@index([expiresAt])
   @@map("refresh_tokens")
 }
@@ -864,6 +889,59 @@ model Rating {
   author    User     @relation("RatingAuthor", fields: [ratedBy], references: [id], onDelete: Cascade)
 
   @@map("ratings")
+}
+
+// La conversation appartient au demandeur, jamais a un agent particulier.
+// Son historique reste donc identique apres chaque reprise par un collegue.
+model SupportChatConversation {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @unique @map("user_id") @db.Uuid
+  department   String   @default("general")
+  status       String   @default("open")
+  assignedToId String?  @map("assigned_to_id") @db.Uuid
+  assignedAt   DateTime? @map("assigned_at") @db.Timestamptz
+  lastMessageAt DateTime @default(now()) @map("last_message_at") @db.Timestamptz
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  user         User @relation("SupportChatRequester", fields: [userId], references: [id], onDelete: Cascade)
+  assignedTo   User? @relation("SupportChatAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  messages     SupportChatEntry[]
+  @@index([status, assignedToId])
+  @@map("support_chat_conversations")
+}
+
+model SupportChatEntry {
+  id             String @id @default(uuid()) @db.Uuid
+  conversationId String @map("conversation_id") @db.Uuid
+  senderId       String? @map("sender_id") @db.Uuid
+  senderName     String @map("sender_name")
+  fromSupport    Boolean @map("from_support")
+  body           String @default("")
+  audioUrl       String? @map("audio_url")
+  photoUrl       String? @map("photo_url")
+  videoUrl       String? @map("video_url")
+  readAt         DateTime? @map("read_at") @db.Timestamptz
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  editedAt       DateTime? @map("edited_at") @db.Timestamptz
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz
+  conversation   SupportChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         User? @relation(fields: [senderId], references: [id], onDelete: SetNull)
+  @@index([conversationId, createdAt])
+  @@map("support_chat_entries")
+}
+
+// Un navigateur ferme ne doit pas rester disponible. Chaque onglet/appareil
+// renouvelle sa propre presence, liee a la famille de session authentifiee.
+model SupportPresence {
+  userId       String @map("user_id") @db.Uuid
+  connectionId String @map("connection_id") @db.Uuid
+  familyId     String? @map("family_id") @db.Uuid
+  available    Boolean @default(true)
+  lastSeenAt   DateTime @default(now()) @map("last_seen_at") @db.Timestamptz
+  user         User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([userId, connectionId])
+  @@index([lastSeenAt])
+  @@map("support_presences")
 }
 
 model SupportMessage {
@@ -1210,4 +1288,25 @@ model DeviceToken {
 
   @@index([userId])
   @@map("device_tokens")
+}
+
+// Les jetons opaques ne sont jamais stockes en clair. Le challenge ne donne
+// acces qu'a l'association/inscription, jamais aux routes authentifiees.
+model GoogleAuthChallenge {
+  id            String    @id @default(uuid()) @db.Uuid
+  tokenHash     String    @unique @map("token_hash")
+  googleSubject String    @map("google_subject")
+  email         String
+  fullName      String    @map("full_name")
+  linkUserId    String?   @map("link_user_id") @db.Uuid
+  phone         String?
+  otpHash       String?   @map("otp_hash")
+  otpSentAt     DateTime? @map("otp_sent_at") @db.Timestamptz
+  attempts      Int       @default(0)
+  expiresAt     DateTime  @map("expires_at") @db.Timestamptz
+  consumedAt    DateTime? @map("consumed_at") @db.Timestamptz
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([expiresAt])
+  @@map("google_auth_challenges")
 }

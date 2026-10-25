@@ -1,4 +1,5 @@
 import { prisma } from '../config/prisma.js';
+import { userSearchWhere } from '../utils/user-search.js';
 import { env } from '../config/env.js';
 import { ok, fail } from '../utils/api-response.js';
 import { getPagination, paginationMeta } from '../utils/pagination.js';
@@ -84,15 +85,7 @@ export const searchAssistanceUsers = handle('assistance.users.search', async (re
   const users = await prisma.user.findMany({
     where: {
       deletedAt: null,
-      ...(search
-        ? {
-            OR: [
-              { fullName: { contains: search, mode: 'insensitive' } },
-              { phone: { contains: search } },
-              { email: { contains: search, mode: 'insensitive' } }
-            ]
-          }
-        : {})
+      ...userSearchWhere(search)
     },
     select: {
       id: true,

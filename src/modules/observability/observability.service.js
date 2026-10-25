@@ -154,7 +154,7 @@ function escapeLogQlString(value) {
 
 function sourceMatcher(source) {
   if (!source) return null;
-  if (source === 'docker') return ['service', 'alloy|loki|prometheus|grafana|node-exporter|postgres-exporter|blackbox-exporter'];
+  if (source === 'docker') return ['service', 'alloy|loki|prometheus|grafana|alertmanager|node-exporter|postgres-exporter|blackbox-exporter'];
   return ['service', escapeLogQlString(source)];
 }
 
@@ -223,9 +223,11 @@ function parseNestedJson(line) {
 }
 
 export function normalizeSeverity(value, numericLevel) {
-  if (typeof value === 'number' && pinoSeverity.has(value)) return pinoSeverity.get(value);
+  if (pinoSeverity.has(Number(value))) return pinoSeverity.get(Number(value));
+  const explicit = severityAliases.get(String(value || '').toLowerCase());
+  if (explicit) return explicit;
   if (numericLevel !== undefined && pinoSeverity.has(Number(numericLevel))) return pinoSeverity.get(Number(numericLevel));
-  return severityAliases.get(String(value || '').toLowerCase()) || 'info';
+  return severityAliases.get(String(numericLevel || '').toLowerCase()) || 'info';
 }
 
 function timestampFromNanoseconds(value) {
@@ -250,7 +252,7 @@ function cleanError(error) {
 function createEntry(timestamp, line, stream) {
   const parsed = parseNestedJson(line);
   const source = parsed.source || parsed.service || stream.service || 'docker';
-  const severity = normalizeSeverity(parsed.severity || parsed.level_name || stream.severity, parsed.level);
+  const severity = normalizeSeverity(stream.severity || parsed.severity || parsed.level_name, parsed.level);
   const message = parsed.message || parsed.msg || parsed.error?.message || parsed.err?.message || String(line);
   const id = createHash('sha256').update(`${timestamp}\0${source}\0${line}`).digest('hex').slice(0, 24);
 
@@ -269,10 +271,11 @@ function createEntry(timestamp, line, stream) {
     environment: parsed.environment || stream.environment || 'production',
     message,
     requestId: parsed.requestId || parsed.req?.id,
-    route: parsed.route || parsed.path || parsed.req?.url,
-    method: parsed.method || parsed.req?.method,
-    statusCode: parsed.statusCode || parsed.status || parsed.res?.statusCode,
-    durationMs: parsed.durationMs || parsed.responseTime,
+    route: parsed.route || parsed.path || parsed.req?.url || parsed.request?.uri,
+    method: parsed.method || parsed.req?.method || parsed.request?.method,
+    statusCode: parsed.statusCode ?? parsed.status ?? parsed.res?.statusCode,
+    // Pino exprime la duree en ms, Caddy en secondes. Zero reste une mesure valide.
+    durationMs: parsed.durationMs ?? parsed.responseTime ?? (typeof parsed.duration === 'number' ? parsed.duration * 1000 : undefined),
     userId: parsed.userId,
     error: cleanError(parsed.error || parsed.err),
     context
@@ -282,13 +285,21 @@ function createEntry(timestamp, line, stream) {
 }
 
 export function normalizeLokiStreams(payload) {
-  const streams = payload?.data?.resultType === 'streams' ? payload.data.result : [];
+  // Une reponse amont invalide n'est pas une liste vide : sinon une panne
+  // apparaitrait dans l'interface comme une absence d'incidents.
+  if (payload?.status === 'error' || payload?.data?.resultType !== 'streams' || !Array.isArray(payload.data.result)) {
+    throw new ObservabilityUnavailableError();
+  }
+  const streams = payload.data.result;
   const entries = streams.flatMap((result) =>
     (result.values || []).map(([timestamp, line]) => createEntry(timestamp, line, result.stream || {}))
   );
   return entries.sort((a, b) => {
-    const timeOrder = Date.parse(b.timestamp) - Date.parse(a.timestamp);
-    return timeOrder || b.id.localeCompare(a.id);
+    // Loki distingue les entrees a la nanoseconde. Trier sur l'ISO (ms)
+    // rendrait l'ordre incompatible avec le curseur et ferait perdre des lignes.
+    const aTime = BigInt(timestampNsByEntry.get(a));
+    const bTime = BigInt(timestampNsByEntry.get(b));
+    return aTime === bTime ? b.id.localeCompare(a.id) : aTime > bTime ? -1 : 1;
   });
 }
 
@@ -305,13 +316,12 @@ function entryPrecedesCursor(entry, cursor) {
 }
 
 async function queryLogs(filters, limit) {
-  const end = filters.cursor
-    ? new Date(Number(BigInt(filters.cursor.timestamp) / 1_000_000n))
-    : filters.to;
+  // Ne pas passer par Date : cette conversion tronque les nanosecondes du curseur.
+  const end = filters.cursor?.timestamp || toNanoseconds(filters.to);
   const payload = await fetchJson(env.LOKI_BASE_URL, '/loki/api/v1/query_range', {
     query: buildLogQuery(filters),
     start: toNanoseconds(filters.from),
-    end: toNanoseconds(end),
+    end,
     direction: 'backward',
     limit: filters.cursor ? Math.min(limit + 50, 10_000) : limit
   });
@@ -358,7 +368,9 @@ export async function getLogs(filters) {
 }
 
 function vectorCounts(payload, label) {
-  if (payload?.data?.resultType !== 'vector') return {};
+  if (payload?.status === 'error' || payload?.data?.resultType !== 'vector' || !Array.isArray(payload.data.result)) {
+    throw new ObservabilityUnavailableError();
+  }
   return Object.fromEntries(
     payload.data.result.map((item) => [item.metric?.[label] || 'unknown', Number(item.value?.[1] || 0)])
   );
@@ -366,7 +378,9 @@ function vectorCounts(payload, label) {
 
 async function getLogCounts(filters, groupLabel) {
   const seconds = Math.max(1, Math.ceil((filters.to.getTime() - filters.from.getTime()) / 1000));
-  const logQuery = buildLogQuery({ ...filters, levels: [], q: undefined, requestId: undefined });
+  // Les compteurs doivent porter sur le meme ensemble que la liste filtree.
+  // Apres le parsing JSON, exclure ses erreurs pour les requetes metriques Loki.
+  const logQuery = buildLogQuery(filters) + (filters.requestId ? ' | __error__=""' : '');
   return fetchJson(env.LOKI_BASE_URL, '/loki/api/v1/query', {
     query: `sum by (${groupLabel}) (count_over_time(${logQuery}[${seconds}s]))`,
     time: filters.to.toISOString()

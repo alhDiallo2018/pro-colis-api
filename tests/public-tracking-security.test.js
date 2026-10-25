@@ -7,8 +7,8 @@ import { prisma } from '../src/config/prisma.js';
  *
  * Le suivi public ne doit jamais exposer les donnees personnelles du chauffeur
  * (email, telephone, adresse, genre, lastLogin, etc.) ni les donnees de paiement,
- * de negociation ou d'authentification. Seul `{ id, name }` est autorise pour le
- * chauffeur, et le GPS reste limite a une unique derniere position.
+ * de negociation ou d'authentification. Le chauffeur utilise une liste stricte
+ * de champs de profil public ; le GPS reste limite a une derniere position.
  */
 describe('public parcel tracking — driver data safety', () => {
   const suffix = Date.now().toString().slice(-7);
@@ -20,6 +20,13 @@ describe('public parcel tracking — driver data safety', () => {
 
   const SENTINEL_EMAIL = 'driver.secret@example.com';
   const SENTINEL_ADDRESS = '123 Rue Secrete, Dakar';
+
+  // Le profil public a ete enrichi sans ouvrir l'acces aux coordonnees privees.
+  // Une egalite stricte detecte toujours l'ajout accidentel d'un champ sensible.
+  const expectedPublicDriver = () => ({
+    id: driverId, name: 'Chauffeur Prive', profilePhoto: null,
+    rating: 0, isVerified: false, vehicleType: null
+  });
 
   async function register(prefix, fullName, role) {
     const res = await request(app)
@@ -80,7 +87,7 @@ describe('public parcel tracking — driver data safety', () => {
     await prisma.$disconnect();
   });
 
-  it('exposes only the driver id and name', async () => {
+  it('exposes only the allowed public driver profile fields', async () => {
     const parcel = await createParcel('in_transit', driverId);
 
     const res = await request(app).get(`/api/v1/public/parcels/track/${parcel.trackingNumber}`);
@@ -88,8 +95,8 @@ describe('public parcel tracking — driver data safety', () => {
 
     const p = res.body.parcel;
     expect(p.driverName).toBe('Chauffeur Prive');
-    expect(p.driver).toEqual({ id: driverId, name: 'Chauffeur Prive' });
-    expect(p.assignedDriver).toEqual({ id: driverId, name: 'Chauffeur Prive' });
+    expect(p.driver).toEqual(expectedPublicDriver());
+    expect(p.assignedDriver).toEqual(expectedPublicDriver());
     expect(p.driverId).toBe(driverId);
     expect(p.assignedDriverId).toBe(driverId);
   });
@@ -109,8 +116,7 @@ describe('public parcel tracking — driver data safety', () => {
     expect(raw).not.toContain(driverPhone);
     expect(raw).not.toMatch(/lastLogin|"gender"|isEmailVerified|isPhoneVerified/);
 
-    // Le champ `driverPhone` a disparu, et les objets conducteur sont reduits a
-    // `{ id, name }` : pas d'email, de telephone, d'adresse, de genre ni de login.
+    // Le profil public ne contient ni email, telephone, adresse, genre ou login.
     expect(p).not.toHaveProperty('driverPhone');
     for (const key of ['email', 'phone', 'address', 'gender', 'lastLogin', 'lastActiveAt']) {
       expect(p.driver).not.toHaveProperty(key);
@@ -176,6 +182,6 @@ describe('public parcel tracking — driver data safety', () => {
 
     // Le nom du chauffeur reste disponible pour l'experience de livraison.
     expect(res.body.parcel.driverName).toBe('Chauffeur Prive');
-    expect(res.body.parcel.driver).toEqual({ id: driverId, name: 'Chauffeur Prive' });
+    expect(res.body.parcel.driver).toEqual(expectedPublicDriver());
   });
 });

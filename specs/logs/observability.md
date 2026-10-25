@@ -115,6 +115,10 @@ Retourne les compteurs par niveau et source, l'heure de la derniere entree et
 un resume de disponibilite. La periode par defaut est une heure et ne peut pas
 depasser 14 jours.
 
+Les compteurs et la derniere entree respectent les filtres `source`, `levels`,
+`q` et `requestId`. Pour les compteurs d'onglets couvrant tous les niveaux,
+le client omet simplement `levels` de sa requete de resume.
+
 ### Liste des journaux
 
 ```http

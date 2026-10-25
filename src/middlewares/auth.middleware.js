@@ -1,52 +1,19 @@
 import { prisma } from '../config/prisma.js';
 import { UnauthorizedError, ForbiddenError } from '../utils/errors.js';
-import { sessionIdleTimeoutMs, verifyAccessToken } from '../utils/tokens.js';
+import { verifyAccessToken } from '../utils/tokens.js';
+import { activeSessionForAccess, touchSession, withSessionLock } from '../modules/auth/session.service.js';
 
-/**
- * Un compte actif emet plusieurs requetes par seconde : ecrire `lastUsedAt` a
- * chacune doublerait la charge d'ecriture de l'API pour une precision inutile.
- * L'horodatage n'est donc rafraichi qu'au-dela de ce pas.
- *
- * Le decalage joue toujours dans le sens prudent : `lastUsedAt` peut retarder
- * de 5 s au plus sur l'activite reelle, donc une session se ferme au plus tot
- * 5 s avant le delai configure, jamais apres.
- */
-const IDLE_TOUCH_THROTTLE_MS = 5000;
-
-/**
- * Ferme la session si elle dort depuis trop longtemps, sinon y date l'activite.
- *
- * Les jetons emis avant l'introduction du `sid` ne designent aucune session :
- * ils restent acceptes jusqu'a leur expiration naturelle plutot que de
- * deconnecter toute la base au deploiement.
- */
-async function enforceSessionActivity(sid) {
+/** Les anciens JWT sans sid restent valides jusqu'a leur expiration. */
+async function enforceSessionActivity(sid, user) {
   if (!sid) return;
-
-  const session = await prisma.refreshToken.findUnique({ where: { jti: sid } });
-  if (!session) return;
-
-  if (session.revokedAt) {
-    throw new UnauthorizedError('Session fermee');
-  }
-
-  const now = Date.now();
-  const idleMs = now - session.lastUsedAt.getTime();
-
-  if (idleMs > sessionIdleTimeoutMs()) {
-    await prisma.refreshToken.update({
-      where: { id: session.id },
-      data: { revokedAt: new Date(), revokedReason: 'idle' }
-    });
-    throw new UnauthorizedError('Session expiree pour inactivite');
-  }
-
-  if (idleMs >= IDLE_TOUCH_THROTTLE_MS) {
-    await prisma.refreshToken.update({
-      where: { id: session.id },
-      data: { lastUsedAt: new Date(now) }
-    });
-  }
+  const result = await withSessionLock(user.id, async (tx) => {
+    const session = await activeSessionForAccess(tx, sid, user.id);
+    if (!session) return new UnauthorizedError('Session fermee', 'SESSION_REVOKED');
+    const error = await touchSession(tx, session, user.role);
+    return error || { familyId: session.familyId };
+  });
+  if (result instanceof Error) throw result;
+  return result?.familyId;
 }
 
 export async function authenticate(req, _res, next) {
@@ -84,7 +51,7 @@ export async function authenticate(req, _res, next) {
       throw new UnauthorizedError('Session invalide');
     }
 
-    await enforceSessionActivity(payload.sid);
+    req.sessionFamilyId = await enforceSessionActivity(payload.sid, user);
 
     req.user = user;
     return next();
@@ -92,7 +59,9 @@ export async function authenticate(req, _res, next) {
     if (error.statusCode) {
       return next(error);
     }
-    return next(new UnauthorizedError('Token invalide'));
+    // Le gestionnaire central journalise la cause technique et renvoie 5xx.
+    // La convertir en 401 detruirait inutilement les sessions des clients.
+    return next(error);
   }
 }
 

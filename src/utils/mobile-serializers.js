@@ -485,7 +485,8 @@ export function serializeParcel(parcel, options = {}) {
  * personnelles du chauffeur : pas de `serializeUser` (email, telephone, adresse,
  * genre, lastLogin, etc.), pas de `driverPhone`, pas de donnees de paiement ou de
  * caisse, et pas d'historique de negociation (offres, propositions). Le chauffeur
- * ne remonte que sous la forme minimale `{ id, name }`.
+ * utilise une liste stricte de champs publics : identifiant, nom, photo,
+ * note, statut de verification et type de vehicule.
  */
 export function serializePublicTrackingParcel(parcel) {
   if (!parcel) return null;

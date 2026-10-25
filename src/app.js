@@ -16,6 +16,7 @@ import { notificationRouter, adminNotificationRouter } from './modules/notificat
 import { uploadRouter } from './modules/uploads/upload.routes.js';
 import { mobileRouter } from './modules/mobile/mobile.routes.js';
 import { supportRouter } from './modules/support/support.routes.js';
+import { supportChatRouter } from './modules/support/chat.routes.js';
 import { zoneRouter } from './modules/zones/zone.routes.js';
 import { observabilityRouter } from './modules/observability/observability.routes.js';
 
@@ -61,6 +62,7 @@ apiV1.use('/upload', uploadRouter);
 apiV1.use('/super-admin/observability', observabilityRouter);
 apiV1.use('/', zoneRouter);
 apiV1.use('/', supportRouter);
+apiV1.use('/support/chat', supportChatRouter);
 apiV1.use('/', mobileRouter);
 
 app.use('/api/v1', apiV1);

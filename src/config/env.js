@@ -1,9 +1,11 @@
 import 'dotenv/config';
 import { z } from 'zod';
+import { appUpdateEnvShape, validateAppUpdateEnv } from './app-update.js';
 
 const DURATION = z
   .string()
-  .regex(/^\d+[smhd]?$/, 'Duree attendue au format 900, 15m, 12h ou 30d');
+  .regex(/^\d+[smhd]?$/, 'Duree attendue au format 900, 15m, 12h ou 30d')
+  .refine((value) => Number.parseInt(value, 10) > 0, 'La duree doit etre positive');
 
 // Secrets JWT : longueur minimale exigee en production. En developpement/test,
 // le schema de base (min 16) suffit pour autoriser une configuration locale.
@@ -36,6 +38,9 @@ function isPlaceholderJwtSecret(value) {
 }
 
 const envSchema = z.object({
+  ...appUpdateEnvShape,
+  GOOGLE_WEB_CLIENT_ID: z.string().trim().refine(value => !value || /^[a-zA-Z0-9_-]+\.apps\.googleusercontent\.com$/.test(value), "Client OAuth Google invalide").default(''),
+  SUPPORT_PRESENCE_TTL_SECONDS: z.coerce.number().int().min(30).max(300).default(90),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8080),
   DATABASE_URL: z.string().min(1),
@@ -50,10 +55,14 @@ const envSchema = z.object({
   // Les comptes staff voient toutes les donnees de la plateforme : leur session
   // se ferme en heures la ou celle d'un client dure des semaines.
   JWT_REFRESH_EXPIRES_IN_STAFF: DURATION.default('12h'),
-  // Delai d'inactivite au-dela duquel la session est fermee, independamment de
-  // la duree de vie du refresh token. C'est ce delai, et non l'expiration du
-  // jeton, qui protege un poste laisse ouvert sans surveillance.
-  SESSION_IDLE_TIMEOUT: DURATION.default('1m'),
+  // Une pause de lecture ou un passage en arriere-plan ne ferme pas une
+  // session client. Le staff conserve une limite courte, independante.
+  SESSION_IDLE_TIMEOUT: DURATION.default('30d'),
+  SESSION_IDLE_TIMEOUT_STAFF: DURATION.default('30m'),
+  // Fenetre fixe pour recuperer une reponse de rotation perdue. La repeter
+  // n'allonge jamais cette fenetre et ne cree pas de nouveau jeton.
+  // 60 s couvrent un timeout client de 30 s suivi de sa nouvelle tentative.
+  REFRESH_RETRY_GRACE_SECONDS: z.coerce.number().int().min(0).max(120).default(60),
   OTP_EXPIRES_MINUTES: z.coerce.number().int().positive().default(10),
   UPLOAD_STORAGE: z.enum(['local', 's3']).default('local'),
   UPLOAD_LOCAL_DIR: z.string().default('uploads'),
@@ -115,6 +124,7 @@ const envSchema = z.object({
   BREVO_SENDER_NAME: z.string().optional(),
   BREVO_SMS_SENDER: z.string().optional()
 }).superRefine((value, context) => {
+  validateAppUpdateEnv(value, context);
   // La route de metriques reste hors de Caddy, mais un token fort limite aussi
   // les acces accidentels depuis un autre conteneur du reseau de production.
   if (value.NODE_ENV === 'production' && (!value.METRICS_TOKEN || value.METRICS_TOKEN.length < 32)) {

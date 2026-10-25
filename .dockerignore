@@ -1,7 +1,11 @@
 node_modules
 npm-debug.log*
 .git
+# Les secrets sont injectes au lancement, jamais copies dans une image.
+.env
 .env.*
 coverage
 uploads
+# Les dumps contiennent des donnees privees et restent sur le volume de sauvegarde.
+backups
 .DS_Store

@@ -598,3 +598,13 @@ Statut : `SPEC`
 | GET | `/webhooks` | aucun | `{ "success": true, "webhooks": [] }` |
 | POST | `/webhooks` | `{ "url": "https://example.com/hook", "events": ["parcel.delivered"], "secret": "secret" }` | `{ "success": true, "webhook": {} }` |
 | DELETE | `/webhooks/:webhookId` | aucun | `{ "success": true, "message": "Webhook supprime" }` |
+
+La creation accepte `isActive` (booleen, `true` par defaut). Les evenements
+sont nettoyes des espaces et dedupliques ; une valeur vide ou non textuelle
+est rejetee en 422. Les reponses exposent `isActive` et `hasSecret`, jamais le
+secret. Creation et suppression produisent une trace d'audit dans la meme
+transaction, sans y copier le secret.
+
+Ces routes gerent les abonnements en base. Le mecanisme de livraison sortante
+des evenements n'est pas encore implemente ; `isActive` decrit la configuration
+de l'abonnement et ne prouve pas la reception d'un evenement.

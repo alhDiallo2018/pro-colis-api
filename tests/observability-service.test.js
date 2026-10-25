@@ -4,6 +4,7 @@ import {
   exportLogs,
   getLogs,
   getServices,
+  getSummary,
   normalizeLokiStreams,
   normalizeSeverity,
   parseObservabilityQuery,
@@ -56,6 +57,8 @@ describe('observability normalization', () => {
     expect(normalizeSeverity(undefined, 60)).toBe('critical');
     expect(normalizeSeverity('PANIC')).toBe('emergency');
     expect(normalizeSeverity('warn')).toBe('warning');
+    expect(normalizeSeverity(undefined, 'error')).toBe('error');
+    expect(normalizeSeverity('50')).toBe('error');
   });
 
   it('normalizes Loki streams and redacts secrets while preserving diagnostic codes', () => {
@@ -132,6 +135,68 @@ describe('observability normalization', () => {
 });
 
 describe('observability upstream clients', () => {
+  it('keeps summary counters and latest entry scoped to the requested search', async () => {
+    jest.spyOn(global, 'fetch').mockImplementation(async (url) => {
+      const query = url.searchParams.get('query');
+      let data = { resultType: 'vector', result: [] };
+      if (url.pathname.endsWith('query_range')) data = { resultType: 'streams', result: [] };
+      else if (query.includes('sum by (severity)')) data.result = [{ metric: { severity: 'error' }, value: [1, '3'] }];
+      else if (query.includes('sum by (service)')) data.result = [{ metric: { service: 'api' }, value: [1, '3'] }];
+      return { ok: true, json: async () => ({ status: 'success', data }) };
+    });
+    const summary = await getSummary({ source: 'api', levels: ['error'], q: 'failure', requestId: 'request-123', from, to });
+    expect(summary.total).toBe(3);
+    expect(summary.bySource).toEqual({ api: 3 });
+    const queries = global.fetch.mock.calls.map(([url]) => url.searchParams.get('query'));
+    for (const query of queries.filter((query) => query.includes('count_over_time'))) {
+      expect(query).toContain('severity=~"error"');
+      expect(query).toContain('|= "failure"');
+      expect(query).toContain('requestId="request-123"');
+      expect(query).toContain('__error__=""');
+    }
+  });
+
+  it('keeps nanosecond order and resumes without skipping entries in the same millisecond', async () => {
+    // Toutes les entrees ont le meme ISO public en millisecondes : la seconde
+    // page doit pourtant recuperer les nanosecondes precedant le curseur.
+    const values = Array.from({ length: 24 }, (_, index) => [
+      (1785630608000000000n + BigInt(index + 1)).toString(), JSON.stringify({ msg: `entry-${index}` })
+    ]);
+    jest.spyOn(global, 'fetch').mockImplementation(async (url) => {
+      const end = BigInt(url.searchParams.get('end'));
+      const limit = Number(url.searchParams.get('limit'));
+      return { ok: true, json: async () => ({ data: { resultType: 'streams', result: [{
+        stream: { service: 'api' },
+        values: values.filter(([time]) => BigInt(time) <= end).reverse().slice(0, limit)
+      }] } }) };
+    });
+    const filters = { from, to, limit: 20 };
+    const first = await getLogs(filters);
+    expect(first.logs.map((entry) => entry.message)).toEqual(values.slice(4).reverse().map(([, line]) => JSON.parse(line).msg));
+    const cursor = JSON.parse(Buffer.from(first.page.nextCursor, 'base64url').toString());
+    const second = await getLogs({ ...filters, cursor });
+    expect(second.logs.map((entry) => entry.message)).toEqual(['entry-3', 'entry-2', 'entry-1', 'entry-0']);
+    expect(second.page.hasMore).toBe(false);
+    expect(global.fetch.mock.calls[1][0].searchParams.get('end')).toBe(cursor.timestamp);
+  });
+
+  it('normalizes Caddy request fields and preserves zero duration', () => {
+    const payload = { data: { resultType: 'streams', result: [{ stream: { service: 'caddy' }, values: [
+      ['1785630608000000000', JSON.stringify({ level: 'error', msg: 'request failed', status: 502,
+        request: { method: 'GET', uri: '/health' }, duration: 0.125 })],
+      ['1785630607000000000', JSON.stringify({ durationMs: 0, responseTime: 20, msg: 'cached' })]
+    ] }] } };
+    const [caddy, cached] = normalizeLokiStreams(payload);
+    expect(caddy).toMatchObject({ severity: 'error', route: '/health', method: 'GET', statusCode: 502, durationMs: 125 });
+    expect(cached.durationMs).toBe(0);
+  });
+
+  it('reports invalid upstream data as unavailable instead of a false empty list', async () => {
+    jest.spyOn(global, 'fetch').mockResolvedValue({ ok: true, json: async () => ({ status: 'error' }) });
+    await expect(getLogs({ from, to, limit: 20 })).rejects.toMatchObject({ code: 'OBSERVABILITY_UNAVAILABLE' });
+    await expect(getSummary({ from, to, limit: 20 })).rejects.toMatchObject({ code: 'OBSERVABILITY_UNAVAILABLE' });
+  });
+
   it('queries Loki and returns normalized logs', async () => {
     jest.spyOn(global, 'fetch').mockResolvedValue({
       ok: true,

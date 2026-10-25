@@ -1,5 +1,8 @@
 import bcrypt from 'bcryptjs';
 import { env } from '../../config/env.js';
+import { publicAndroidUpdatePolicy } from '../../config/app-update.js';
+import { userSearchWhere } from '../../utils/user-search.js';
+import * as supportChat from '../support/chat.service.js';
 import { prisma } from '../../config/prisma.js';
 import { fail, ok } from '../../utils/api-response.js';
 import { isBrevoConfigured, sendNotificationEmail, sendNotificationSms, sendOtpSms } from '../../utils/brevo.js';
@@ -4027,6 +4030,23 @@ export const sendMessage = handle('messages.send', async (req, res) => {
     select: { id: true, role: true, fullName: true }
   });
 
+  // Valeur embarquee dans les anciennes APK : elle ne correspond pas
+  // necessairement a un compte en base. Elle designe uniquement le support.
+  const legacySupport = !originalReceiver && receiverId === 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+  if (!originalReceiver && !legacySupport) throw new NotFoundError('Destinataire introuvable');
+
+  // Compatibilite des applications deja publiees : leur compte support fixe
+  // ouvre desormais le meme fil partage, sans diffuser a tous les agents.
+  if (!req.body.parcelId && (legacySupport || supportChat.isSupportAgent(originalReceiver)) && !supportChat.isSupportAgent(req.user)) {
+    const department = originalReceiver?.role === 'support_technique' ? 'technique'
+      : originalReceiver?.role === 'support_commercial' ? 'commercial' : 'general';
+    const chat = await supportChat.openChat(req.user, req.user.id, department);
+    const message = await supportChat.sendChatMessage(req.user, chat.id, {
+      body, audioUrl: req.body.audioUrl || null, photoUrl: req.body.photoUrl || null, videoUrl: req.body.videoUrl || null
+    });
+    return ok(res, { status: 201, data: { message, messages: [message], conversationId: chat.id } });
+  }
+
   if (!originalReceiver) throw new NotFoundError('Destinataire introuvable');
 
   const isSupportTarget = ['support_technique', 'support_commercial', 'support', 'admin', 'super_admin'].includes(originalReceiver.role);
@@ -4308,6 +4328,17 @@ export const messageThread = handle('messages.thread', async (req, res) => {
   const parcelId = req.query.parcelId || null;
   if (!peerId) throw new ValidationError([{ path: 'peerId', message: 'peerId requis' }]);
   res.setHeader('Cache-Control', 'private, no-store');
+
+  if (!parcelId && !supportChat.isSupportAgent(req.user)) {
+    const peer = await prisma.user.findUnique({ where: { id: peerId }, select: { role: true } });
+    if ((peer && supportChat.isSupportAgent(peer)) || (!peer && peerId === 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d')) {
+      // Lire un ancien fil ne doit pas rouvrir une demande deja cloturee.
+      const chat = await prisma.supportChatConversation.findUnique({ where: { userId: req.user.id } })
+        ?? await supportChat.openChat(req.user, req.user.id);
+      const result = await supportChat.chatThread(req.user, chat.id);
+      return ok(res, { data: result });
+    }
+  }
 
   const where = {
     deletedAt: null,
@@ -6184,7 +6215,10 @@ export const superAdminExport = handle('super.export', async (req, res) => {
 
 export const superAdminUsers = handle('super.users', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
-  const where = cleanUndefined({ role: req.query.role, status: req.query.status });
+  const where = {
+    ...cleanUndefined({ role: req.query.role, status: req.query.status }),
+    ...userSearchWhere(req.query.search ?? req.query.q)
+  };
   const [total, users] = await Promise.all([
     prisma.user.count({ where }),
     prisma.user.findMany({ where, include: { ...driverInclude, score: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
@@ -6456,12 +6490,17 @@ function auditUuidFilter(value, path) {
 }
 
 function auditDateFilter(from, to) {
+  // Une date de fin sans heure designe toute la journee UTC, pas minuit.
+  const dateOnlyEnd = typeof to === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(to);
   const range = cleanUndefined({
     gte: from ? new Date(from) : undefined,
-    lte: to ? new Date(to) : undefined
+    lte: to ? new Date(dateOnlyEnd ? `${to}T23:59:59.999Z` : to) : undefined
   });
   if (Object.values(range).some((date) => Number.isNaN(date.getTime()))) {
     throw new ValidationError([{ path: 'query.from', message: 'Date ISO invalide' }], 'Filtre d audit invalide');
+  }
+  if (range.gte && range.lte && range.gte > range.lte) {
+    throw new ValidationError([{ path: 'query.from', message: 'La date de debut doit preceder la date de fin' }], 'Filtre d audit invalide');
   }
   return Object.keys(range).length ? range : undefined;
 }
@@ -6476,11 +6515,15 @@ export const auditLogs = handle('super.auditLogs', async (req, res) => {
     action: req.query.action || undefined,
     entityType: req.query.entityType || undefined,
     entityId: auditUuidFilter(req.query.entityId, 'query.entityId'),
-    createdAt: auditDateFilter(req.query.from, req.query.to),
+    // Accepter les noms documentes et ceux deja utilises par le web/mobile.
+    createdAt: auditDateFilter(req.query.from || req.query.dateFrom, req.query.to || req.query.dateTo),
     OR: search
       ? [
         { action: { contains: search, mode: 'insensitive' } },
-        { entityType: { contains: search, mode: 'insensitive' } }
+        { entityType: { contains: search, mode: 'insensitive' } },
+        { actor: { is: { fullName: { contains: search, mode: 'insensitive' } } } },
+        { requestId: { contains: search, mode: 'insensitive' } },
+        ...(UUID_PATTERN.test(search) ? [{ entityId: search }, { actorId: search }] : [])
       ]
       : undefined
   });
@@ -6489,7 +6532,7 @@ export const auditLogs = handle('super.auditLogs', async (req, res) => {
     prisma.auditLog.count({ where }),
     prisma.auditLog.findMany({
       where,
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       skip,
       take: limit,
       include: { actor: { select: { id: true, fullName: true, phone: true, role: true } } }
@@ -6679,6 +6722,13 @@ export const getPublicConfig = handle('config.public', async (_req, res) => {
   return ok(res, { message: 'Configuration publique', data: { config: await readPublicConfig() } });
 });
 
+// Independante de la BD et des sessions : meme un appareil deconnecte doit
+// pouvoir connaitre la version requise. Le wrapper handle journalise les erreurs.
+export const getAppUpdate = handle('config.appUpdate', async (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  return ok(res, { data: { android: publicAndroidUpdatePolicy(env) } });
+});
+
 export const updateSystemConfig = handle('super.configUpdate', async (req, res) => {
   const entries = Object.entries(req.body);
   if (entries.length === 0) throw new ValidationError([{ path: 'body', message: 'Au moins un parametre requis' }]);
@@ -6739,23 +6789,46 @@ export const listWebhooks = handle('webhooks.list', async (_req, res) => {
 
 export const createWebhook = handle('webhooks.create', async (req, res) => {
   const url = typeof req.body.url === 'string' ? req.body.url.trim() : '';
-  if (!/^https?:\/\/\S+$/i.test(url)) {
+  if (!URL.canParse(url) || !['http:', 'https:'].includes(new URL(url).protocol)) {
     throw new ValidationError([{ path: 'body.url', message: 'URL http(s) valide requise' }]);
   }
-  const events = Array.isArray(req.body.events) ? req.body.events.filter((event) => typeof event === 'string') : [];
-  if (events.length === 0) {
+  if (!Array.isArray(req.body.events) || req.body.events.length === 0
+    || req.body.events.some((event) => typeof event !== 'string' || !event.trim())) {
     throw new ValidationError([{ path: 'body.events', message: 'Au moins un evenement est requis' }]);
   }
+  if (req.body.isActive !== undefined && typeof req.body.isActive !== 'boolean') {
+    throw new ValidationError([{ path: 'body.isActive', message: 'Booleen requis' }]);
+  }
+  if (req.body.secret != null && typeof req.body.secret !== 'string') {
+    throw new ValidationError([{ path: 'body.secret', message: 'Chaine de caracteres requise' }]);
+  }
+  const events = [...new Set(req.body.events.map((event) => event.trim()))];
+  const secret = req.body.secret?.trim() ? req.body.secret : null;
 
-  const webhook = await prisma.webhook.create({
-    data: { url, events, secret: req.body.secret || null, createdBy: req.user.id }
+  // L'abonnement et sa trace sont atomiques. Le secret ne doit jamais etre
+  // copie dans l'audit ; seule sa presence est utile au diagnostic.
+  const webhook = await prisma.$transaction(async (tx) => {
+    const created = await tx.webhook.create({
+      data: { url, events, secret, isActive: req.body.isActive ?? true, createdBy: req.user.id }
+    });
+    await audit(tx, req, {
+      action: 'webhook.create', entityType: 'webhook', entityId: created.id,
+      afterData: { url: created.url, events: created.events, isActive: created.isActive, hasSecret: Boolean(created.secret) }
+    });
+    return created;
   });
   return ok(res, { status: 201, message: 'Webhook cree', data: { webhook: serializeWebhook(webhook) } });
 });
 
 export const deleteWebhook = handle('webhooks.delete', async (req, res) => {
-  const removed = await prisma.webhook.deleteMany({ where: { id: req.params.webhookId } });
-  if (removed.count === 0) throw new NotFoundError('Webhook introuvable');
+  const id = auditUuidFilter(req.params.webhookId, 'params.webhookId');
+  await prisma.$transaction(async (tx) => {
+    const removed = await tx.webhook.delete({ where: { id } });
+    await audit(tx, req, {
+      action: 'webhook.delete', entityType: 'webhook', entityId: removed.id,
+      beforeData: { url: removed.url, events: removed.events, isActive: removed.isActive, hasSecret: Boolean(removed.secret) }
+    });
+  });
   return ok(res, { message: 'Webhook supprime' });
 });
 
@@ -6763,7 +6836,7 @@ export const deleteWebhook = handle('webhooks.delete', async (req, res) => {
 // SYSTEM HEALTH - Santé du système
 // ============================================================
 
-export const systemHealth = handle('system.health', async (_req, res) => {
+export const systemHealth = handle('system.health', async (req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
     return ok(res, {
@@ -6775,12 +6848,18 @@ export const systemHealth = handle('system.health', async (_req, res) => {
         timestamp: new Date().toISOString()
       }
     });
-  } catch {
-    return fail(res, {
-      status: 503,
+  } catch (error) {
+    req.log.error({ error, action: 'system.health', requestId: req.requestId }, 'System health database probe failed');
+    // Conserver les memes champs de diagnostic que la reponse saine. `fail`
+    // n'accepte pas de data : les valeurs etaient auparavant perdues.
+    return res.status(503).json({
+      success: false,
       message: 'Systeme degrade',
-      code: 'SERVICE_UNAVAILABLE',
-      data: { status: 'degraded', database: 'disconnected' }
+      error: { code: 'SERVICE_UNAVAILABLE', details: [] },
+      status: 'degraded',
+      database: 'disconnected',
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString()
     });
   }
 });

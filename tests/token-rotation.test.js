@@ -9,7 +9,7 @@ import { durationToMs, hashSecret, refreshTokenTtl } from '../src/utils/tokens.j
  * Duree de vie et rotation des sessions.
  *
  * Deux invariants tiennent la securite de la chaine : un refresh token ne sert
- * qu'une fois (sa reutilisation coupe le compte), et sa duree depend du role —
+ * qu'une fois (ses retries proches partagent le successeur), et sa duree depend du role —
  * un compte staff voit toute la plateforme, sa session doit se refermer en
  * heures quand celle d'un client dure des semaines.
  */
@@ -55,14 +55,17 @@ describe('rotation des refresh tokens', () => {
     expect((await refresh(first.body.refreshToken)).status).toBe(200);
   });
 
-  it('coupe toutes les sessions quand un jeton revoque est rejoue', async () => {
+  it('revoque la famille quand un jeton est rejoue hors grace', async () => {
     const { id, refreshToken } = await register('76', 'Rotation Rejeu');
 
     const rotated = await refresh(refreshToken);
     expect(rotated.status).toBe(200);
 
-    // Rejeu du jeton deja consomme : on ne sait pas qui du voleur ou de la
-    // victime le presente, donc tout le compte est coupe.
+    // Vieillir la rotation, pas le JWT : le rejeu est hors de la tolerance reseau.
+    await prisma.refreshToken.updateMany({
+      where: { userId: id, revokedReason: 'rotated' },
+      data: { revokedAt: new Date(Date.now() - (env.REFRESH_RETRY_GRACE_SECONDS + 1) * 1000) }
+    });
     const replayed = await refresh(refreshToken);
     expect(replayed.status).toBe(401);
 

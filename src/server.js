@@ -3,11 +3,13 @@ import { env } from './config/env.js';
 import { logger } from './config/logger.js';
 import { disconnectPrisma } from './config/prisma.js';
 import { attachNotificationPushBridge } from './utils/push.js';
+import { startSupportReassignmentWorker } from './modules/support/chat.service.js';
 
 // Toute notification creee part aussi en push vers les appareils du
 // destinataire. Branche ici et pas dans `app.js` : les tests montent l'app sans
 // devoir declencher d'appels reseau.
 attachNotificationPushBridge();
+const stopSupportWorker = startSupportReassignmentWorker();
 
 const server = app.listen(env.PORT, () => {
   logger.info({ port: env.PORT }, 'PRO COLIS API started');
@@ -18,6 +20,7 @@ let shuttingDown = false;
 async function shutdown(signal, exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
+  stopSupportWorker();
 
   logger.info({ signal, exitCode }, 'Stopping PRO COLIS API');
 
