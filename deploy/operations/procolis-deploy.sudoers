@@ -1,0 +1,2 @@
+# Livraison precise uniquement ; "" interdit tout argument supplementaire.
+procolis-ops ALL=(root) NOPASSWD: NOSETENV: /usr/local/sbin/procolis-deploy ""
