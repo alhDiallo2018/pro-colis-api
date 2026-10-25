@@ -1,4 +1,4 @@
-# Connexion Google Android
+# Connexion et inscription Google — Android et web
 
 ## Activation
 
@@ -11,7 +11,7 @@ Le mobile lit ce client public via `GET /api/v1/auth/google/config` et initialis
 `google_sign_in` avec `serverClientId`. Ne pas fournir de secret OAuth au mobile.
 Enregistrer aussi le client Android `com.sendprocolis.app` et les SHA-1 des clés
 de signature utilisées. Google Play App Signing a sa propre empreinte.
-La première version active Google uniquement sur Android.
+Le web utilise Google Identity Services avec le même client Web et les mêmes routes API.
 
 Pour l'inscription, Brevo doit permettre l'envoi de SMS. Le nouveau parcours
 attend la réponse du fournisseur et renvoie 503 en cas d'échec. Aucun OTP
@@ -69,3 +69,39 @@ Ne pas déclarer ce test réel réussi sur la seule base des simulations.
 
 Sources : [vérification serveur Google](https://developers.google.com/identity/sign-in/android/backend-auth),
 [intégration Android](https://pub.dev/packages/google_sign_in_android).
+
+## Activation web
+
+Les pages `/login` et `/register` proposent le bouton officiel « Continuer avec
+Google » lorsque `/api/v1/auth/google/config` annonce un client actif. Le SDK est
+chargé depuis Google, sans bibliothèque OAuth obsolète ni secret dans le bundle.
+Un service indisponible laisse les formulaires PIN/email/téléphone utilisables.
+
+Dans Google Auth Platform, sélectionner le client de type **Application Web**
+et autoriser les origines JavaScript `https://sendprocolis.com` et, si utilisée,
+`https://www.sendprocolis.com`. En développement, ajouter l'origine exacte avec
+son port (par exemple `http://localhost:5173`) ainsi que `http://localhost`.
+Ce parcours utilise une popup et un callback JavaScript ; il ne nécessite pas
+une nouvelle route de redirection OAuth dans l'API.
+
+Dans le `.env` de la stack **web** de production, renseigner
+`GOOGLE_WEB_CLIENT_ID` avec ce client. Le Compose le transmet au service `api`.
+L'identifiant est public ; ne jamais y copier le secret client OAuth. La valeur
+provient de l'API au runtime et ne nécessite pas un build pour être changée.
+Il faut recréer le conteneur API après changement de sa configuration. Les
+migrations Google et le nouveau web doivent aussi être déployés.
+
+Le web conserve les challenges uniquement en mémoire. Un compte associé ouvre
+une session normale ; une correspondance avec un compte existant impose son PIN.
+Une inscription vérifie le téléphone par SMS, demande un PIN, le choix client
+ou chauffeur et l'acceptation des conditions. Un téléphone déjà utilisé bascule
+vers l'association du compte existant. Les retours vers une page protégée sont
+conservés, y compris après un passage entre connexion et inscription.
+
+Les tests web simulent Google et le serveur : connexion, association, profil,
+SMS indisponible, expiration, annulation, doubles clics, redirection et refus de
+preuve sans renouvellement de session. Ils ne remplacent pas un essai réel sur
+une origine autorisée avec le client OAuth et le fournisseur SMS configurés.
+
+Références : [configuration Google Identity Services](https://developers.google.com/identity/gsi/web/guides/get-google-api-clientid)
+et [API JavaScript Google](https://developers.google.com/identity/gsi/web/reference/js-reference).
