@@ -7,12 +7,10 @@ import { env } from '../../config/env.js';
 import { ok, fail } from '../../utils/api-response.js';
 import { ValidationError, normalizeError } from '../../utils/errors.js';
 import {
-  isBrevoConfigured,
+  isBrevoConfiguredAsync,
+  describeBrevoConfig,
   sendEmail,
   sendSms,
-  getSenderEmail,
-  getSenderName,
-  getSmsSender,
   invalidateBrevoConfigCache
 } from '../../utils/brevo.js';
 
@@ -79,7 +77,8 @@ function handle(action, fn) {
       const normalized = normalizeError(error);
       req.log.error(
         {
-          error,
+          errorType: error.name,
+          errorCode: normalized?.code || 'INTERNAL_ERROR',
           action,
           userId: req.user?.id,
           role: req.user?.role,
@@ -100,20 +99,17 @@ function handle(action, fn) {
   };
 }
 
-function defaultBrevoConfig() {
-  return {
-    provider: 'brevo',
-    apiKey: env.BREVO_API_KEY || '',
-    senderEmail: getSenderEmail(),
-    senderName: getSenderName(),
-    smsSender: getSmsSender()
-  };
-}
+const brevoConfigSchema = z.object({
+  apiKey: z.string().trim().max(4096).optional(),
+  senderEmail: z.union([z.literal(''), z.string().email()]).optional(),
+  senderName: z.string().trim().max(100).optional(),
+  smsSender: z.string().trim().max(11).optional()
+});
 
 async function storedBrevoConfig() {
   const row = await prisma.systemConfig.findUnique({ where: { key: BREVO_CONFIG_KEY } });
   const stored = row?.value && typeof row.value === 'object' ? row.value : {};
-  return { ...defaultBrevoConfig(), ...stored };
+  return describeBrevoConfig(stored);
 }
 
 // ------------------------------------------------------------------
@@ -128,7 +124,7 @@ export const sendSmsMessage = handle('notifications.smsSend', async (req, res) =
     ]);
   }
 
-  if (!isBrevoConfigured()) {
+  if (!(await isBrevoConfiguredAsync())) {
     return fail(res, { status: 503, message: 'Brevo non configure', code: 'BREVO_NOT_CONFIGURED' });
   }
 
@@ -151,7 +147,7 @@ export const sendEmailMessage = handle('notifications.emailSend', async (req, re
     ]);
   }
 
-  if (!isBrevoConfigured()) {
+  if (!(await isBrevoConfiguredAsync())) {
     return fail(res, { status: 503, message: 'Brevo non configure', code: 'BREVO_NOT_CONFIGURED' });
   }
 
@@ -174,7 +170,7 @@ export const sendBulkEmailMessage = handle('notifications.emailSendBulk', async 
     ]);
   }
 
-  if (!isBrevoConfigured()) {
+  if (!(await isBrevoConfiguredAsync())) {
     return fail(res, { status: 503, message: 'Brevo non configure', code: 'BREVO_NOT_CONFIGURED' });
   }
 
@@ -207,10 +203,14 @@ export const getBrevoConfig = handle('notifications.brevoConfigGet', async (_req
 });
 
 export const updateBrevoConfig = handle('notifications.brevoConfigUpdate', async (req, res) => {
-  const allowed = ['apiKey', 'senderEmail', 'senderName', 'smsSender'];
-  const patch = Object.fromEntries(
-    allowed.filter((key) => req.body[key] !== undefined).map((key) => [key, req.body[key]])
-  );
+  const parsed = brevoConfigSchema.safeParse(req.body);
+  if (!parsed.success) {
+    throw new ValidationError(parsed.error.issues.map(issue => ({ path: issue.path.join('.'), message: issue.message })));
+  }
+  const patch = Object.fromEntries(Object.entries(parsed.data).filter(([, value]) => value !== undefined));
+  // Les anciennes interfaces peuvent renvoyer une cle masquee apres lecture.
+  // Ignorer ce masque conserve la vraie cle ; une chaine vide retire la surcharge.
+  if (patch.apiKey?.includes('****')) delete patch.apiKey;
 
   if (Object.keys(patch).length === 0) {
     throw new ValidationError([{ path: 'body', message: 'Au moins un parametre requis' }]);
@@ -243,7 +243,7 @@ export const updateBrevoConfig = handle('notifications.brevoConfigUpdate', async
   // La config en base prime sur l'env : prise en compte immédiate pour les envois.
   invalidateBrevoConfigCache();
 
-  const config = { ...defaultBrevoConfig(), ...value };
+  const config = describeBrevoConfig(value);
   return ok(res, { message: 'Configuration Brevo mise a jour', data: { config } });
 });
 
@@ -253,7 +253,7 @@ export const testBrevoConnection = handle('notifications.brevoTest', async (req,
     throw new ValidationError([{ path: 'body.email', message: 'Email de test requis' }]);
   }
 
-  if (!isBrevoConfigured()) {
+  if (!(await isBrevoConfiguredAsync())) {
     return fail(res, { status: 503, message: 'Brevo non configure', code: 'BREVO_NOT_CONFIGURED' });
   }
 

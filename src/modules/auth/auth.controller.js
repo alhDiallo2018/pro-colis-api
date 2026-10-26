@@ -191,7 +191,7 @@ export async function sendOtp(req, res) {
     const { phone, email, purpose } = req.validated.body;
     const { code } = await authService.sendOtp({ phone, email, purpose });
 
-    if (isBrevoConfigured()) {
+    if (await isBrevoConfiguredAsync()) {
       if (phone) {
         sendOtpSms({ phone, code, purpose }).catch(() => {});
       }
@@ -367,7 +367,7 @@ export async function resendVerification(req, res) {
     const { identifier } = req.validated.body;
     const { code, phone, email } = await authService.resendVerification({ identifier });
 
-    if (isBrevoConfigured()) {
+    if (await isBrevoConfiguredAsync()) {
       if (phone) {
         sendOtpSms({ phone, code, purpose: 'verification' }).catch(() => {});
       }

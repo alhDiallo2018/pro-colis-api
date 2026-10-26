@@ -12,34 +12,48 @@ const CONFIG_TTL_MS = 30_000;
 let dbConfig = null;
 let loadedAt = 0;
 let loading = null;
+let configGeneration = 0;
 let client = null;
 let clientKey = null;
 
 async function loadDbConfig(force = false) {
   const stale = force || dbConfig === null || Date.now() - loadedAt > CONFIG_TTL_MS;
   if (!stale) return dbConfig;
+  const generation = configGeneration;
   if (!loading) {
-    loading = prisma.systemConfig
+    const request = prisma.systemConfig
       .findUnique({ where: { key: BREVO_CONFIG_KEY } })
       .then((row) => {
-        dbConfig = row?.value && typeof row.value === 'object' ? row.value : {};
-        loadedAt = Date.now();
-        return dbConfig;
+        const value = row?.value && typeof row.value === 'object' ? row.value : {};
+        if (generation === configGeneration) {
+          dbConfig = value;
+          loadedAt = Date.now();
+        }
+        return value;
       })
       .catch(() => {
-        // DB indisponible : on retombe sur l'env sans casser l'appelant.
-        dbConfig = dbConfig ?? {};
-        loadedAt = Date.now();
-        return dbConfig;
+        // Une panne de lecture conserve le dernier snapshot de cette generation,
+        // ou utilise l'environnement si aucune configuration n'a ete chargee.
+        if (generation === configGeneration) {
+          dbConfig = dbConfig ?? {};
+          loadedAt = Date.now();
+        }
+        return dbConfig ?? {};
       })
       .finally(() => {
-        loading = null;
+        if (loading === request) loading = null;
       });
+    loading = request;
   }
-  return loading;
+  const value = await loading;
+  // Une lecture demarree avant un enregistrement admin ne doit pas restaurer
+  // l'ancienne cle ni determiner la disponibilite avec un snapshot obsolete.
+  return generation === configGeneration ? value : loadDbConfig();
 }
 
 export function invalidateBrevoConfigCache() {
+  configGeneration += 1;
+  loading = null;
   dbConfig = null;
   loadedAt = 0;
   client = null;
@@ -51,8 +65,33 @@ function snapshot() {
   return dbConfig ?? {};
 }
 
+const setting = value => typeof value === 'string' ? value.trim() : '';
+
+// Les valeurs non vides en base priment, champ par champ. Une valeur vide
+// retire la surcharge admin et retrouve la configuration de l'environnement.
+export function resolveBrevoConfig(stored = {}) {
+  return {
+    provider: 'brevo',
+    apiKey: setting(stored.apiKey) || setting(env.BREVO_API_KEY),
+    senderEmail: setting(stored.senderEmail) || setting(env.BREVO_SENDER_EMAIL) || 'noreply@sendprocolis.com',
+    senderName: setting(stored.senderName) || setting(env.BREVO_SENDER_NAME) || 'PRO COLIS',
+    smsSender: setting(stored.smsSender) || setting(env.BREVO_SMS_SENDER) || 'ProColis'
+  };
+}
+
+export function describeBrevoConfig(stored = {}) {
+  const effective = resolveBrevoConfig(stored);
+  const databaseKey = Boolean(setting(stored.apiKey));
+  const environmentKey = Boolean(setting(env.BREVO_API_KEY));
+  // Conserver le champ apiKey pour les clients existants, mais jamais sa valeur.
+  return { ...effective, apiKey: effective.apiKey ? '********' : '',
+    apiKeyConfigured: Boolean(effective.apiKey),
+    apiKeySource: databaseKey ? 'database' : environmentKey ? 'environment' : 'none',
+    environmentApiKeyConfigured: environmentKey };
+}
+
 function currentApiKey() {
-  return snapshot().apiKey || env.BREVO_API_KEY || null;
+  return resolveBrevoConfig(snapshot()).apiKey || null;
 }
 
 async function getClient() {
@@ -89,15 +128,15 @@ export async function isBrevoConfiguredAsync() {
 }
 
 export function getSenderEmail() {
-  return snapshot().senderEmail || env.BREVO_SENDER_EMAIL || 'noreply@sendprocolis.com';
+  return resolveBrevoConfig(snapshot()).senderEmail;
 }
 
 export function getSenderName() {
-  return snapshot().senderName || env.BREVO_SENDER_NAME || 'PRO COLIS';
+  return resolveBrevoConfig(snapshot()).senderName;
 }
 
 export function getSmsSender() {
-  return snapshot().smsSender || env.BREVO_SMS_SENDER || 'ProColis';
+  return resolveBrevoConfig(snapshot()).smsSender;
 }
 
 export async function sendEmail({ to, subject, htmlContent, textContent, params }) {
