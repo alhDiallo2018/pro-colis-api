@@ -105,3 +105,25 @@ une origine autorisée avec le client OAuth et le fournisseur SMS configurés.
 
 Références : [configuration Google Identity Services](https://developers.google.com/identity/gsi/web/guides/get-google-api-clientid)
 et [API JavaScript Google](https://developers.google.com/identity/gsi/web/reference/js-reference).
+
+
+### Client Web de production (26 octobre 2026)
+
+Le client OAuth de type **Application Web** fourni pour SendProColis est :
+
+```dotenv
+GOOGLE_WEB_CLIENT_ID=856894814285-blm20bnfamss8spptpjvp2c5984rgsni.apps.googleusercontent.com
+```
+
+Ajouter `https://sendprocolis.com` aux origines JavaScript autorisees de ce
+client dans Google Cloud. Le web utilise GIS en mode popup avec callback ;
+aucun secret client n'est transmis au navigateur ni requis par cette integration.
+Le mobile recupere egalement ce client via `/auth/google/config`.
+
+La procedure administrateur `deploy/operations/apply-google-web-client.py`
+met a jour la configuration runtime root et le `.env` web, sauvegarde ces deux
+fichiers, valide que seul le client change dans l'environnement effectif, puis
+recree l'API avec son image actuelle. Une erreur de verification restaure la
+configuration precedente. Les helpers de deploiement des revisions du 25 octobre
+restent des procedures historiques figees ; ne pas les reutiliser comme modele
+pour une nouvelle livraison sans revoir leur configuration Google.
