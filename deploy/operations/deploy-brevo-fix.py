@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Livraison revue : configuration Brevo, validation SMS et recuperation du PIN."""
+"""Livraison revue : proteger la cle Brevo et expliquer les prerequis d'envoi."""
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -11,8 +11,8 @@ import sys
 
 HELPER = Path('/usr/local/sbin/procolis-deploy')
 HELPER_SHA256 = '8178a618fe9dea7b8f9d12913f45550e3ea93f8f71c16c31a04a29a8f71c2aec'
-API_REVISION = '0559781865266f7a671bd8eaedc5f72c9fb304c6'
-WEB_REVISION = 'b9c0807b8698d513d8bef1776a9eb4310583a5e9'
+API_REVISION = '9ac4ff32d6bcd96eca4d5acae49fe80f15860404'
+WEB_REVISION = 'bf9cc01594c74e3a480f6fc1b51cfdfee95b7f76'
 GOOGLE_CLIENT = '856894814285-blm20bnfamss8spptpjvp2c5984rgsni.apps.googleusercontent.com'
 
 
