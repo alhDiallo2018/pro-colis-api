@@ -1,7 +1,7 @@
 import { ok, fail } from '../../utils/api-response.js';
 import { serializeUser } from '../../utils/mobile-serializers.js';
 import * as authService from './auth.service.js';
-import { sendOtpSms, sendOtpEmail, isBrevoConfigured } from '../../utils/brevo.js';
+import { sendOtpSms, sendOtpEmail, isBrevoConfigured, isBrevoConfiguredAsync } from '../../utils/brevo.js';
 import { env } from '../../config/env.js';
 
 /**
@@ -18,15 +18,17 @@ import { env } from '../../config/env.js';
  * plutot que de simuler un envoi, ce qui laisserait l'utilisateur devant un
  * ecran de saisie qu'aucun code ne viendra remplir.
  */
-function otpDelivery({ code, sentMessage, log, action }) {
-  if (isBrevoConfigured()) {
+function otpDelivery({ code, sentMessage, log, action, configured = isBrevoConfigured(), deliveryAccepted = configured }) {
+  if (configured && deliveryAccepted) {
     return { delivered: true, message: sentMessage, data: { sent: true } };
   }
 
-  if (env.NODE_ENV === 'production') {
+  if (env.NODE_ENV === 'production' || configured) {
     log?.error(
-      { action, brevoConfigured: false },
-      'Brevo non configure en production : aucun code OTP ne peut etre livre'
+      { action, brevoConfigured: configured, deliveryAccepted },
+      configured
+        ? 'Brevo n a accepte aucun envoi du code OTP'
+        : 'Brevo non configure en production : aucun code OTP ne peut etre livre'
     );
     return {
       delivered: false,
@@ -249,19 +251,25 @@ export async function forgotPassword(req, res) {
     const { identifier } = req.validated.body;
     const { code, phone, email } = await authService.forgotPassword({ identifier });
 
-    if (isBrevoConfigured()) {
-      if (phone) {
-        sendOtpSms({ phone, code, purpose: 'reset-password' }).catch(() => {});
-      }
-      if (email) {
-        sendOtpEmail({ email, code, purpose: 'reset-password' }).catch(() => {});
-      }
+    const configured = await isBrevoConfiguredAsync();
+    let deliveryAccepted = false;
+    if (configured) {
+      // Attendre la reponse du fournisseur evite d'annoncer un code envoye
+      // quand les deux canaux echouent. Un seul canal accepte suffit pour
+      // recuperer le compte ; aucune valeur OTP ni reponse Brevo n'est loguee.
+      const deliveries = [];
+      if (phone) deliveries.push(sendOtpSms({ phone, code, purpose: 'reset-password' }));
+      if (email) deliveries.push(sendOtpEmail({ email, code, purpose: 'reset-password' }));
+      const results = await Promise.allSettled(deliveries);
+      deliveryAccepted = results.some(result => result.status === 'fulfilled' && Boolean(result.value));
     }
 
     return respondOtp(
       res,
       otpDelivery({
         code,
+        configured,
+        deliveryAccepted,
         sentMessage: 'Code de reinitialisation envoye',
         log: req.log,
         action: 'auth.forgotPassword'
@@ -269,7 +277,7 @@ export async function forgotPassword(req, res) {
     );
   } catch (error) {
     req.log.error(
-      { error, action: 'auth.forgotPassword', requestId: req.requestId, identifier: req.validated?.body?.identifier },
+      { action: 'auth.forgotPassword', requestId: req.requestId, errorType: error.name, errorCode: error.code || 'INTERNAL_ERROR' },
       'Failed to process forgot password'
     );
     return fail(res, {

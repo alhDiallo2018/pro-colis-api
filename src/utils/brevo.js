@@ -80,6 +80,14 @@ export function isBrevoConfigured() {
   return !!currentApiKey();
 }
 
+/** Les decisions d'envoi doivent attendre la configuration en base : le
+ * snapshot synchrone peut etre vide juste apres un redemarrage de l'API.
+ */
+export async function isBrevoConfiguredAsync() {
+  await loadDbConfig();
+  return !!currentApiKey();
+}
+
 export function getSenderEmail() {
   return snapshot().senderEmail || env.BREVO_SENDER_EMAIL || 'noreply@sendprocolis.com';
 }
