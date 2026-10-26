@@ -21,6 +21,9 @@ renseigner « Nouvelle cle API Brevo » et les expediteurs. La cle saisie est
 stockee en base par l'API ; aucune recreation de conteneur n'est necessaire.
 Une saisie vide conserve la cle actuelle. Le bouton « Utiliser la cle du
 serveur », suivi d'« Enregistrer », retire explicitement la surcharge en base.
+Ce choix est desactive et refuse par l'API si aucune cle serveur ne peut
+remplacer la cle en base. Sans cle existante, le formulaire exige une nouvelle
+saisie avant la sauvegarde et laisse le test d'envoi desactive.
 Si aucune source ne fournit de cle, les envois restent indisponibles.
 
 L'API GET/PUT de configuration renvoie la presence et la source de la cle,

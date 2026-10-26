@@ -81,6 +81,20 @@ test('test de connexion immediat apres enregistrement sans cle environnement', a
   expect(sendEmail).toHaveBeenCalledTimes(1);
 });
 
+test('refuse le repli sans cle serveur et conserve la cle en base sans ecriture d audit', async () => {
+  env.BREVO_API_KEY = '';
+  await request(app).put(url).set(headers(admin)).send({ apiKey: 'db-only-test-key' }).expect(200);
+  const before = await prisma.auditLog.count({ where: { actorId: admin.user.id, action: 'notifications.brevoConfigUpdate' } });
+  const response = await request(app).put(url).set(headers(admin)).send({ apiKey: '  ' });
+  expect(response.status).toBe(422);
+  expect(response.body.error.details).toEqual(expect.arrayContaining([
+    expect.objectContaining({ path: 'apiKey', message: expect.stringContaining('Aucune clé Brevo serveur') })
+  ]));
+  expect((await prisma.systemConfig.findUnique({ where: { key: 'brevo' } })).value.apiKey).toBe('db-only-test-key');
+  expect(await prisma.auditLog.count({ where: { actorId: admin.user.id, action: 'notifications.brevoConfigUpdate' } })).toBe(before);
+  expect(await actualBrevo.isBrevoConfiguredAsync()).toBe(true);
+});
+
 test('valide les champs et refuse les comptes non autorises', async () => {
   expect((await request(app).put(url).set(headers(admin)).send({ apiKey: 123 })).status).toBe(422);
   expect((await request(app).put(url).set(headers(admin)).send({ senderEmail: 'invalid' })).status).toBe(422);

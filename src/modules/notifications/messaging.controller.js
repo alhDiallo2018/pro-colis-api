@@ -212,6 +212,12 @@ export const updateBrevoConfig = handle('notifications.brevoConfigUpdate', async
   // Ignorer ce masque conserve la vraie cle ; une chaine vide retire la surcharge.
   if (patch.apiKey?.includes('****')) delete patch.apiKey;
 
+  // Une chaine vide demande le repli vers l'environnement. Sans cle serveur,
+  // ce choix couperait les emails/OTP : refuser avant toute ecriture en base.
+  if (patch.apiKey === '' && !describeBrevoConfig({}).environmentApiKeyConfigured) {
+    throw new ValidationError([{ path: 'apiKey', message: 'Aucune clé Brevo serveur disponible. Conservez la clé enregistrée ou renseignez une nouvelle clé.' }]);
+  }
+
   if (Object.keys(patch).length === 0) {
     throw new ValidationError([{ path: 'body', message: 'Au moins un parametre requis' }]);
   }
