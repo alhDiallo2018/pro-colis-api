@@ -34,7 +34,8 @@ class MediaRecoveryTests(unittest.TestCase):
         for url in ['https://elsewhere.test/uploads/' + PHOTO, '/uploads/../.env',
                     '/uploads/photo/%2e%2e/' + PHOTO, '/uploads/photo%2f..%2f' + PHOTO,
                     '/uploads/anything.jpg', '/uploads/' + PHOTO.replace('.jpg', '.html'),
-                    'file:///uploads/' + PHOTO, 'https://key@sendprocolis.com/uploads/' + PHOTO]:
+                    'file:///uploads/' + PHOTO, 'https://key@sendprocolis.com/uploads/' + PHOTO,
+                    'https://[invalid/uploads/' + PHOTO]:
             self.assertIsNone(media.relative_media(url), url)
 
     def test_restore_keeps_source_intact_and_is_idempotent(self):

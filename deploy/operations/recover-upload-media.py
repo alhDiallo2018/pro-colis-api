@@ -48,7 +48,10 @@ try {
 
 def relative_media(value):
     """Les URL ne deviennent jamais des chemins arbitraires du serveur."""
-    url = urlsplit(value)
+    try:
+        url = urlsplit(value)
+    except ValueError:
+        return None
     if url.scheme not in ('', 'http', 'https') or url.netloc not in ('', 'sendprocolis.com', 'www.sendprocolis.com'):
         return None
     if not url.path.startswith('/uploads/') or url.username or url.password:
