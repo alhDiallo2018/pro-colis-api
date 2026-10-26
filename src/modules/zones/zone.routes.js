@@ -3,7 +3,11 @@ import { authenticate, optionalAuthenticate } from '../../middlewares/auth.middl
 import { requireRoles } from '../../middlewares/rbac.middleware.js';
 import * as zoneController from './zone.controller.js';
 
+import { placesRouter } from './places.routes.js';
+
 export const zoneRouter = Router();
+
+zoneRouter.use('/public/places', placesRouter);
 
 const superAdmin = [authenticate, requireRoles('super_admin', 'support')];
 

@@ -40,6 +40,7 @@ function isPlaceholderJwtSecret(value) {
 const envSchema = z.object({
   ...appUpdateEnvShape,
   GOOGLE_WEB_CLIENT_ID: z.string().trim().refine(value => !value || /^[a-zA-Z0-9_-]+\.apps\.googleusercontent\.com$/.test(value), "Client OAuth Google invalide").default(''),
+  GOOGLE_MAPS_API_KEY: z.string().trim().default(''),
   SUPPORT_PRESENCE_TTL_SECONDS: z.coerce.number().int().min(30).max(300).default(90),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(8080),

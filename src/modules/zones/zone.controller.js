@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { prisma } from '../../config/prisma.js';
 import { env } from '../../config/env.js';
 import { ok, fail } from '../../utils/api-response.js';
@@ -199,7 +200,11 @@ async function ensureZoneGarage(tx, zone) {
     where: {
       deletedAt: null,
       name: { equals: fields.name, mode: 'insensitive' },
-      city: { equals: fields.city, mode: 'insensitive' }
+      city: { equals: fields.city, mode: 'insensitive' },
+      // Deux repères d'une même rue ne partagent pas nécessairement le point
+      // de rendez-vous. Le miroir doit conserver la géométrie de sa zone.
+      latitude: fields.latitude,
+      longitude: fields.longitude
     }
   });
 
@@ -293,7 +298,7 @@ export const detectZones = handle('zones.detect', async (req, res) => {
   const latitude = number(req.query.latitude ?? req.query.lat, NaN);
   const longitude = number(req.query.longitude ?? req.query.lng, NaN);
 
-  if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
     throw new ValidationError([
       { path: 'query.latitude', message: 'Parametres latitude et longitude requis' }
     ]);
@@ -334,16 +339,27 @@ export const detectZones = handle('zones.detect', async (req, res) => {
  * (`garage` / `garageId`) reste disponible pour les anciens clients qui
  * utilisent departureGarageId / arrivalGarageId : ne pas mélanger ces FK.
  *
- * Body : { placeId?, name, displayName?, latitude, longitude, country?, region?, city? }
+ * Body : { exactPoint?, placeId?, name, displayName?, latitude, longitude, country?, region?, city? }
  */
 export const resolveZone = handle('zones.resolve', async (req, res) => {
-  const { placeId, name, displayName, country, region, city } = req.body;
-  const latitude = number(req.body.latitude, NaN);
-  const longitude = number(req.body.longitude, NaN);
-
-  if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
-    throw new ValidationError([{ path: 'body.latitude', message: 'Latitude et longitude requises' }]);
-  }
+  // Les anciens clients peuvent envoyer null ou une chaîne vide pour un
+  // niveau administratif inconnu : cela équivaut à un champ absent.
+  const text = z.preprocess(value => value == null || value === '' ? undefined : value,
+    z.string().trim().min(1).max(500).optional());
+  const coordinate = (min, max) => z.union([z.number(), z.string().trim().min(1)])
+    .pipe(z.coerce.number().finite().min(min).max(max));
+  const parsed = z.object({ name: text, displayName: text, country: text, region: text, city: text,
+    placeId: z.string().trim().min(1).max(255).optional(), exactPoint: z.boolean().optional(),
+    latitude: coordinate(-90, 90), longitude: coordinate(-180, 180) }).safeParse(req.body);
+  if (!parsed.success) throw new ValidationError(parsed.error.issues.map(issue => ({
+    path: `body.${issue.path.join('.')}`, message: issue.message
+  })));
+  const { name, displayName, country, region, city, latitude, longitude, exactPoint } = parsed.data;
+  // Un repère manuel possède sa propre identité : le placeId du géocodage
+  // inverse peut désigner toute une rue et ferait perdre le point exact.
+  const placeId = exactPoint
+    ? `point:${latitude.toFixed(7)},${longitude.toFixed(7)}`
+    : parsed.data.placeId;
   if (!placeId && !name) {
     throw new ValidationError([{ path: 'body.placeId', message: 'placeId ou name requis' }]);
   }
@@ -384,7 +400,9 @@ export const resolveZone = handle('zones.resolve', async (req, res) => {
     if (d <= radius && d < nearestContainerDist) { nearestContainer = z; nearestContainerDist = d; }
     if (d < nearestAnyDist) { nearestAny = z; nearestAnyDist = d; }
   }
-  if (nearestContainer) {
+  // Les anciens clients GPS gardent la détection de zone. Un lieu Places
+  // explicite ou un point manuel doit conserver sa propre position.
+  if (nearestContainer && !placeId) {
     const { garage } = await prisma.$transaction((tx) => ensureZoneGarage(tx, nearestContainer));
     return ok(res, {
       message: 'Zone existante (proximité)',
