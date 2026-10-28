@@ -62,6 +62,12 @@ describe('direct driver proposal flow', () => {
     zoneId = zone.id;
   });
 
+  // Une proposition directe cible désormais un chauffeur disponible. Chaque
+  // scénario repart disponible, même si le précédent a accepté une mission.
+  beforeEach(async () => {
+    await prisma.user.update({ where: { id: driverId }, data: { driverStatus: 'available' } });
+  });
+
   afterAll(async () => {
     await prisma.negotiationMessage.deleteMany({ where: { parcelId: { in: parcelIds } } });
     await prisma.bid.deleteMany({ where: { parcelId: { in: parcelIds } } });

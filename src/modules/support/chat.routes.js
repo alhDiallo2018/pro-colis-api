@@ -17,7 +17,7 @@ const parse = (schema, value) => {
   return parsed.data;
 };
 const id = req => parse(z.string().uuid(), req.params.id);
-const body = z.object({ body: z.string().trim().max(5000).default(''),
+const body = z.object({ ticketId: z.string().uuid().optional(), body: z.string().trim().max(5000).default(''),
   audioUrl: z.string().max(2000).optional(), photoUrl: z.string().max(2000).optional(), videoUrl: z.string().max(2000).optional()
 }).refine(value => value.body || value.audioUrl || value.photoUrl || value.videoUrl, 'Message vide');
 
@@ -53,7 +53,7 @@ supportChatRouter.post('/conversations', handle('support.open', async req => {
   return { conversation: await chat.openChat(req.user, value.userId ?? req.user.id, value.department) };
 }));
 supportChatRouter.get('/conversations', staff, handle('support.queue', async () => ({ conversations: await chat.listChats() })));
-supportChatRouter.get('/conversations/:id', handle('support.thread', req => chat.chatThread(req.user, id(req))));
+supportChatRouter.get('/conversations/:id', handle('support.thread', req => chat.chatThread(req.user, id(req), req.query.ticketId ? parse(z.string().uuid(), req.query.ticketId) : undefined)));
 supportChatRouter.post('/conversations/:id/messages', handle('support.send', async req => ({
   message: await chat.sendChatMessage(req.user, id(req), parse(body, req.body))
 })));

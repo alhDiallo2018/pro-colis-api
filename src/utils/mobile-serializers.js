@@ -126,7 +126,8 @@ export function serializePublicDriver(driver, { detailed = false } = {}) {
     ...base,
     totalDeliveries: driver.totalDeliveries ?? 0,
     vehicleModel: vehicle?.model ?? null,
-    vehicleType: vehicle?.type ?? null
+    vehicleType: vehicle?.type ?? null,
+    vehicleCapacity: vehicle?.capacity ?? null
   };
 }
 
@@ -168,6 +169,8 @@ export function serializeBid(bid) {
     driverRating: decimalToString(bid.driver?.rating ?? null),
     driverCity: bid.driver?.city ?? null,
     driverZoneName: bid.driver?.garage?.name ?? null,
+    driverVehicleType: bid.driver?.vehicles?.[0]?.type ?? null,
+    driverAvailability: bid.driver?.driverStatus ?? null,
     price: decimalToString(bid.price),
     message: bid.message,
     status: bid.status,
@@ -692,7 +695,9 @@ export function serializeAdvertisement(advertisement) {
     audioUrl: advertisement.audioUrl,
     status: advertisement.status,
     metadata: advertisement.metadata,
-    offers: advertisement.offers?.map(serializeAdvertisementOffer) || [],
+    itinerary: advertisement.metadata?.itinerary ?? null,
+    transport: advertisement.metadata?.transport ?? null,
+    offers: advertisement.offers?.map(offer => serializeAdvertisementOffer({ ...offer, advertisement })) || [],
     createdAt: dateToIso(advertisement.createdAt),
     updatedAt: dateToIso(advertisement.updatedAt)
   };
@@ -703,6 +708,12 @@ export function serializeAdvertisementOffer(offer) {
   return {
     id: offer.id,
     advertisementId: offer.advertisementId,
+    journeySegment: offer.advertisement?.metadata?.itinerary && offer.parcel ? {
+      pickup: offer.advertisement.metadata.itinerary.stops.find(s => s.zoneId === offer.parcel.departureZoneId) ?? null,
+      dropoff: offer.advertisement.metadata.itinerary.stops.find(s => s.zoneId === offer.parcel.arrivalZoneId) ?? null,
+      lineNumber: offer.advertisement.metadata.itinerary.lineNumber,
+      serviceType: offer.advertisement.metadata.itinerary.serviceType
+    } : null,
     clientId: offer.clientId,
     client: serializeUser(offer.client),
     parcelId: offer.parcelId,

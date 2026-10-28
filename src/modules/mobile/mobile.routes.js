@@ -285,6 +285,11 @@ mobileRouter.get('/public/parcels/free', optionalAuthenticate, mobileController.
 mobileRouter.get('/public/parcels/track/:trackingNumber', optionalAuthenticate, mobileController.trackParcel);
 mobileRouter.get('/public/parcels/:parcelId/events', optionalAuthenticate, mobileController.publicParcelEvents);
 mobileRouter.get('/public/parcels/:parcelId/bids', optionalAuthenticate, mobileController.publicParcelBids);
+mobileRouter.get('/client/drivers/discovery', authenticate, requireRoles('client'), mobileController.mapDriverDiscovery);
+mobileRouter.get('/client/drivers/search', authenticate, requireRoles('client'), mobileController.searchDrivers);
+mobileRouter.get('/public/vehicle-types', mobileController.vehicleTypes);
+mobileRouter.put('/driver/discovery-location', authenticate, requireRoles('driver'), mobileController.shareDiscoveryPosition);
+
 mobileRouter.get('/public/drivers/search', optionalAuthenticate, mobileController.searchDrivers);
 mobileRouter.get('/public/drivers/garage/:garageId', optionalAuthenticate, mobileController.garagePublicDrivers);
 mobileRouter.get('/public/drivers/:driverId', optionalAuthenticate, mobileController.publicDriverDetail);
@@ -484,6 +489,16 @@ mobileRouter.get('/identity/status', authenticate, mobileController.identityStat
 // ADVERTISEMENTS
 // ============================================================
 
+// Flux précis uniquement après activation explicite sur un départ, sous authentification.
+mobileRouter.get('/driver/route-templates', authenticate, requireRoles('driver'), mobileController.listRouteTemplates);
+mobileRouter.post('/driver/route-templates', authenticate, requireRoles('driver'), mobileController.saveRouteTemplate);
+mobileRouter.patch('/driver/route-templates/:templateId', authenticate, requireRoles('driver'), mobileController.renameRouteTemplate);
+mobileRouter.delete('/driver/route-templates/:templateId', authenticate, requireRoles('driver'), mobileController.archiveRouteTemplate);
+mobileRouter.post('/driver/route-templates/:templateId/departures', authenticate, requireRoles('driver'), mobileController.scheduleRouteDepartures);
+mobileRouter.get('/client/journeys/live', authenticate, requireRoles('client', 'driver'), mobileController.listLiveJourneys);
+mobileRouter.post('/advertisements/:advertisementId/live', authenticate, requireRoles('driver'), mobileController.startLiveJourney);
+mobileRouter.patch('/advertisements/:advertisementId/live', authenticate, requireRoles('driver'), mobileController.updateLiveJourney);
+mobileRouter.delete('/advertisements/:advertisementId/live', authenticate, requireRoles('driver'), mobileController.stopLiveJourney);
 mobileRouter.get('/advertisements', optionalAuthenticate, mobileController.listAdvertisements);
 mobileRouter.get('/advertisements/my', authenticate, mobileController.myAdvertisements);
 mobileRouter.get('/advertisements/drivers', optionalAuthenticate, mobileController.listAdvertisements);

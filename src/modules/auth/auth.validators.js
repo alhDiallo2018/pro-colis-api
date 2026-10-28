@@ -18,6 +18,8 @@ export const registerSchema = z.object({
     city: z.string().optional().nullable(),
     region: z.string().optional().nullable(),
     garageId: z.string().uuid().optional().nullable(),
+    vehicleType: z.string().trim().min(1).optional().nullable(),
+    vehicleCapacity: z.coerce.number().int().nonnegative().optional().nullable(),
     vehiclePlate: z.string().optional().nullable(),
     vehicleModel: z.string().optional().nullable(),
     vehicleColor: z.string().optional().nullable(),

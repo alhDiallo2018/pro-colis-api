@@ -867,7 +867,7 @@ export const migrateGarages = handle('zones.migrate', async (req, res) => {
  * garage miroir la ou le web envoie desormais celui de la zone : accepter les
  * deux evite un 404 selon la version de l'appelant.
  */
-async function resolveZoneRef(id) {
+export async function resolveZoneRef(id) {
   if (!id || !UUID_RE.test(id)) return { zone: null, garageId: null };
 
   const zone = await prisma.zone.findUnique({ where: { id } });

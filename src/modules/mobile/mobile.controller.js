@@ -1,3 +1,11 @@
+import { once, validateRequestId } from '../reliability/idempotency.js';
+import { notifyRouteAlerts } from '../experience/alerts.service.js';
+import { rememberRoute, saveExistingRoute, scheduleRoute } from '../trips/templates.service.js';
+import { registeredTransport, startJourneyLive, updateJourneyLive, stopJourneyLive, liveJourneys } from '../trips/live.service.js';
+import { normalizeItinerary, segmentFor, assertSegmentCapacity } from '../trips/itinerary.js';
+import { VEHICLE_TYPES, normalizeVehicleType, vehicleTypeFilter } from '../../utils/vehicle-types.js';
+import { coordinate, discoverDrivers, discoverDriverMap } from '../drivers/discovery.service.js';
+import { resolveZoneRef } from '../zones/zone.controller.js';
 import bcrypt from 'bcryptjs';
 import { env } from '../../config/env.js';
 import { publicAndroidUpdatePolicy } from '../../config/app-update.js';
@@ -77,7 +85,7 @@ const publicDriverDetailSelect = {
     where: { deletedAt: null },
     orderBy: { createdAt: 'desc' },
     take: 1,
-    select: { model: true, type: true }
+    select: { model: true, type: true, capacity: true }
   }
 };
 
@@ -87,7 +95,7 @@ const publicDriverDetailSelect = {
 async function syncDriverVehicle(client, user, body) {
   const plateNumber = (body.vehiclePlate || '').trim();
   const model = (body.vehicleModel || '').trim();
-  const type = (body.vehicleType || '').trim();
+  const type = body.vehicleType ? normalizeVehicleType(body.vehicleType, 'body.vehicleType') : '';
   const hasCapacity = body.vehicleCapacity !== undefined && body.vehicleCapacity !== null;
 
   if (!plateNumber && !model && !type && !hasCapacity) return;
@@ -161,7 +169,7 @@ const parcelInclude = {
   },
   bids: { 
     include: { 
-      driver: true,
+      driver: { include: { vehicles: { where: { deletedAt: null }, orderBy: { createdAt: 'desc' }, take: 1, select: { type: true } } } },
       negotiationMessages: {
         orderBy: { createdAt: 'asc' }
       }
@@ -968,7 +976,18 @@ export const createParcel = handle('parcel.create', async (req, res) => {
     ]);
   }
 
-  const result = await prisma.$transaction(async (tx) => {
+  const requestId = validateRequestId(req.body.requestId);
+  const { requestId: _requestId, ...payload } = req.body;
+  const saved = await prisma.$transaction(async (tx) => once(tx, req.user.id, 'parcel.create', requestId, payload, async () => {
+    if (req.body.sourceDraftId) {
+      validateRequestId(req.body.sourceDraftId);
+      const draft = await tx.shipmentDraft.findFirst({ where: { id: req.body.sourceDraftId, userId: req.user.id } });
+      if (!draft) throw new NotFoundError('Brouillon introuvable');
+      // Le verrou du brouillon protège aussi deux clés de publication différentes.
+      await tx.$queryRaw`SELECT id FROM shipment_drafts WHERE id = ${draft.id}::uuid FOR UPDATE`;
+      const current = await tx.shipmentDraft.findUnique({ where: { id: draft.id } });
+      if (current.completedParcelId) throw new ConflictError('Ce brouillon a déjà été publié. Ouvrez le colis depuis vos outils.');
+    }
     // Un chauffeur qui crée un colis pour un client et s'y assigne lui-même
     // prend en charge une nouvelle mission : bloqué en cas de dette.
     if (req.user.role === 'driver' && req.body.senderId) {
@@ -980,6 +999,21 @@ export const createParcel = handle('parcel.create', async (req, res) => {
     // colis. Aucun blocage par défaut (seuil = 0).
     if (req.user.role === 'client') {
       await assertClientCanCreateParcel(tx, req.user.id);
+    }
+
+    if (req.user.role === 'client' && req.body.driverId) {
+      const selected = await tx.user.findFirst({
+        where: { id: req.body.driverId, role: 'driver', status: 'active', driverStatus: 'available' },
+        include: { vehicles: { where: { deletedAt: null, isAvailable: true,
+          ...(req.body.vehicleType ? vehicleTypeFilter(req.body.vehicleType) : {}) },
+          orderBy: { createdAt: 'desc' }, take: 1 } }
+      });
+      if (!selected) throw new ConflictError('Ce chauffeur n’est plus disponible. Choisissez un autre chauffeur.');
+      const vehicle = selected.vehicles[0];
+      if ((req.body.vehicleType && !vehicle) || (vehicle?.capacity > 0 && Number(req.body.weight) > vehicle.capacity)) {
+        throw new ConflictError('Ce véhicule ne correspond plus au type ou au poids du colis. Choisissez un autre chauffeur.');
+      }
+      await assertCanAcceptNewDelivery(tx, selected.id);
     }
 
     const parcel = await tx.parcel.create({
@@ -1044,8 +1078,11 @@ export const createParcel = handle('parcel.create', async (req, res) => {
       }
     }
 
-    return parcel;
-  });
+    if (req.body.sourceDraftId) await tx.shipmentDraft.update({ where: { id: req.body.sourceDraftId }, data: { completedParcelId: parcel.id, completedAt: new Date() } });
+    return { parcelId: parcel.id };
+  }));
+  const result = await prisma.parcel.findFirst({ where: { id: saved.parcelId, createdBy: req.user.id, deletedAt: null }, include: parcelInclude });
+  if (!result) throw new NotFoundError('Ce colis a été supprimé ; aucune nouvelle publication n’a été effectuée');
 
   return ok(res, { 
     status: 201, 
@@ -2385,7 +2422,7 @@ export const clientBidsReceived = handle('bid.clientReceived', async (req, res) 
     prisma.bid.findMany({
       where,
       include: {
-        driver: true,
+        driver: { include: { vehicles: { where: { deletedAt: null }, orderBy: { createdAt: 'desc' }, take: 1, select: { type: true } } } },
         parcel: true,
         negotiationMessages: { orderBy: { createdAt: 'asc' } }
       },
@@ -4960,28 +4997,45 @@ export const searchParcels = handle('search.parcels', async (req, res) => {
   return ok(res, { message: 'Recherche colis', data: { parcels: parcels.map(serializeParcel) } });
 });
 
-export const searchDrivers = handle('drivers.search', async (req, res) => {
-  const verifiedOnly = ['true', '1'].includes(String(req.query.verifiedOnly || '').toLowerCase());
-  const drivers = await prisma.user.findMany({
-    where: cleanUndefined({
-      role: 'driver',
-      status: 'active',
-      city: req.query.city,
-      garageId: req.query.garageId,
-      isVerified: verifiedOnly ? true : undefined
-    }),
-    select: publicDriverSelect,
-    // La vérification prime, puis la réputation et l'expérience départagent
-    // les chauffeurs. Le nom stabilise l'ordre à scores identiques.
-    orderBy: [
-      { isVerified: 'desc' },
-      { rating: 'desc' },
-      { completedDeliveries: 'desc' },
-      { fullName: 'asc' }
-    ],
-    take: Number(req.query.limit || 100)
+export const vehicleTypes = handle('vehicles.types', async (_req, res) =>
+  ok(res, { data: { vehicleTypes: VEHICLE_TYPES.map(({ value, label }) => ({ value, label })) } }));
+
+export const shareDiscoveryPosition = handle('driver.discovery', async (req, res) => {
+  if (typeof req.body.enabled !== 'boolean') {
+    throw new ValidationError([{ path: 'body.enabled', message: 'Activation explicite requise' }]);
+  }
+  if (!req.body.enabled) {
+    await prisma.driverDiscoveryPosition.deleteMany({ where: { driverId: req.user.id } });
+    return ok(res, { data: { enabled: false } });
+  }
+  const latitude = coordinate(req.body.latitude, 'body.latitude', -90, 90);
+  const longitude = coordinate(req.body.longitude, 'body.longitude', -180, 180);
+  const updatedAt = new Date();
+  await prisma.driverDiscoveryPosition.upsert({
+    where: { driverId: req.user.id },
+    create: { driverId: req.user.id, latitude, longitude, updatedAt },
+    update: { latitude, longitude, updatedAt }
   });
-  return ok(res, { message: 'Chauffeurs', data: { drivers: drivers.map((d) => serializePublicDriver(d)) } });
+  return ok(res, { data: { enabled: true, expiresAt: new Date(updatedAt.getTime() + 600000) } });
+});
+
+export const mapDriverDiscovery = handle('drivers.discovery.map', async (req, res) => {
+  const data = await discoverDriverMap(req.query, req.user);
+  return ok(res, { message: 'Chauffeurs proches du retrait', data });
+});
+
+export const searchDrivers = handle('drivers.search', async (req, res) => {
+  let scope = req.query.garageId ? { garageId: req.query.garageId } : {};
+  if (req.query.zoneId) {
+    const { zone, garageId } = await resolveZoneRef(req.query.zoneId);
+    if (!zone && !garageId) throw new NotFoundError('Zone introuvable');
+    scope = { OR: [
+      ...(zone ? [{ driverZones: { some: { zoneId: zone.id } } }] : []),
+      ...(garageId ? [{ garageId }] : [])
+    ] };
+  }
+  const drivers = await discoverDrivers(req.query, req.user, scope);
+  return ok(res, { message: 'Chauffeurs', data: { drivers } });
 });
 
 export const publicDriverDetail = handle('drivers.detail', async (req, res) => {
@@ -5201,6 +5255,31 @@ function assertAdvertisementRoute(source) {
 export const listAdvertisements = handle('advertisements.list', async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
   const where = cleanUndefined({ status: req.query.status });
+  const { pickupZoneId, dropoffZoneId, serviceType, lineNumber } = req.query;
+  const routeSearch = pickupZoneId !== undefined || dropoffZoneId !== undefined;
+  if (routeSearch && (!pickupZoneId || !dropoffZoneId)) throw new ValidationError([{ path: 'query', message: 'Précisez le retrait et la remise' }]);
+  if (serviceType && !['trip', 'gp', 'shuttle'].includes(serviceType)) throw new ValidationError([{ path: 'serviceType', message: 'Service invalide' }]);
+  const filtered = routeSearch || serviceType || lineNumber;
+  if (filtered) {
+    const weight = req.query.weight === undefined ? 0.01 : Number(req.query.weight);
+    if (!Number.isFinite(weight) || weight <= 0) throw new ValidationError([{ path: 'weight', message: 'Poids positif requis' }]);
+    // Filtrer avant pagination : une escale ne figure pas dans les terminus.
+    const candidates = await prisma.advertisement.findMany({ where: { ...where, status: 'open' },
+      include: { ...advertisementLocationInclude, driver: true, offers: { include: { parcel: true } } }, orderBy: { departureAt: 'asc' } });
+    const matches = candidates.flatMap(ad => {
+      const itinerary = ad.metadata?.itinerary;
+      if (!itinerary || (serviceType && itinerary.serviceType !== serviceType) ||
+          (lineNumber && itinerary.lineNumber !== String(lineNumber).trim())) return [];
+      if (new Date(itinerary.stops.at(-1).scheduledAt).getTime() <= Date.now()) return [];
+      let segment = null;
+      if (routeSearch) {
+        try { segment = assertSegmentCapacity(ad, { departureZoneId: pickupZoneId, arrivalZoneId: dropoffZoneId, weight }, ad.offers.filter(o => o.status === 'accepted')); }
+        catch (error) { if (error instanceof ConflictError) return []; throw error; }
+      }
+      return [{ ...serializeAdvertisement(ad), matchingSegment: segment }];
+    });
+    return ok(res, { message: 'Trajets compatibles', data: { advertisements: matches.slice(skip, skip + limit) }, meta: paginationMeta({ page, limit, total: matches.length }) });
+  }
   const [total, advertisements] = await Promise.all([
     prisma.advertisement.count({ where }),
     prisma.advertisement.findMany({ where, include: { ...advertisementLocationInclude, driver: { include: { garage: true } }, offers: true }, orderBy: { createdAt: 'desc' }, skip, take: limit })
@@ -5216,6 +5295,8 @@ export const myAdvertisements = handle('advertisements.my', async (req, res) => 
 export const createAdvertisement = handle('advertisements.create', async (req, res) => {
   await assertDriverVerified(req);
   assertAdvertisementRoute(req.body);
+  const transport = req.body.itinerary ? await registeredTransport(req.user.id, req.body.vehicleId) : null;
+  const itinerary = req.body.itinerary === undefined ? null : await normalizeItinerary(req.body.itinerary ? { ...req.body.itinerary, serviceType: transport.serviceType } : null, req.body, prisma);
 
   const advertisement = await prisma.$transaction(async (tx) => {
     const created = await tx.advertisement.create({
@@ -5231,10 +5312,14 @@ export const createAdvertisement = handle('advertisements.create', async (req, r
         availableWeight: positiveDecimal(req.body.availableWeight, 'availableWeight'),
         proposedPrice: positiveDecimal(req.body.proposedPrice, 'proposedPrice'),
         description: req.body.description,
-        audioUrl: req.body.audioUrl
+        audioUrl: req.body.audioUrl,
+        metadata: itinerary ? { itinerary, transport } : {}
       },
       include: { ...advertisementLocationInclude, driver: true, offers: true }
     });
+
+    await rememberRoute(tx, created);
+    await notifyRouteAlerts(tx, created);
 
     await audit(tx, req, {
       action: 'advertisement.create',
@@ -5294,6 +5379,14 @@ export const updateAdvertisement = handle('advertisements.update', async (req, r
     data.departureAt = req.body.departureAt ? parseFutureDate(req.body.departureAt, 'departureAt') : null;
   }
 
+  // Revalider aussi les horaires lorsque le départ ou les terminus changent.
+  if (req.body.itinerary !== undefined || advertisement.metadata?.itinerary) {
+    const transport = await registeredTransport(advertisement.driverId, advertisement.metadata?.transport?.vehicleId);
+    const input = req.body.itinerary === undefined ? advertisement.metadata.itinerary : req.body.itinerary;
+    const itinerary = await normalizeItinerary(input ? { ...input, serviceType: transport.serviceType } : null, { ...advertisement, ...data }, prisma);
+    data.metadata = { ...advertisement.metadata, itinerary, transport };
+  }
+
   if (Object.keys(data).length === 0) {
     throw new ValidationError([{ path: 'body', message: 'Aucun champ modifiable fourni' }]);
   }
@@ -5301,7 +5394,7 @@ export const updateAdvertisement = handle('advertisements.update', async (req, r
   assertAdvertisementRoute({ ...advertisement, ...data });
 
   const changedFields = Object.keys(data).filter(
-    (field) => String(advertisement[field] ?? '') !== String(data[field] ?? '')
+    (field) => JSON.stringify(advertisement[field] ?? null) !== JSON.stringify(data[field] ?? null)
   );
   if (changedFields.length === 0) {
     return ok(res, {
@@ -5311,11 +5404,17 @@ export const updateAdvertisement = handle('advertisements.update', async (req, r
   }
 
   const updated = await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM advertisements WHERE id = ${advertisement.id}::uuid FOR UPDATE`;
+    if (await tx.advertisementOffer.count({ where: { advertisementId: advertisement.id, status: 'accepted' } })) throw new ConflictError('Une offre vient d’être acceptée : le trajet ne peut plus changer');
+    if (await tx.journeyLive.count({ where: { advertisementId: advertisement.id } })) throw new ConflictError('Arrêtez le suivi GPS avant de modifier ce départ');
     const result = await tx.advertisement.update({
       where: { id: advertisement.id },
       data,
       include: { ...advertisementLocationInclude, driver: true, offers: true }
     });
+
+    await rememberRoute(tx, result);
+    await notifyRouteAlerts(tx, result);
 
     await audit(tx, req, {
       action: 'advertisement.update',
@@ -5405,6 +5504,7 @@ export const closeAdvertisement = handle('advertisements.close', async (req, res
   const reason = req.body.reason ? String(req.body.reason).trim() : null;
 
   const closed = await prisma.$transaction(async (tx) => {
+    await tx.journeyLive.deleteMany({ where: { advertisementId: advertisement.id } });
     const liveOffers = advertisement.offers.filter((offer) =>
       ADVERTISEMENT_LIVE_OFFER_STATUSES.includes(offer.status)
     );
@@ -5468,7 +5568,7 @@ export const createAdvertisementOffer = handle('advertisements.offerCreate', asy
   if (ad.driverId === req.user.id) {
     throw new ForbiddenError('Impossible de faire une offre sur sa propre annonce');
   }
-  if (ad.departureAt && new Date(ad.departureAt).getTime() <= Date.now()) {
+  if (!ad.metadata?.itinerary && ad.departureAt && new Date(ad.departureAt).getTime() <= Date.now()) {
     throw new ConflictError('Le depart de cette annonce est deja passe');
   }
 
@@ -5478,10 +5578,11 @@ export const createAdvertisementOffer = handle('advertisements.offerCreate', asy
   }
 
   const parcelId = req.body.parcelId || null;
+  if (ad.metadata?.itinerary && !parcelId) throw new ValidationError([{ path: 'parcelId', message: 'Choisissez un colis pour réserver les arrêts' }]);
   if (parcelId) {
     const parcel = await prisma.parcel.findFirst({
       where: { id: parcelId, senderId: req.user.id, deletedAt: null },
-      select: { id: true, status: true, assignedDriverId: true }
+      select: { id: true, status: true, assignedDriverId: true, departureZoneId: true, arrivalZoneId: true, weight: true }
     });
     if (!parcel) throw new NotFoundError('Colis introuvable');
     if (parcel.assignedDriverId) throw new ConflictError('Ce colis est deja assigne a un chauffeur');
@@ -5489,6 +5590,7 @@ export const createAdvertisementOffer = handle('advertisements.offerCreate', asy
       throw new ConflictError('Ce colis n\'est plus disponible pour une offre de trajet');
     }
 
+    segmentFor(ad, parcel);
     const duplicate = await prisma.advertisementOffer.findFirst({
       where: {
         advertisementId: ad.id,
@@ -5533,9 +5635,11 @@ export const advertisementOffers = handle('advertisements.offers', async (req, r
 
 export const acceptAdvertisementOffer = handle('advertisements.offerAccept', async (req, res) => {
   const result = await prisma.$transaction(async (tx) => {
+    // Sérialiser les réservations d’un même départ pour éviter la surcapacité.
+    await tx.$queryRaw`SELECT id FROM advertisements WHERE id = ${req.params.advertisementId}::uuid FOR UPDATE`;
     const advertisement = await tx.advertisement.findUnique({
       where: { id: req.params.advertisementId },
-      select: { id: true, driverId: true, status: true }
+      select: { id: true, driverId: true, status: true, metadata: true, availableWeight: true }
     });
     if (!advertisement) throw new NotFoundError('Annonce introuvable');
 
@@ -5604,6 +5708,11 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
       throw new ConflictError('Le statut actuel du colis ne permet plus cette acceptation');
     }
 
+    const reservations = advertisement.metadata?.itinerary ? await tx.advertisementOffer.findMany({
+      where: { advertisementId: advertisement.id, status: 'accepted' }, include: { parcel: true }
+    }) : [];
+    const segment = assertSegmentCapacity(advertisement, parcel, reservations);
+
     const respondedAt = new Date();
     const parcelClaim = await tx.parcel.updateMany({
       where: {
@@ -5636,13 +5745,14 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
       data: {
         parcelId: parcel.id,
         status: 'confirmed',
-        description: 'Offre de trajet acceptee et chauffeur assigne',
+        description: segment ? `Trajet réservé : retrait à ${segment.pickup.name}, remise à ${segment.dropoff.name}` : 'Offre de trajet acceptee et chauffeur assigne',
         userId: req.user.id,
         userName: req.user.fullName,
         userRole: req.user.role,
         metadata: {
           advertisementId: advertisement.id,
           offerId: currentOffer.id,
+          ...(segment ? { journeySegment: segment, serviceType: advertisement.metadata.itinerary.serviceType, lineNumber: advertisement.metadata.itinerary.lineNumber } : {}),
           negotiatedPrice: Number(currentOffer.price)
         }
       }
@@ -5849,7 +5959,7 @@ export const advertisementStats = handle('advertisements.stats', async (req, res
 export const createVehicle = handle('vehicles.create', async (req, res) => {
   const garageId = req.user.role === 'admin' ? req.user.garageId : req.body.garageId;
   const vehicle = await prisma.vehicle.create({
-    data: { plateNumber: req.body.plateNumber, model: req.body.model, type: req.body.type, capacity: Number(req.body.capacity || 0), garageId, driverId: req.body.driverId }
+    data: { plateNumber: req.body.plateNumber, model: req.body.model, type: normalizeVehicleType(req.body.type), capacity: Number(req.body.capacity || 0), garageId, driverId: req.body.driverId }
   });
   return ok(res, { status: 201, message: 'Vehicule cree', data: { vehicle } });
 });
@@ -5881,7 +5991,7 @@ export const getDriverVehicle = handle('driver.vehicle.get', async (req, res) =>
 export const upsertDriverVehicle = handle('driver.vehicle.upsert', async (req, res) => {
   const plateNumber = (req.body.plateNumber || '').trim();
   const model = (req.body.model || '').trim();
-  const type = (req.body.type || '').trim();
+  const type = normalizeVehicleType(req.body.type);
   const errors = [];
   if (plateNumber.length < 2) errors.push({ path: 'body.plateNumber', message: "Plaque d'immatriculation requise" });
   if (model.length < 1) errors.push({ path: 'body.model', message: 'Modele requis' });
@@ -6611,6 +6721,7 @@ async function readPublicConfig() {
     'support.availability',
     'help.topics',
     'help.faqs',
+    'help.guides',
     'cancellation.reasons',
     // Identité légale affichée dans les pages « Mentions légales »,
     // « Confidentialité » et « CGU ». Vide tant que l'administrateur ne l'a pas
@@ -6691,7 +6802,8 @@ async function readPublicConfig() {
     },
     help: {
       topics: listValue('help.topics', []),
-      faqs: listValue('help.faqs', [])
+      faqs: listValue('help.faqs', []),
+      guides: listValue('help.guides', []).filter(g => g?.published === true && ['fr', 'wo'].includes(g.language) && typeof g.title === 'string' && typeof g.text === 'string').map(g => ({ id: String(g.id ?? ''), language: g.language, title: g.title, text: g.text, audioUrl: typeof g.audioUrl === 'string' && (/^https:\/\//.test(g.audioUrl) || g.audioUrl.startsWith('/api/v1/public/help-audio/')) ? g.audioUrl : null }))
     },
     // Motifs d'annulation (value/label uniquement) : les règles financières
     // restent côté serveur, seul le libellé est exposé pour l'affichage.
@@ -7648,4 +7760,50 @@ export const getParcelFromAdvertisement = handle('advertisements.getParcel', asy
     message: 'Colis récupéré',
     data: { parcel: serializeParcel(parcel) }
   });
+});
+
+// Les erreurs de validation, de concurrence et de BD sont traitées et loguées
+// par handle, comme les autres contrôleurs critiques de ce module.
+export const startLiveJourney = handle('journey.live.start', async (req, res) => {
+  const session = await startJourneyLive(req.params.advertisementId, req.user, req.body);
+  return ok(res, { data: { sessionId: session.id, advertisementId: session.advertisementId } });
+});
+export const updateLiveJourney = handle('journey.live.update', async (req, res) => {
+  await updateJourneyLive(req.params.advertisementId, req.user, req.body);
+  return ok(res, { data: { updated: true } });
+});
+export const stopLiveJourney = handle('journey.live.stop', async (req, res) => {
+  await stopJourneyLive(req.params.advertisementId, req.user, req.body.sessionId);
+  return ok(res, { data: { stopped: true } });
+});
+export const listLiveJourneys = handle('journey.live.list', async (req, res) => {
+  return ok(res, { data: { journeys: await liveJourneys(req.query, req.user) } });
+});
+
+// Chaque accès au carnet est limité au chauffeur connecté. handle centralise
+// le try/catch, la réponse d’erreur et les logs des traitements transactionnels.
+export const listRouteTemplates = handle('route.templates.list', async (req, res) => {
+  const templates = await prisma.routeTemplate.findMany({ where: { driverId: req.user.id, archivedAt: null }, orderBy: { lastUsedAt: 'desc' } });
+  return ok(res, { data: { templates } });
+});
+export const saveRouteTemplate = handle('route.templates.save', async (req, res) => {
+  const template = await saveExistingRoute(req.user, req.body.advertisementId);
+  return ok(res, { data: { template } });
+});
+export const renameRouteTemplate = handle('route.templates.rename', async (req, res) => {
+  const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
+  if (!name || name.length > 160) throw new ValidationError([{ path: 'name', message: 'Nom requis, 160 caractères maximum' }]);
+  const result = await prisma.routeTemplate.updateMany({ where: { id: req.params.templateId, driverId: req.user.id, archivedAt: null }, data: { name } });
+  if (!result.count) throw new NotFoundError('Trajet habituel introuvable');
+  return ok(res, { message: 'Trajet renommé' });
+});
+export const archiveRouteTemplate = handle('route.templates.archive', async (req, res) => {
+  const result = await prisma.routeTemplate.updateMany({ where: { id: req.params.templateId, driverId: req.user.id }, data: { archivedAt: new Date() } });
+  if (!result.count) throw new NotFoundError('Trajet habituel introuvable');
+  return ok(res, { message: 'Trajet retiré du carnet' });
+});
+export const scheduleRouteDepartures = handle('route.templates.schedule', async (req, res) => {
+  await assertDriverVerified(req);
+  const result = await scheduleRoute(req.user, req.params.templateId, req.body);
+  return ok(res, { status: result.replayed ? 200 : 201, data: { ...result, count: result.advertisementIds.length } });
 });

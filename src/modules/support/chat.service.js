@@ -129,7 +129,7 @@ async function authorizedChat(tx, actor, id) {
   return chat;
 }
 
-export async function chatThread(actor, id) {
+export async function chatThread(actor, id, ticketId) {
   return withSupportLock(async tx => {
     await reconcileAssignments(tx);
     const chat = await authorizedChat(tx, actor, id);
@@ -141,7 +141,8 @@ export async function chatThread(actor, id) {
       await tx.notification.updateMany({ where: { userId: actor.id, type: 'support_chat',
         data: { path: ['conversationId'], equals: id }, isRead: false }, data: { isRead: true, readAt: new Date() } });
     }
-    const messages = await tx.supportChatEntry.findMany({ where: { conversationId: id, deletedAt: null },
+    if (ticketId && !await tx.supportTicket.findFirst({ where: { id: ticketId, requesterId: chat.userId } })) throw new NotFoundError('Réclamation introuvable');
+    const messages = await tx.supportChatEntry.findMany({ where: { conversationId: id, deletedAt: null, ...(ticketId ? { ticketId } : {}) },
       orderBy: { createdAt: 'asc' } });
     return { conversation: serializeChat(chat), messages: messages.map(message => ({ ...message,
       isRead: Boolean(message.readAt), senderId: message.senderId ?? '', receiverId: message.fromSupport ? chat.userId : '',
@@ -216,6 +217,7 @@ export async function sendChatMessage(actor, id, payload) {
       await reconcileAssignments(tx);
       chat = await tx.supportChatConversation.findUnique({ where: { id }, include });
     }
+    if (payload.ticketId && !await tx.supportTicket.findFirst({ where: { id: payload.ticketId, requesterId: chat.userId } })) throw new NotFoundError('Réclamation introuvable');
     const entry = await tx.supportChatEntry.create({ data: { conversationId: id, senderId: actor.id,
       senderName: actor.fullName, fromSupport, ...payload } });
     await tx.supportChatConversation.update({ where: { id }, data: { lastMessageAt: entry.createdAt } });
@@ -249,4 +251,20 @@ export function startSupportReassignmentWorker() {
   }, 15000);
   timer.unref();
   return () => clearInterval(timer);
+}
+
+// Même verrou que l'affectation du support : création atomique du ticket et
+// de son premier message dans la transaction appelante.
+export async function attachComplaint(tx, actor, ticket, photos) {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(78120491)`;
+  let chat = await tx.supportChatConversation.findUnique({ where: { userId: actor.id } });
+  if (!chat) chat = await tx.supportChatConversation.create({ data: { userId: actor.id, department: 'technique' } });
+  else if (chat.status === 'closed') chat = await tx.supportChatConversation.update({ where: { id: chat.id }, data: { status: 'open', assignedToId: null, department: 'technique' } });
+  await tx.supportChatEntry.create({ data: { conversationId: chat.id, ticketId: ticket.id, senderId: actor.id, senderName: actor.fullName,
+    fromSupport: false, body: `${ticket.reference} · ${ticket.subject}\n${ticket.body?.split('\n\nPhotos :')[0] ?? ''}`, photoUrl: photos[0] ?? null } });
+  for (const photoUrl of photos.slice(1)) await tx.supportChatEntry.create({ data: { conversationId: chat.id, ticketId: ticket.id,
+    senderId: actor.id, senderName: actor.fullName, fromSupport: false, body: ticket.reference, photoUrl } });
+  await tx.supportChatConversation.update({ where: { id: chat.id }, data: { lastMessageAt: new Date() } });
+  await reconcileAssignments(tx);
+  return chat.id;
 }

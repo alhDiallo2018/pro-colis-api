@@ -1,3 +1,4 @@
+import { normalizeVehicleType } from '../../utils/vehicle-types.js';
 import bcrypt from 'bcryptjs';
 import { releaseSupportSession } from '../support/chat.service.js';
 import { prisma } from '../../config/prisma.js';
@@ -131,6 +132,18 @@ export async function registerUser(payload) {
   // le validateur le restreint déjà) : toute valeur inconnue ou privilégiée
   // retombe sur `client`, jamais sur un rôle staff.
   const role = payload.role === 'driver' ? 'driver' : 'client';
+  // Les données fournies à l'inscription doivent alimenter la même table que
+  // le profil chauffeur. Sinon la catégorie était perdue après connexion.
+  let vehicleData = null;
+  if (role === 'driver' && (payload.vehicleType || payload.vehiclePlate || payload.vehicleModel)) {
+    const type = normalizeVehicleType(payload.vehicleType, 'vehicleType');
+    const plateNumber = payload.vehiclePlate?.trim();
+    const model = payload.vehicleModel?.trim();
+    if (type !== 'gp' && (!plateNumber || !model)) throw new ValidationError([{ path: 'vehicle', message: 'Plaque et modèle requis pour enregistrer le véhicule' }]);
+    if (plateNumber && await prisma.vehicle.findUnique({ where: { plateNumber } })) throw new ConflictError('Cette plaque est déjà enregistrée');
+    vehicleData = { type, plateNumber, model: model || 'GP', capacity: payload.vehicleCapacity ?? 0 };
+  }
+
 
   // Registration creates the user, initial score row and audit entry atomically.
   const user = await prisma.$transaction(async (tx) => {
@@ -152,6 +165,12 @@ export async function registerUser(payload) {
       include: USER_INCLUDE
     });
 
+    if (vehicleData) {
+      await tx.vehicle.create({ data: { ...vehicleData,
+        // GP désigne un transporteur ; ne pas lui inventer une immatriculation routière.
+        plateNumber: vehicleData.plateNumber || `GP-${createdUser.id}`,
+        driverId: createdUser.id, garageId: payload.garageId || null } });
+    }
     await tx.score.create({ data: { userId: createdUser.id } });
     await tx.auditLog.create({
       data: {
@@ -164,7 +183,7 @@ export async function registerUser(payload) {
       }
     });
 
-    return createdUser;
+    return vehicleData ? tx.user.findUnique({ where: { id: createdUser.id }, include: USER_INCLUDE }) : createdUser;
   });
 
   const tokens = await createTokenPair(user);

@@ -219,6 +219,11 @@ enum NegotiationRole {
 }
 
 model User {
+  operationRequests OperationRequest[]
+  savedRecipients SavedRecipient[]
+  journeyEvents JourneyEvent[]
+  routeAlerts RouteAlert[]
+  shipmentDrafts ShipmentDraft[]
   id                      String                 @id @default(uuid()) @db.Uuid
   email                   String?                @unique
   googleSubject           String?                @unique @map("google_subject")
@@ -269,8 +274,12 @@ model User {
   sentNotifications       Notification[]         @relation("NotificationSender")
   otpCodes                OtpCode[]
   refreshTokens           RefreshToken[]
+  routeTemplates          RouteTemplate[]
+  routeScheduleBatches    RouteScheduleBatch[]
+  journeyLive             JourneyLive?
   advertisements          Advertisement[]
   advertisementOffers     AdvertisementOffer[]
+  discoveryPosition       DriverDiscoveryPosition?
   driverLocations         DriverLocation[]
   ratingsGiven            Rating[]               @relation("RatingAuthor")
   ratingsReceived         Rating[]               @relation("RatingDriver")
@@ -336,6 +345,7 @@ model Garage {
 }
 
 model Vehicle {
+  journeyLive JourneyLive?
   id          String    @id @default(uuid()) @db.Uuid
   plateNumber String    @unique @map("plate_number")
   model       String
@@ -813,6 +823,8 @@ model RefreshToken {
 }
 
 model Advertisement {
+  routeAlertDeliveries RouteAlertDelivery[]
+  journeyLive JourneyLive?
   id                String               @id @default(uuid()) @db.Uuid
   driverId          String               @map("driver_id") @db.Uuid
   departureGarageId String?              @map("departure_garage_id") @db.Uuid
@@ -911,6 +923,8 @@ model SupportChatConversation {
 }
 
 model SupportChatEntry {
+  ticketId String? @map("ticket_id") @db.Uuid
+  ticket SupportTicket? @relation(fields: [ticketId], references: [id], onDelete: SetNull)
   id             String @id @default(uuid()) @db.Uuid
   conversationId String @map("conversation_id") @db.Uuid
   senderId       String? @map("sender_id") @db.Uuid
@@ -927,6 +941,7 @@ model SupportChatEntry {
   conversation   SupportChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender         User? @relation(fields: [senderId], references: [id], onDelete: SetNull)
   @@index([conversationId, createdAt])
+  @@index([ticketId])
   @@map("support_chat_entries")
 }
 
@@ -959,6 +974,7 @@ model SupportMessage {
 }
 
 model SupportTicket {
+  chatMessages SupportChatEntry[]
   id                String         @id @default(uuid()) @db.Uuid
   reference         String         @unique
   subject           String
@@ -1309,4 +1325,139 @@ model GoogleAuthChallenge {
 
   @@index([expiresAt])
   @@map("google_auth_challenges")
+}
+
+// Une seule position volontaire par chauffeur, indépendante du suivi colis.
+// Elle est supprimée à la désactivation et ignorée après dix minutes.
+model DriverDiscoveryPosition {
+  driverId String @id @map("driver_id") @db.Uuid
+  latitude Decimal @db.Decimal(10, 7)
+  longitude Decimal @db.Decimal(10, 7)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz
+  driver User @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  @@map("driver_discovery_positions")
+}
+
+// Une session GPS lie un véhicule physique à UN départ, jamais à un numéro de ligne.
+model JourneyLive {
+  id              String        @id @default(uuid()) @db.Uuid
+  advertisementId String        @unique @map("advertisement_id") @db.Uuid
+  driverId        String        @unique @map("driver_id") @db.Uuid
+  vehicleId       String        @unique @map("vehicle_id") @db.Uuid
+  latitude        Decimal       @db.Decimal(10, 7)
+  longitude       Decimal       @db.Decimal(10, 7)
+  accuracyMeters  Float         @map("accuracy_meters")
+  capturedAt      DateTime      @map("captured_at") @db.Timestamptz
+  startedAt       DateTime      @default(now()) @map("started_at") @db.Timestamptz
+  updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+  advertisement   Advertisement @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
+  driver          User          @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  vehicle         Vehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  @@map("journey_live")
+}
+
+// Le trajet habituel ne contient ni date de départ, ni GPS, ni réservations.
+model RouteTemplate {
+  id          String    @id @default(uuid()) @db.Uuid
+  driverId    String    @map("driver_id") @db.Uuid
+  fingerprint String
+  name        String
+  data        Json
+  archivedAt  DateTime? @map("archived_at") @db.Timestamptz
+  lastUsedAt  DateTime   @default(now()) @map("last_used_at") @db.Timestamptz
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime   @updatedAt @map("updated_at") @db.Timestamptz
+  driver      User       @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  @@unique([driverId, fingerprint])
+  @@index([driverId, archivedAt])
+  @@map("route_templates")
+}
+
+// Idempotence durable : une reconnexion ou un double clic ne republie pas 50 départs.
+model RouteScheduleBatch {
+  id               String   @id @default(uuid()) @db.Uuid
+  driverId         String   @map("driver_id") @db.Uuid
+  requestId        String   @map("request_id") @db.Uuid
+  payloadHash      String   @map("payload_hash")
+  advertisementIds Json     @map("advertisement_ids")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz
+  driver           User     @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  @@unique([driverId, requestId])
+  @@map("route_schedule_batches")
+}
+
+// Les alertes sont opt-in et limitées dans le temps ; supprimer le compte
+// supprime aussi ses préférences et les brouillons contenant des coordonnées.
+model RouteAlert {
+  deliveries RouteAlertDelivery[]
+  id String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  departureZoneId String @map("departure_zone_id") @db.Uuid
+  arrivalZoneId String @map("arrival_zone_id") @db.Uuid
+  expiresAt DateTime @map("expires_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([userId, departureZoneId, arrivalZoneId])
+  @@index([expiresAt])
+  @@map("route_alerts")
+}
+
+model ShipmentDraft {
+  completedParcelId String? @map("completed_parcel_id") @db.Uuid
+  completedAt DateTime? @map("completed_at") @db.Timestamptz
+  id String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  label String
+  data Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId, createdAt])
+  @@map("shipment_drafts")
+}
+
+model RouteAlertDelivery {
+  alertId String @map("alert_id") @db.Uuid
+  advertisementId String @map("advertisement_id") @db.Uuid
+  alert RouteAlert @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  advertisement Advertisement @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
+  @@id([alertId, advertisementId])
+  @@map("route_alert_deliveries")
+}
+
+model OperationRequest {
+  actorId String @map("actor_id") @db.Uuid
+  scope String
+  requestId String @map("request_id") @db.Uuid
+  fingerprint String
+  result Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  actor User @relation(fields: [actorId], references: [id], onDelete: Cascade)
+  @@id([actorId, scope, requestId])
+  @@map("operation_requests")
+}
+model SavedRecipient {
+  id String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  name String
+  phone String
+  email String?
+  address String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId, name])
+  @@map("saved_recipients")
+}
+// Aucun texte libre ni coordonnée : seulement les étapes utiles à la qualité.
+model JourneyEvent {
+  id String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  attemptId String @map("attempt_id") @db.Uuid
+  event String
+  platform String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([userId, attemptId, event])
+  @@index([createdAt, event])
+  @@map("journey_events")
 }

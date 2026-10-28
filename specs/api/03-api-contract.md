@@ -277,3 +277,252 @@ Payload creation colis :
 | POST | `/webhooks` | super_admin | Enregistrer webhook. |
 | GET | `/webhooks` | super_admin | Lister webhooks. |
 | DELETE | `/webhooks/:webhookId` | super_admin | Supprimer webhook. |
+
+
+## Recherche de chauffeurs par véhicule et proximité
+
+- `GET /public/vehicle-types` : catalogue `{ vehicleTypes: [{ value, label }] }`.
+  Codes : `motorcycle`, `truck`, `van`, `tricycle`, `bus`, `gp`.
+  Les écritures véhicule normalisent les anciens libellés (Moto, camion, Tata,
+  horaire, minibus…) et refusent les types inconnus.
+- `GET /public/drivers/search` : filtres `zoneId` (ou ancien `garageId`),
+  `vehicleType`, `availableOnly=true`, `verifiedOnly=true`, `minCapacity` en kg,
+  `limit` (1 à 200). Le rattachement zone inclut les anciens garages miroirs.
+- `GET /client/drivers/search` : mêmes filtres, authentification client requise.
+  Fournir `latitude` **et** `longitude` pour classer les chauffeurs disponibles
+  par distance à vol d'oiseau. Réponse enrichie avec `vehicleType`,
+  `vehicleModel`, `vehicleCapacity`, `distanceKm` (arrondi à 100 m) et
+  `locationUpdatedAt`. Une position absente ou âgée de plus de dix minutes
+  donne une distance `null` et place le chauffeur après les positions connues.
+  Les coordonnées GPS et plaques des chauffeurs ne sont jamais retournées.
+- `PUT /driver/discovery-location` : authentification chauffeur requise.
+  `{ enabled: true, latitude, longitude }` publie volontairement une position ;
+  `{ enabled: false }` la supprime. Le chauffeur est déduit de la session.
+  La table dédiée ne lit jamais les positions de suivi des colis.
+- Le client mobile actualise le partage chaque minute au premier plan. Le
+  passage en arrière-plan, le changement de compte ou de disponibilité
+  interrompt le partage. Si la suppression réseau échoue, la position expire
+  automatiquement dix minutes après le dernier envoi réussi.
+- La proposition directe (`POST /client/parcels/create`, avec `driverId`)
+  revérifie la disponibilité et la capacité déclarée au moment de l'envoi.
+  Le champ optionnel `vehicleType` permet de revérifier le type sélectionné.
+  Un changement incompatible renvoie `409`. Le colis reste `proposal_sent`
+  jusqu'à la réponse du chauffeur : la sélection n'est pas une acceptation.
+
+Déploiement : appliquer la migration `20261028000000_driver_discovery`, puis
+redémarrer l'API avec le client Prisma régénéré avant de distribuer le mobile.
+La capacité est une déclaration en kg ; elle ne garantit pas les dimensions,
+la capacité restante ou les conditions de transport, à confirmer avec le chauffeur.
+
+### Découverte cartographique mobile
+
+`GET /client/drivers/discovery` (client authentifié uniquement) exige
+`latitude` et `longitude` du point de retrait. Filtres : `vehicleType`,
+`minCapacity`, `verifiedOnly`, `radiusKm` (1–100, défaut 10), `limit` (1–200).
+Cette recherche géographique ne se limite pas au garage de rattachement.
+
+Réponse : `{ drivers, categories, search }`. Seuls les chauffeurs disponibles,
+avec véhicule et position volontaire actualisée depuis moins de dix minutes,
+sont inclus, dans le rayon demandé et par distance croissante. Chaque chauffeur
+porte `mapPosition` (coordonnées arrondies à 0,001 degré et
+`accuracyMeters: 150`) ; aucune position précise de suivi de colis n'est exposée.
+`categories` fournit les comptes par type avant application du filtre de type,
+mais après les contraintes de capacité, vérification et rayon. `search.total`
+précède la pagination ; `search.returned` indique le nombre effectivement rendu.
+Les distances sont à vol d'oiseau, sans promesse de délai d'arrivée.
+
+Le mobile ouvre la carte depuis l'accueil et les annonces : retrait/destination,
+catégories, capacité, rayon, chauffeur puis description et proposition de prix.
+La localisation du client reste facultative ; la saisie manuelle et le choix
+sur carte restent disponibles. Les résultats sont revérifiés toutes les
+30 secondes au premier plan. En cas d'échec réseau, la sélection est retirée
+pour éviter de présenter une ancienne disponibilité comme actuelle.
+
+### Voyages, GP et navettes avec arrêts intermédiaires
+
+Les annonces chauffeur acceptent désormais `itinerary` :
+
+```json
+{
+  "serviceType": "shuttle",
+  "lineNumber": "45",
+  "stops": [
+    { "zoneId": "<zone-départ>", "offsetMinutes": 0 },
+    { "zoneId": "<zone-intermédiaire>", "offsetMinutes": 30 },
+    { "zoneId": "<zone-arrivée>", "offsetMinutes": 90 }
+  ]
+}
+```
+
+- Services : `trip`, `gp`, `shuttle`. Le numéro de ligne est obligatoire pour
+  `shuttle`. L'exemple 45 est un libellé déclaré, pas un itinéraire certifié.
+- Une annonce représente un départ daté : `departureAt`, `availableWeight`
+  et les zones des deux terminus sont requis avec un itinéraire. Les 2–40
+  arrêts distincts suivent des horaires strictement croissants, en minutes
+  depuis le départ. Le serveur résout leurs noms, positions et dates prévues.
+- Stockage dans `Advertisement.metadata.itinerary`, exposé aussi sous
+  `itinerary`. Les anciennes annonces sans itinéraire restent compatibles.
+- Recherche `GET /advertisements?pickupZoneId=…&dropoffZoneId=…&weight=…`
+  filtre avant pagination, dans le sens du trajet et avec capacité suffisante
+  sur chaque tronçon. Filtres supplémentaires : `serviceType`, `lineNumber`.
+  `matchingSegment` précise retrait, remise et indices dans les arrêts.
+- Un départ déjà effectué peut encore accepter une prise en charge à un arrêt
+  futur. Aucun embarquement à un arrêt dont l'horaire est passé n'est proposé.
+- Une offre sur un itinéraire doit avoir un colis appartenant au client ; ses
+  zones déterminent les arrêts. L'acceptation verrouille l'annonce en base,
+  revalide horaires et poids, puis calcule la charge sur chaque tronçon.
+  Deux colis consécutifs réutilisent la capacité ; deux colis qui se
+  chevauchent l'additionnent. Un dépassement renvoie `409`.
+- Le segment réservé est enregistré dans l'événement `confirmed` du colis et
+  affiché au chauffeur dans les offres. La prise en charge et la livraison
+  gardent leurs confirmations existantes : un horaire ne livre pas un colis.
+- Une annonce avec réservation acceptée ne peut plus modifier ses arrêts ou
+  sa capacité. Une navette récurrente publie une annonce par départ ; aucune
+  répétition ni géolocalisation de bus n'est fabriquée automatiquement.
+
+### Identité du véhicule et position GPS en direct
+
+La ligne (`45`, par exemple) n'est pas une clé de véhicule. Chaque annonce
+reste un départ identifié par son UUID, lié au `transport.vehicleId` du
+véhicule enregistré et à l'ordre de ses arrêts. Plusieurs dizaines de véhicules
+peuvent publier le même numéro, dans le même sens ou dans des sens opposés.
+Le véhicule conserve une référence d'affichage ; les repères cartographiques
+utilisent l'identifiant du départ et ne sont jamais regroupés par numéro.
+
+Pour une nouvelle annonce avec itinéraire, le serveur reprend le véhicule du
+profil (ou `vehicleId` appartenant au chauffeur). Il déduit `serviceType` :
+`bus` → `shuttle`, `gp` → `gp`, autres → `trip`. Le mobile ne redemande pas la
+catégorie et préremplit la capacité enregistrée ; le chauffeur précise la
+capacité disponible pour ce départ. Les anciennes annonces doivent être
+modifiées pour rattacher leur véhicule avant d'activer le suivi précis.
+
+Le partage précis est **distinct** de la découverte approximative : activation
+explicite par le chauffeur, pour un départ ouvert, au plus tôt 30 minutes avant
+son départ annoncé. Aucun GPS de colis ou point de démonstration n'est réutilisé.
+
+- `POST /advertisements/:id/live` (chauffeur propriétaire) :
+  `{ enabled: true, latitude, longitude, accuracyMeters, capturedAt }`.
+  Retourne `sessionId`. Une session par chauffeur, véhicule et départ.
+- `PATCH /advertisements/:id/live` : mêmes mesures avec `sessionId`. Seules
+  les mesures plus récentes remplacent le point courant ; un ancien flux ne
+  peut pas déplacer le véhicule d'une nouvelle session.
+- `DELETE /advertisements/:id/live` avec `{ sessionId }` : arrêt idempotent.
+  La fermeture du départ supprime également son partage.
+- `GET /client/journeys/live` (authentifié client, ou chauffeur pour ses propres
+  départs) : filtres `advertisementId`, `lineNumber`, paire `pickupZoneId` /
+  `dropoffZoneId`. Coordonnées non arrondies, précision fournie par le GPS,
+  date de mesure et expiration. La direction vient des arrêts ordonnés.
+
+Une position de plus de 60 secondes est retirée. Une mesure future de plus de
+5 secondes ou une précision déclarée supérieure à 1 000 m est refusée. Les
+clients actualisent la carte toutes les cinq secondes et affichent la précision
+et l'âge GPS ; ils n'affichent pas d'ETA inventée. Le suivi mobile utilise les
+mesures du GPS, espacées d'au moins huit secondes, avec notification persistante
+Android / indication iOS, et peut continuer en arrière-plan selon les permissions
+système. L'arrêt, la déconnexion et le changement de compte interrompent le flux.
+Un défaut réseau ou une absence prolongée de mesures ne renouvelle jamais la
+fraîcheur d'un point stocké. Le fonctionnement écran verrouillé doit aussi être
+vérifié sur téléphones physiques iOS et Android.
+
+Déploiement : migration `20261029000000_journey_live` et régénération Prisma,
+puis reconstruction native du mobile (capacités de localisation en arrière-plan).
+
+L'inscription chauffeur (`POST /auth/register`) conserve aussi `vehicleType`,
+`vehicleCapacity`, `vehiclePlate` et `vehicleModel` dans la table des véhicules,
+dans la même transaction que le compte. Les alias de catégorie sont normalisés.
+Pour un GP, une référence interne de transporteur remplace la plaque routière
+si elle n'est pas fournie ; aucun numéro de bus ou d'avion n'est inventé.
+
+### Trajets habituels et départs en série
+
+Les créations et modifications d'annonces avec itinéraire mémorisent le trajet
+privé du chauffeur. Une empreinte du service, de la ligne et des arrêts ordonnés
+avec leurs durées évite un nouveau modèle pour chaque départ identique. La date,
+les offres, les réservations, le GPS et les sessions ne sont jamais mémorisés
+comme données à dupliquer. Prix et capacité servent seulement de valeurs initiales.
+
+- `GET /driver/route-templates` : carnet privé, trié par utilisation récente.
+- `POST /driver/route-templates` avec `{ advertisementId }` : mémoriser un
+  ancien voyage appartenant au chauffeur ; aucune ressaisie des zones.
+- `PATCH /driver/route-templates/:id` avec `{ name }` : renommer.
+- `DELETE /driver/route-templates/:id` : archiver le modèle sans toucher aux
+  voyages déjà publiés.
+- `POST /driver/route-templates/:id/departures` : publier 1 à 100 départs :
+
+```json
+{
+  "requestId": "<UUID stable pour cette publication>",
+  "departures": [
+    { "departureAt": "2027-01-02T06:00:00Z", "reverse": false },
+    { "departureAt": "2027-01-02T07:00:00Z", "reverse": true }
+  ],
+  "availableWeight": 20,
+  "proposedPrice": null
+}
+```
+
+Les horaires sont explicites (ISO avec fuseau), futurs, dans les 90 jours.
+Les nouveaux départs sont à négocier : `proposedPrice` absent ou `null` ne
+reprend jamais un ancien tarif, y compris pour un modèle historique tarifé.
+Les interfaces de création publient sans prix : le client propose un colis et
+une offre, puis le chauffeur négocie selon ses caractéristiques. Les anciens
+clients API peuvent encore transmettre un tarif explicite ; les demandes déjà
+enregistrées pour une reprise idempotente gardent leur contenu d'origine.
+`reverse` inverse les arrêts et recalcule les durées depuis le nouveau départ.
+Le véhicule actuel et sa catégorie proviennent du profil. La série refuse les
+chevauchements internes et les créneaux déjà occupés par ses départs ouverts.
+L'opération est transactionnelle : tous les départs sont créés, ou aucun.
+
+`requestId` est unique par chauffeur. Un nouvel essai identique renvoie les
+mêmes `advertisementIds` et `replayed: true` ; un contenu différent avec la même
+clé renvoie `409`. Le mobile conserve la demande sur ce téléphone, par compte,
+avant son envoi et jusqu'à confirmation, afin de reprendre après une coupure.
+Chaque départ possède ensuite ses réservations et son activation GPS propres.
+
+Le mobile propose « Trajets habituels · planning rapide » dans Mes annonces,
+« Utiliser un trajet habituel » à la création et « Réutiliser ce trajet » depuis
+un voyage. Le premier horaire, le nombre et l'intervalle génèrent un récapitulatif
+avant publication, avec alternance aller/retour possible. Cette planification
+crée une série finie ; elle ne lance pas de récurrence quotidienne indéfinie.
+
+Déploiement : migration `20261030000000_route_templates`, régénération Prisma et
+mise à jour du mobile. Aucun ancien voyage n'est modifié par la réutilisation.
+
+## Outils d’envoi et accompagnement des livraisons
+
+Routes sous `/api/v1/experience`, authentification obligatoire, rôles client ou
+chauffeur. Réponses privées `Cache-Control: private, no-store`.
+
+| Méthode | Route | Accès et résultat |
+| --- | --- | --- |
+| GET | `/parcels/:id` | Expéditeur ou chauffeur attribué : `experience` avec prochaine action, état de suivi, finances filtrées par rôle, reçus du payeur et réclamations personnelles. |
+| GET | `/parcels/:id/repeat` | Expéditeur : `draft` avec liste blanche des coordonnées, trajet et caractéristiques ; aucun engagement repris. |
+| POST | `/parcels/:id/complaints` | Expéditeur ou chauffeur attribué : `requestId` UUID stable, `reason` (`delay`, `damage`, `missing`, `payment`, `other`), `message` (10–3000 caractères), `photos` (0–4 URL). Renvoie `complaint`. Le même contenu est rejouable, un changement avec la même clé renvoie 409. |
+| GET | `/workspace?page=1` | Client : `drafts` (100 maximum), `alerts` actives, `receipts` (25 par page), `page`, `hasMore`. |
+| POST | `/drafts` | Client : `drafts: [{id: UUID, label, data}]`, 1–50 éléments. Écriture atomique, rejouable à contenu identique. Prix/paiement/chauffeur interdits dans `data`. |
+| GET | `/drafts/:id` | Client propriétaire : `draft` prêt à préremplir, à relire avant publication. |
+| DELETE | `/drafts/:id` | Client propriétaire : suppression idempotente. |
+| POST | `/alerts` | Client : `departureZoneId`, `arrivalZoneId`, `consent: true`, `days` optionnel (1–90, défaut 30). 20 alertes maximum. |
+| DELETE | `/alerts/:id` | Client propriétaire : désactivation idempotente. |
+
+`finance.commissionEstimated` distingue estimation et valeur historique ; un
+montant non déterminable est `null`, jamais remplacé par zéro. La dette créée sur
+un colis et la dette actuelle du compte sont deux informations distinctes.
+Les reçus ne comprennent que les paiements `completed` du payeur autorisé.
+
+`/public/config` expose aussi `help.guides` : guides publiés en `fr` ou `wo`,
+transcription et URL audio facultative. Les guides français initiaux sont servis
+sous `/api/v1/public/help-audio/`. La publication de contenus ne modifie pas les
+règles de livraison ou de paiement.
+
+### Reprise fiable et outils professionnels (2026-10-28)
+
+- `POST /client/parcels/create` accepte `requestId` (UUID) et `sourceDraftId` (UUID facultatif). La même clé, pour le même compte et le même contenu, retrouve le colis créé. Un contenu différent avec cette clé renvoie `409`. Le résultat et la création sont commis dans la même transaction PostgreSQL. Les anciennes applications sans clé restent compatibles.
+- `POST /upload` accepte également `requestId`. Le type, le colis, le nom et l'empreinte du fichier doivent rester identiques à la reprise. Les fichiers temporaires refusés ou rejoués sont supprimés. Un fichier lié à un colis exige un accès à ce colis.
+- `GET /experience/requests/:id` retourne `{result: {parcelId} | null}` pour la clé du compte connecté. L'absence de résultat ne constitue pas une autorisation de créer avec une autre clé : une première requête peut encore être en cours.
+- `GET /experience/workspace` expose `completedParcelId` et `completedAt` sur les brouillons publiés. Un brouillon publié ne peut plus être utilisé pour créer un deuxième colis ; il reste visible pour le suivi du lot.
+- `POST /experience/imports/preview` : multipart `file`, CSV ou XLSX, 2 Mo, une feuille, 1–50 colis. En-têtes : `nom`, `telephone`, `description`, `poids` ; `adresse` et `email` facultatifs. Résultat `{drafts,errors:[{line,message}],count}`. Toute ligne invalide vide `drafts`. Aucune création métier pendant l'aperçu. Formules, macros et liens externes XLSX refusés ; analyse dans un worker borné.
+- `GET/POST /experience/recipients`, `GET/DELETE /experience/recipients/:id` : carnet privé client, 200 entrées maximum. Création avec `requestId`, `name`, `phone`, `email?`, `address?`. La lecture individuelle retourne un `draft` pour préremplir le parcours existant.
+- `POST /experience/events` : `{attemptId,event,platform}` ; événements `creation_started`, `creation_submitted`, `creation_failed`, `creation_completed`, plateformes `web` ou `mobile`. Aucun champ libre ni position. Un événement identique pour la même tentative est dédupliqué.
+- Une réclamation crée aussi son premier message dans la conversation support du demandeur. Les messages acceptent `ticketId` ; l'API contrôle l'appartenance au même demandeur. `GET /support/chat/conversations/:id?ticketId=…` permet une lecture filtrée. Les interfaces gardent le fil complet afin que les réponses générales restent visibles. Un changement effectif de statut notifie le demandeur une seule fois.
+- `GET /quality` : réservé à `super_admin` et `support_technique`, agrégats sur 30 jours, aucun détail personnel. Retards actifs selon l'estimation enregistrée ; abandons présumés après 24 h sans création confirmée dans le journal serveur ; première réponse réelle sur les conversations commencées pendant la période et ayant reçu une réponse.

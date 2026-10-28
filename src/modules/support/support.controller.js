@@ -350,7 +350,7 @@ export const updateTicket = handle('support.technique.ticketUpdate', async (req,
     status: status || undefined,
     priority: priority || undefined,
     assigneeId: assigneeId === null ? null : assigneeId || undefined,
-    category: category || undefined
+    category: existing.category?.startsWith('parcel:') ? undefined : category || undefined
   });
 
   if (Object.keys(data).length === 0) {
@@ -385,10 +385,18 @@ export const updateTicket = handle('support.technique.ticketUpdate', async (req,
     data.assigneeId = req.user.id;
   }
 
-  const ticket = await prisma.supportTicket.update({
-    where: { id: existing.id },
-    data,
-    include: ticketInclude
+  const ticket = await prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT id FROM support_tickets WHERE id = ${existing.id}::uuid FOR UPDATE`;
+    const current = await tx.supportTicket.findUnique({ where: { id: existing.id } });
+    const updated = await tx.supportTicket.update({ where: { id: existing.id }, data, include: ticketInclude });
+    // Une seule notification pour deux changements simultanés identiques.
+    if (status && status !== current.status && current.requesterId) {
+      const labels = { open: 'reçue', pending: 'en attente', in_progress: 'en cours', resolved: 'résolue' };
+      await tx.notification.create({ data: { userId: current.requesterId, senderId: req.user.id,
+        type: 'complaint_status', title: 'Votre réclamation a été mise à jour', body: `${current.reference} : ${labels[status] ?? status}`,
+        data: { ticketId: current.id, ...(current.category?.startsWith('parcel:') ? { parcelId: current.category.slice(7) } : {}) } } });
+    }
+    return updated;
   });
 
   return ok(res, { message: 'Ticket mis a jour', data: { ticket: serializeTicket(ticket) } });

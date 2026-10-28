@@ -20,6 +20,9 @@ import { supportChatRouter } from './modules/support/chat.routes.js';
 import { zoneRouter } from './modules/zones/zone.routes.js';
 import { observabilityRouter } from './modules/observability/observability.routes.js';
 
+import { qualityRouter } from './modules/experience/quality.routes.js';
+import { experienceRouter } from './modules/experience/experience.routes.js';
+
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,6 +57,7 @@ app.use(
 
 const apiV1 = express.Router();
 apiV1.use('/health', healthRouter);
+apiV1.use('/public/help-audio', (_req, res, next) => { res.set('Cross-Origin-Resource-Policy', 'cross-origin'); next(); }, express.static(path.resolve(__dirname, '../public/help-audio')));
 apiV1.use('/auth', authRouter);
 apiV1.use('/public/garages', garageRouter);
 apiV1.use('/notifications', notificationRouter);
@@ -63,6 +67,8 @@ apiV1.use('/super-admin/observability', observabilityRouter);
 apiV1.use('/', zoneRouter);
 apiV1.use('/', supportRouter);
 apiV1.use('/support/chat', supportChatRouter);
+apiV1.use('/experience', experienceRouter);
+apiV1.use('/quality', qualityRouter);
 apiV1.use('/', mobileRouter);
 
 app.use('/api/v1', apiV1);
