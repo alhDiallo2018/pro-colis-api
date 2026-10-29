@@ -256,4 +256,53 @@ describe('driver location (GPS tracking)', () => {
     // Une seule position plate, pas un tableau d'historique.
     expect(body).not.toMatch(/driver_locations/);
   });
+  it('suit les mesures GPS dans l’ordre de capture puis signale l’arrivée', async () => {
+    const parcel = await createParcel('in_transit', driverId);
+    const sample = Date.now();
+    for (const [latitude, delay] of [[14.8, 5000], [14.7, 20000]]) {
+      await request(app).post('/api/v1/driver/location')
+        .set('Authorization', `Bearer ${driverToken}`)
+        .send({ parcelId: parcel.id, latitude, longitude: -17.4,
+          capturedAt: new Date(sample - delay).toISOString() }).expect(201);
+    }
+    const url = `/api/v1/public/parcels/track/${parcel.trackingNumber}/location`;
+    let response = await request(app).get(url).expect(200);
+    expect(response.body.driverLocation.latitude).toBe(14.8);
+    expect(response.body.driverLocation.updatedAt).toBe(new Date(sample - 5000).toISOString());
+    expect(response.body.driverLocation.isLive).toBe(true);
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(response.body).not.toHaveProperty('parcel');
+    await prisma.parcel.update({ where: { id: parcel.id }, data: { status: 'arrived' } });
+    response = await request(app).get(url).expect(200);
+    expect(response.body.status).toBe('arrived');
+    await prisma.parcel.update({ where: { id: parcel.id }, data: { status: 'delivered' } });
+    response = await request(app).get(url).expect(200);
+    expect(response.body.driverLocation).toEqual({ available: false });
+  });
+
+  it('ne présente pas une ancienne position comme du direct et refuse une capture périmée', async () => {
+    const parcel = await createParcel('in_transit', driverId);
+    await prisma.driverLocation.create({ data: { parcelId: parcel.id, driverId,
+      latitude: 14.7, longitude: -17.4, createdAt: new Date(Date.now() - 180000) } });
+    const response = await request(app).get(`/api/v1/public/parcels/track/${parcel.trackingNumber}/location`).expect(200);
+    expect(response.body.driverLocation.available).toBe(true);
+    expect(response.body.driverLocation.isLive).toBe(false);
+    await request(app).post('/api/v1/driver/location').set('Authorization', `Bearer ${driverToken}`)
+      .send({ parcelId: parcel.id, latitude: 14.9, longitude: -17.4,
+        capturedAt: new Date(Date.now() - 120000).toISOString() }).expect(422);
+  });
+
+  it('suit tous les colis actifs du chauffeur au-delà de la première page des missions', async () => {
+    const expected = [];
+    for (let i = 0; i < 21; i++) expected.push((await createParcel('in_transit', driverId)).id);
+    const foreign = await createParcel('in_transit', otherDriverId);
+    const delivered = await createParcel('delivered', driverId);
+    const response = await request(app).get('/api/v1/driver/tracking-parcels')
+      .set('Authorization', `Bearer ${driverToken}`).expect(200);
+    expect(response.body.parcelIds).toEqual(expect.arrayContaining(expected));
+    expect(response.body.parcelIds).not.toContain(foreign.id);
+    expect(response.body.parcelIds).not.toContain(delivered.id);
+    await request(app).get('/api/v1/driver/tracking-parcels').expect(401);
+  });
+
 });

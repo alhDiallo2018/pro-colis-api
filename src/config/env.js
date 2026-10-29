@@ -79,7 +79,6 @@ const envSchema = z.object({
   METRICS_TOKEN: z.string().optional(),
   CORS_ORIGIN: z.string().default('*'),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(900000),
-  RATE_LIMIT_MAX: z.coerce.number().int().positive().default(300),
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(100),
   PAYDUNYA_MASTER_KEY: z.string().optional(),
   PAYDUNYA_PRIVATE_KEY: z.string().optional(),

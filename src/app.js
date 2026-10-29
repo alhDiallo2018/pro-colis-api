@@ -6,7 +6,6 @@ import { fileURLToPath } from 'node:url';
 import { env } from './config/env.js';
 import { requestIdMiddleware } from './middlewares/request-id.middleware.js';
 import { httpLogger } from './middlewares/http-logger.middleware.js';
-import { globalRateLimit } from './middlewares/rate-limit.middleware.js';
 import { errorMiddleware, notFoundMiddleware } from './middlewares/error.middleware.js';
 import { metricsHandler, metricsMiddleware } from './observability/metrics.js';
 import { healthRouter } from './modules/health/health.routes.js';
@@ -38,7 +37,8 @@ app.use(
     credentials: true
   })
 );
-app.use(globalRateLimit);
+// Les flux GPS et rafraîchissements mobiles ne partagent plus un quota par IP.
+// Les routes sensibles (authentification, OTP et imports) gardent leur limite.
 // Cette route n'est pas proxifiee par Caddy en production et exige en plus un
 // bearer token distinct des jetons utilisateurs.
 app.get('/internal/metrics', metricsHandler);

@@ -85,7 +85,7 @@ Middlewares recommandes :
 
 - `helmet`.
 - CORS configure avec les domaines autorises.
-- rate limiting global.
+- pas de quota global par IP pour les rafraîchissements et le suivi mobile.
 - rate limiting strict pour auth, OTP et upload.
 - limite de body JSON, par exemple `10mb`; endpoints base64 media peuvent avoir une limite dediee.
 

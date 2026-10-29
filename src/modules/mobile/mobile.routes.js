@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { tripImportRouter } from '../trips/import.routes.js';
 import { authenticate, optionalAuthenticate } from '../../middlewares/auth.middleware.js';
 import { requireRoles } from '../../middlewares/rbac.middleware.js';
 import * as adminAssistanceController from '../admin-assistance.controller.js';
@@ -180,6 +181,7 @@ mobileRouter.get('/driver/cash-declarations', authenticate, requireRoles('driver
 mobileRouter.post('/driver/bids', authenticate, requireRoles('driver'), mobileController.createBid);
 mobileRouter.get('/driver/bids/sent', authenticate, requireRoles('driver'), mobileController.driverBidsSent);
 mobileRouter.post('/driver/location', authenticate, requireRoles('driver'), mobileController.saveDriverLocation);
+mobileRouter.get('/driver/tracking-parcels', authenticate, requireRoles('driver'), mobileController.activeTrackingParcels);
 mobileRouter.get('/driver/vehicle', authenticate, requireRoles('driver'), mobileController.getDriverVehicle);
 mobileRouter.put('/driver/vehicle', authenticate, requireRoles('driver'), mobileController.upsertDriverVehicle);
 
@@ -283,6 +285,7 @@ mobileRouter.delete('/vehicles/:vehicleId', authenticate, requireRoles('admin', 
 
 mobileRouter.get('/public/parcels/free', optionalAuthenticate, mobileController.freeParcels);
 mobileRouter.get('/public/parcels/track/:trackingNumber', optionalAuthenticate, mobileController.trackParcel);
+mobileRouter.get('/public/parcels/track/:trackingNumber/location', optionalAuthenticate, mobileController.trackParcelLocation);
 mobileRouter.get('/public/parcels/:parcelId/events', optionalAuthenticate, mobileController.publicParcelEvents);
 mobileRouter.get('/public/parcels/:parcelId/bids', optionalAuthenticate, mobileController.publicParcelBids);
 mobileRouter.get('/client/drivers/discovery', authenticate, requireRoles('client'), mobileController.mapDriverDiscovery);
@@ -490,6 +493,7 @@ mobileRouter.get('/identity/status', authenticate, mobileController.identityStat
 // ============================================================
 
 // Flux précis uniquement après activation explicite sur un départ, sous authentification.
+mobileRouter.use('/driver/route-templates/import', tripImportRouter);
 mobileRouter.get('/driver/route-templates', authenticate, requireRoles('driver'), mobileController.listRouteTemplates);
 mobileRouter.post('/driver/route-templates', authenticate, requireRoles('driver'), mobileController.saveRouteTemplate);
 mobileRouter.patch('/driver/route-templates/:templateId', authenticate, requireRoles('driver'), mobileController.renameRouteTemplate);

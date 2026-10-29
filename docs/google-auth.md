@@ -4,6 +4,7 @@
 
 Déployer la migration additive `20261025200000_google_auth`, puis configurer
 `GOOGLE_WEB_CLIENT_ID` avec le client OAuth **Web** du projet Google
+`sendprocolismaps` (`gmp-demo-project-672849367`), distinct du projet Firebase
 `sendprocolis`. Une valeur vide désactive la connexion Google ; les routes
 PIN/email/téléphone restent utilisables. Redémarrer l'API après changement.
 
@@ -119,6 +120,18 @@ Ajouter `https://sendprocolis.com` aux origines JavaScript autorisees de ce
 client dans Google Cloud. Le web utilise GIS en mode popup avec callback ;
 aucun secret client n'est transmis au navigateur ni requis par cette integration.
 Le mobile recupere egalement ce client via `/auth/google/config`.
+Ce client appartient au projet OAuth **sendprocolismaps**
+(`gmp-demo-project-672849367`), distinct du projet Firebase `sendprocolis`.
+Enregistrer les signatures Android dans ce projet OAuth pour correspondre à
+l’audience Web utilisée par l’API. Voir le
+[diagnostic mobile du 29 octobre](corrections-mobile-2026-10-29.md).
+
+Le client Android `sendprocolis-android-upload-20261029`, créé le 29 octobre,
+est `856894814285-8bon5r19bo0tbustju560efvsiggk5en.apps.googleusercontent.com`.
+Il autorise `com.sendprocolis.app` signé par le JKS d’importation fourni
+(SHA-1 `24:BE:58:23:BE:E4:66:5A:83:C8:8C:CF:74:0C:50:09:78:1A:17:23`).
+Le client Web ci-dessus reste l’audience utilisée par le mobile et l’API.
+Le JSON téléchargé du client Android n’a pas à être embarqué dans Flutter.
 
 La procedure administrateur `deploy/operations/apply-google-web-client.py`
 met a jour la configuration runtime root et le `.env` web, sauvegarde ces deux

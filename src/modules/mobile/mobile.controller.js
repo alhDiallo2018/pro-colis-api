@@ -2190,6 +2190,19 @@ export const trackParcel = handle('public.trackParcel', async (req, res) => {
   });
 });
 
+// Les mises à jour de carte ne chargent ni les médias, ni les offres, ni les
+// paiements à chaque passage : uniquement l’état et la dernière mesure GPS.
+export const trackParcelLocation = handle('public.trackParcelLocation', async (req, res) => {
+  const parcel = await prisma.parcel.findUnique({
+    where: { trackingNumber: req.params.trackingNumber },
+    select: { id: true, trackingNumber: true, status: true, assignedDriverId: true, deletedAt: true, updatedAt: true }
+  });
+  if (!parcel || parcel.deletedAt) throw new NotFoundError('Colis introuvable');
+  res.set('Cache-Control', 'no-store');
+  return ok(res, { data: { trackingNumber: parcel.trackingNumber, status: parcel.status,
+    updatedAt: parcel.updatedAt, driverLocation: await buildPublicDriverLocation(parcel) } });
+});
+
 /**
  * Derniere position connue du chauffeur pour ce colis, exposee au client.
  *
@@ -2215,7 +2228,9 @@ async function buildPublicDriverLocation(parcel) {
     latitude: coordNumber(latest.latitude),
     longitude: coordNumber(latest.longitude),
     accuracy: coordNumber(latest.accuracy),
-    updatedAt: latest.createdAt.toISOString()
+    updatedAt: latest.createdAt.toISOString(),
+    // Une dernière position peut rester utile sans être présentée comme live.
+    isLive: Date.now() - latest.createdAt.getTime() <= 120000 && latest.createdAt.getTime() <= Date.now() + 5000
   };
 }
 
@@ -5081,8 +5096,8 @@ function parseCoordinate(value, path, min, max) {
 
 export const saveDriverLocation = handle('driver.location', async (req, res) => {
   const parcelId = req.body.parcelId;
-  if (!parcelId) {
-    throw new ValidationError([{ path: 'body.parcelId', message: 'parcelId requis' }]);
+  if (typeof parcelId !== 'string' || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(parcelId)) {
+    throw new ValidationError([{ path: 'body.parcelId', message: 'Identifiant de colis valide requis' }]);
   }
 
   const latitude = parseCoordinate(req.body.latitude, 'body.latitude', -90, 90);
@@ -5097,31 +5112,56 @@ export const saveDriverLocation = handle('driver.location', async (req, res) => 
     accuracy = parsedAccuracy;
   }
 
-  // Le chauffeur ne peut tracer que le colis qui lui est reellement assigne.
-  // Le driverId vient exclusivement de l'authentification, jamais du client.
-  const parcel = await prisma.parcel.findUnique({ where: { id: parcelId } });
-  if (!parcel || parcel.deletedAt) throw new NotFoundError('Colis introuvable');
-  if (parcel.assignedDriverId !== req.user.id) {
-    throw new ForbiddenError("Vous n'êtes pas assigné à ce colis");
-  }
-  // Une position ne doit être persistée que pendant la fenêtre où le suivi est
-  // réellement actif. Cela évite qu'un mobile en retard ou resté ouvert publie
-  // la position privée du chauffeur avant la prise en charge ou après livraison.
-  if (!GPS_LIVE_PARCEL_STATUSES.includes(parcel.status)) {
-    throw new ConflictError("Le suivi GPS n'est pas actif pour le statut actuel du colis");
+  const capturedAt = req.body.capturedAt === undefined ? new Date() : new Date(req.body.capturedAt);
+  const age = Date.now() - capturedAt.getTime();
+  if ((req.body.capturedAt !== undefined && typeof req.body.capturedAt !== 'string') ||
+      !Number.isFinite(age) || age < -5000 || age > 60000) {
+    throw new ValidationError([{ path: 'body.capturedAt', message: 'Une mesure GPS de moins d’une minute est requise' }]);
   }
 
-  const location = await prisma.driverLocation.create({
-    data: {
-      driverId: req.user.id,
-      parcelId,
-      latitude,
-      longitude,
-      accuracy
+  // Le chauffeur ne peut tracer que le colis qui lui est reellement assigne.
+  // Le driverId vient exclusivement de l'authentification, jamais du client.
+  const location = await prisma.$transaction(async tx => {
+    // Le verrou ordonne l’envoi GPS et le changement de statut : une requête en
+    // vol ne peut écrire une nouvelle position après la livraison/annulation.
+    await tx.$queryRaw`SELECT id FROM parcels WHERE id = ${parcelId}::uuid FOR UPDATE`;
+    const parcel = await tx.parcel.findUnique({ where: { id: parcelId } });
+    if (!parcel || parcel.deletedAt) throw new NotFoundError('Colis introuvable');
+    if (parcel.assignedDriverId !== req.user.id) {
+      throw new ForbiddenError("Vous n'êtes pas assigné à ce colis");
     }
+    // Une position ne doit être persistée que pendant la fenêtre où le suivi est
+    // réellement actif. Cela évite qu'un mobile en retard ou resté ouvert publie
+    // la position privée du chauffeur avant la prise en charge ou après livraison.
+    if (!GPS_LIVE_PARCEL_STATUSES.includes(parcel.status)) {
+      throw new ConflictError("Le suivi GPS n'est pas actif pour le statut actuel du colis");
+    }
+
+    return tx.driverLocation.create({
+      data: {
+        driverId: req.user.id,
+        parcelId,
+        latitude,
+        longitude,
+        accuracy,
+        // Horodatage du GPS, pas du réseau : un ancien paquet arrivé en retard
+        // ne doit pas remplacer une mesure plus récente ni rajeunir sa position.
+        createdAt: capturedAt
+      }
+    });
   });
 
   return ok(res, { status: 201, message: 'Position enregistree', data: { location: serializeDriverLocation(location) } });
+});
+
+// La liste des missions affichées est paginée ; les colis réellement suivis
+// doivent être complets, y compris une ancienne mission encore en transit.
+export const activeTrackingParcels = handle('driver.trackingParcels', async (req, res) => {
+  const parcels = await prisma.parcel.findMany({
+    where: { assignedDriverId: req.user.id, deletedAt: null, status: { in: GPS_LIVE_PARCEL_STATUSES } },
+    select: { id: true }, orderBy: { id: 'asc' }
+  });
+  return ok(res, { data: { parcelIds: parcels.map(parcel => parcel.id) } });
 });
 
 // ============================================================
