@@ -218,6 +218,16 @@ enum NegotiationRole {
   driver
 }
 
+enum TransitOperator {
+  ddd
+  aftu
+}
+
+enum TransitDirection {
+  aller
+  retour
+}
+
 model User {
   operationRequests OperationRequest[]
   savedRecipients SavedRecipient[]
@@ -839,6 +849,7 @@ model Advertisement {
   description       String?
   audioUrl          String?              @map("audio_url")
   status            AdvertisementStatus  @default(open)
+  transitLineId     String?              @map("transit_line_id") @db.Uuid
   metadata          Json                 @default("{}")
   createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz
   updatedAt         DateTime             @updatedAt @map("updated_at") @db.Timestamptz
@@ -847,8 +858,10 @@ model Advertisement {
   arrivalGarage     Garage?              @relation("AdvertisementArrivalGarage", fields: [arrivalGarageId], references: [id])
   departureZone     Zone?                @relation("AdvertisementDepartureZone", fields: [departureZoneId], references: [id])
   arrivalZone       Zone?                @relation("AdvertisementArrivalZone", fields: [arrivalZoneId], references: [id])
+  transitLine       TransitLine?         @relation(fields: [transitLineId], references: [id])
   offers            AdvertisementOffer[]
 
+  @@index([transitLineId, status, departureAt])
   @@map("advertisements")
 }
 
@@ -1268,6 +1281,7 @@ model Zone {
   children    Zone[]       @relation("ZoneHierarchy")
   driverZones ZoneDriver[]
   favorites   FavoriteZone[]
+  transitStops TransitLineStop[]
 
   departureParcels        Parcel[]        @relation("ParcelDepartureZone")
   arrivalParcels          Parcel[]        @relation("ParcelArrivalZone")
@@ -1460,4 +1474,39 @@ model JourneyEvent {
   @@unique([userId, attemptId, event])
   @@index([createdAt, event])
   @@map("journey_events")
+}
+
+// Catalogue public des lignes de bus DDD / AFTU. Partagé entre tous les chauffeurs ;
+// un voyage reste porté par Advertisement (jamais par TransitLine).
+model TransitLine {
+  id             String             @id @default(uuid()) @db.Uuid
+  operator       TransitOperator
+  number         String
+  direction      TransitDirection
+  name           String
+  origin         String
+  destination    String
+  source         String?
+  metadata       Json               @default("{}")
+  createdAt      DateTime           @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime           @updatedAt @map("updated_at") @db.Timestamptz
+  stops          TransitLineStop[]
+  advertisements Advertisement[]
+
+  @@unique([operator, number, direction])
+  @@index([operator])
+  @@map("transit_lines")
+}
+
+model TransitLineStop {
+  transitLineId String      @map("transit_line_id") @db.Uuid
+  order         Int
+  zoneId        String      @map("zone_id") @db.Uuid
+  label         String
+  transitLine   TransitLine @relation(fields: [transitLineId], references: [id], onDelete: Cascade)
+  zone          Zone        @relation(fields: [zoneId], references: [id])
+
+  @@id([transitLineId, order])
+  @@index([zoneId])
+  @@map("transit_line_stops")
 }

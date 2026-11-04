@@ -15,3 +15,7 @@ npm-debug.log*
 
 # Surcharge Docker locale (service postgres conteneurise)
 docker-compose.override.yml
+
+# Artefacts regenerables du scraping/geocodage transit (DDD + AFTU).
+# scripts/transit/scrape.mjs + geocode.mjs reconstruisent tout a la demande.
+data/

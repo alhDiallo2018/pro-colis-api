@@ -488,6 +488,9 @@ mobileRouter.post('/identity/verify', authenticate, mobileController.createIdent
 mobileRouter.post('/identity/upload', authenticate, mobileController.identityUpload);
 mobileRouter.get('/identity/status', authenticate, mobileController.identityStatus);
 
+// TRANSIT (catalogue public DDD / AFTU) : routes déplacées dans
+// `src/modules/trips/transit.routes.js`, montées sous `/transit` depuis `app.js`.
+
 // ============================================================
 // ADVERTISEMENTS
 // ============================================================

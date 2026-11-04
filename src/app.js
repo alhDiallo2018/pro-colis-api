@@ -17,6 +17,7 @@ import { mobileRouter } from './modules/mobile/mobile.routes.js';
 import { supportRouter } from './modules/support/support.routes.js';
 import { supportChatRouter } from './modules/support/chat.routes.js';
 import { zoneRouter } from './modules/zones/zone.routes.js';
+import { transitRouter } from './modules/trips/transit.routes.js';
 import { observabilityRouter } from './modules/observability/observability.routes.js';
 
 import { qualityRouter } from './modules/experience/quality.routes.js';
@@ -69,6 +70,7 @@ apiV1.use('/', supportRouter);
 apiV1.use('/support/chat', supportChatRouter);
 apiV1.use('/experience', experienceRouter);
 apiV1.use('/quality', qualityRouter);
+apiV1.use('/transit', transitRouter);
 apiV1.use('/', mobileRouter);
 
 app.use('/api/v1', apiV1);

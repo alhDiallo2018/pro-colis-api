@@ -5335,6 +5335,14 @@ export const myAdvertisements = handle('advertisements.my', async (req, res) => 
 export const createAdvertisement = handle('advertisements.create', async (req, res) => {
   await assertDriverVerified(req);
   assertAdvertisementRoute(req.body);
+  // Référence optionnelle au catalogue DDD / AFTU : seule la clé étrangère est validée,
+  // les arrêts précis viennent de l'itinéraire fourni par le chauffeur (qui peut adapter).
+  let transitLineId = null;
+  if (req.body.transitLineId) {
+    const line = await prisma.transitLine.findUnique({ where: { id: req.body.transitLineId } });
+    if (!line) throw new NotFoundError('Ligne de transport introuvable');
+    transitLineId = line.id;
+  }
   const transport = req.body.itinerary ? await registeredTransport(req.user.id, req.body.vehicleId) : null;
   const itinerary = req.body.itinerary === undefined ? null : await normalizeItinerary(req.body.itinerary ? { ...req.body.itinerary, serviceType: transport.serviceType } : null, req.body, prisma);
 
@@ -5353,6 +5361,7 @@ export const createAdvertisement = handle('advertisements.create', async (req, r
         proposedPrice: positiveDecimal(req.body.proposedPrice, 'proposedPrice'),
         description: req.body.description,
         audioUrl: req.body.audioUrl,
+        transitLineId,
         metadata: itinerary ? { itinerary, transport } : {}
       },
       include: { ...advertisementLocationInclude, driver: true, offers: true }
