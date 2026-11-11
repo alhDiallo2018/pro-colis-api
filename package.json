@@ -20,7 +20,8 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
-    "test:db:setup": "DATABASE_URL=\"$(node scripts/db-url.mjs procolis_test)\" prisma migrate deploy"
+    "test:db:setup": "DATABASE_URL=\"$(node scripts/db-url.mjs procolis_test)\" prisma migrate deploy",
+    "pilot:snapshot": "node scripts/pilot-snapshot.mjs"
   },
   "dependencies": {
     "@getbrevo/brevo": "^6.0.2",

@@ -1,0 +1,343 @@
+openapi: 3.0.3
+info:
+  title: SendProColis — API publique partenaires e-commerce
+  version: 1.0.0
+  description: |
+    API destinée aux boutiques en ligne (Shopify, WooCommerce, Dukka,
+    intégrateurs sur mesure) qui veulent :
+
+    - Demander un devis d'expédition (national ou sous-régional CEDEAO).
+    - Souscrire une assurance colis.
+    - Recevoir en temps réel les événements de suivi via **webhook signé**.
+
+    ## Authentification
+
+    Toutes les routes requièrent le header `X-Api-Key: <keyId>.<secret>`.
+    La paire `keyId.secret` est fournie par le support SendProColis après
+    validation KYC du partenaire. Le serveur stocke `sha256(secret)` — le
+    secret lui-même n'est jamais conservé en clair côté SendProColis.
+
+    Le champ `scopes` de la clé contrôle les permissions :
+      - `shipments.read`  : lire les suivis.
+      - `shipments.write` : créer des devis / assurances.
+
+    ## Webhooks
+
+    Chaque événement est signé HMAC-SHA256 et envoyé par **POST** à
+    l'URL fournie par le partenaire. Le partenaire DOIT vérifier la
+    signature (voir §`WebhookVerification`). Format :
+
+    ```http
+    POST /your/endpoint HTTP/1.1
+    X-SendProColis-Signature: t=1700000000000,v1=<hex sha256>
+    X-SendProColis-Event: shipment.updated
+    X-SendProColis-Timestamp: 1700000000000
+    Content-Type: application/json
+
+    { "event": "...", "data": { ... }, "createdAt": "..." }
+    ```
+
+    Le partenaire DOIT répondre 2xx en < 5 s. Les réponses non-2xx
+    déclenchent un log côté SendProColis (retries exponentiels V2).
+
+servers:
+  - url: https://sendprocolis.com/api/v1
+    description: Production
+
+security:
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: Format `<keyId>.<secret>`
+
+  schemas:
+
+    InternationalEstimateRequest:
+      type: object
+      required: [originCountry, destinationCountry, weightKg]
+      properties:
+        originCountry:
+          type: string
+          minLength: 2
+          maxLength: 2
+          description: ISO 3166-1 alpha-2 (ex. `SN`, `ML`, `CI`).
+          example: SN
+        destinationCountry:
+          type: string
+          example: ML
+        weightKg:
+          type: number
+          format: float
+          minimum: 0.01
+          maximum: 50
+        displayCurrency:
+          type: string
+          enum: [XOF, GHS, NGN, MRU, GMD, EUR, USD]
+          default: XOF
+        declareValue:
+          type: boolean
+          description: Exige un document CN22/CN23 dans la liste de docs.
+          default: false
+
+    InternationalEstimateResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data:
+          type: object
+          properties:
+            quote:
+              oneOf:
+                - $ref: '#/components/schemas/InternationalQuote'
+                - $ref: '#/components/schemas/QuoteError'
+
+    InternationalQuote:
+      type: object
+      required: [ok, priceXof, displayCurrency, priceDisplay]
+      properties:
+        ok: { type: boolean, enum: [true] }
+        priceXof: { type: integer, example: 12500 }
+        priceDisplay: { type: number, example: 19.00 }
+        displayCurrency: { type: string, example: EUR }
+        customsSurchargeXof: { type: integer, example: 1500 }
+        crossBorder: { type: boolean }
+        slaDays: { type: integer, example: 4 }
+        requiredDocuments:
+          type: array
+          items: { type: string }
+          example: [invoice, cn22_or_cn23, sender_id]
+
+    QuoteError:
+      type: object
+      required: [ok, reason]
+      properties:
+        ok: { type: boolean, enum: [false] }
+        reason:
+          type: string
+          enum:
+            - disabled
+            - invalid_country
+            - invalid_weight
+            - overweight
+            - country_pair_not_served
+        maxWeightKg:
+          type: integer
+          description: Présent quand reason = overweight.
+
+    InsuranceQuoteRequest:
+      type: object
+      required: [declaredValueXof, parcelType]
+      properties:
+        declaredValueXof:
+          type: integer
+          minimum: 1
+          example: 100000
+        parcelType:
+          type: string
+          enum: [document, package, fragile, valuable, perishable]
+        crossBorder:
+          type: boolean
+          default: false
+
+    InsuranceQuote:
+      type: object
+      required: [ok, premiumXof, coverageXof]
+      properties:
+        ok: { type: boolean, enum: [true] }
+        premiumXof: { type: integer, example: 1500 }
+        coverageXof: { type: integer, example: 100000 }
+        coverageRate: { type: number, example: 0.015 }
+        crossBorder: { type: boolean }
+        exclusions:
+          type: array
+          items: { type: string }
+
+    ShipmentPublicPayload:
+      type: object
+      description: Payload envoyé dans les webhooks.
+      properties:
+        trackingNumber: { type: string, example: 'PC-20261111-ABCDE' }
+        status:
+          type: string
+          enum:
+            - pending
+            - confirmed
+            - picked_up
+            - in_transit
+            - arrived
+            - out_for_delivery
+            - delivered
+            - cancelled
+        weightKg: { type: number, nullable: true }
+        departureCity: { type: string, nullable: true }
+        arrivalCity: { type: string, nullable: true }
+        pickupDate: { type: string, format: date-time, nullable: true }
+        deliveryDate: { type: string, format: date-time, nullable: true }
+        estimatedDeliveryDate: { type: string, format: date-time, nullable: true }
+        updatedAt: { type: string, format: date-time, nullable: true }
+
+    WebhookEnvelope:
+      type: object
+      required: [event, data, createdAt]
+      properties:
+        event:
+          type: string
+          enum:
+            - shipment.updated
+            - shipment.delivered
+            - shipment.cancelled
+        data:
+          $ref: '#/components/schemas/ShipmentPublicPayload'
+        createdAt:
+          type: string
+          format: date-time
+
+    WebhookVerification:
+      description: |
+        Pseudo-code de vérification côté partenaire (Node.js) :
+
+        ```js
+        import { createHmac } from 'node:crypto';
+
+        function verify(req, secret) {
+          const header = req.headers['x-sendprocolis-signature'];
+          const [tsPart, v1Part] = header.split(',');
+          const ts = Number(tsPart.slice(2));
+          const v1 = v1Part.slice(3);
+          if (Math.abs(Date.now() - ts) > 5 * 60 * 1000) return false;
+          const expected = createHmac('sha256', secret)
+            .update(`${ts}.${req.rawBody}`)
+            .digest('hex');
+          return v1 === expected;
+        }
+        ```
+      type: object
+
+paths:
+
+  /parcels/international-estimate:
+    get:
+      summary: Devis d'expédition sous-régionale CEDEAO
+      description: |
+        Retourne le prix en XOF (devise pivot) et converti dans la devise
+        d'affichage choisie. Paires pays supportées en V1 : SN, ML, GN, MR,
+        GM, CI, BF (plus combinaisons symétriques).
+      parameters:
+        - in: query
+          name: originCountry
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 2 }
+        - in: query
+          name: destinationCountry
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 2 }
+        - in: query
+          name: weightKg
+          required: true
+          schema: { type: number, format: float }
+        - in: query
+          name: displayCurrency
+          schema: { type: string, default: XOF }
+        - in: query
+          name: declareValue
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: OK (succès métier ou refus structuré)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternationalEstimateResponse'
+
+  /parcels/insurance/quote:
+    post:
+      summary: Devis d'assurance colis
+      description: Retourne la prime à payer et le plafond d'indemnisation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InsuranceQuoteRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      quote:
+                        oneOf:
+                          - $ref: '#/components/schemas/InsuranceQuote'
+                          - $ref: '#/components/schemas/QuoteError'
+
+  /public/parcels/track/{trackingNumber}:
+    get:
+      summary: Suivi public d'un colis (lecture seule)
+      security: []
+      description: |
+        Endpoint existant, utilisable par les partenaires sans clé API via
+        le lien public de tracking. Inclut `eta` (prédiction dynamique) et
+        `anomalies` quand disponibles.
+      parameters:
+        - in: path
+          name: trackingNumber
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      parcel: { type: object }
+                      driverLocation: { type: object, nullable: true }
+                      eta: { type: object, nullable: true }
+                      anomalies:
+                        type: array
+                        items: { type: object }
+
+x-webhook-headers:
+  description: |
+    Headers envoyés par SendProColis sur chaque webhook sortant.
+  values:
+    'X-SendProColis-Signature': 't=<unixMs>,v1=<hex sha256>'
+    'X-SendProColis-Event': 'shipment.updated | shipment.delivered | shipment.cancelled'
+    'X-SendProColis-Timestamp': '<unixMs>'
+    'Content-Type': 'application/json'
+
+x-webhook-examples:
+  shipment_updated:
+    event: shipment.updated
+    data:
+      trackingNumber: PC-20261111-ABCDE
+      status: in_transit
+      departureCity: Dakar
+      arrivalCity: Thiès
+      updatedAt: '2026-11-11T13:30:00Z'
+    createdAt: '2026-11-11T13:30:00Z'
+
+x-acceptance-criteria:
+  - L'ajout d'un partenaire se fait en posant une entrée `apiKeys.business.<keyId>` dans SystemConfig avec `keyHash` (sha256 du secret), `partnerName`, `webhookUrl`, `webhookSecret`, `scopes`, `active: true`.
+  - Les secrets ne sont JAMAIS stockés en clair.
+  - Chaque webhook est signé HMAC-SHA256 avec le `webhookSecret` du partenaire.
+  - Le partenaire a 5 s pour répondre ; au-delà le webhook est marqué échoué.
+  - Les retries exponentiels ne sont PAS implémentés en V1 (à ajouter V2 via une queue).

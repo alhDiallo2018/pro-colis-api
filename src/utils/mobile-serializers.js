@@ -477,7 +477,14 @@ export function serializeParcel(parcel, options = {}) {
     media: parcel.media?.map(serializeMedia) || [],
     photoUrls: parcel.media?.filter((item) => item.mediaType === 'photo').map((item) => item.url) || [],
     videoUrls: parcel.media?.filter((item) => item.mediaType === 'video').map((item) => item.url) || [],
-    audioUrls: parcel.media?.filter((item) => item.mediaType === 'audio').map((item) => item.url) || []
+    audioUrls: parcel.media?.filter((item) => item.mediaType === 'audio').map((item) => item.url) || [],
+    // ETA prédictive dynamique, injectée par le controller quand elle est
+    // calculable. `null` sinon — le mobile retombe alors sur
+    // `estimatedDeliveryDate` (statique).
+    eta: options.eta ?? null,
+    // Anomalies trajet détectées à partir des positions GPS récentes :
+    // gps_silence, prolonged_stop, route_deviation. Tableau vide si aucune.
+    anomalies: options.anomalies ?? []
   };
 }
 

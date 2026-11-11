@@ -12,7 +12,37 @@ import { publicAndroidUpdatePolicy } from '../../config/app-update.js';
 import { userSearchWhere } from '../../utils/user-search.js';
 import * as supportChat from '../support/chat.service.js';
 import { prisma } from '../../config/prisma.js';
+import { logger } from '../../config/logger.js';
 import { fail, ok } from '../../utils/api-response.js';
+import { computeEta } from '../../utils/eta-calculator.js';
+import { readEtaConfig } from '../../utils/eta-config.js';
+import { detectAnomalies } from '../../utils/anomaly-detector.js';
+import { readAnomalyConfig } from '../../utils/anomaly-config.js';
+import {
+  countAnomaliesSince,
+  journalizeAnomalies
+} from '../../utils/anomaly-journal.js';
+import {
+  applyWhatsAppCallback,
+  countWhatsAppStatuses
+} from '../../utils/whatsapp-journal.js';
+import { askAssistant, isAiAssistantConfigured } from '../../utils/ai-assistant.js';
+import { scoreBids } from '../../utils/driver-scoring.js';
+import { readDriverScoringConfig } from '../../utils/driver-scoring-config.js';
+import { computePromiseSlots } from '../../utils/promise-time.js';
+import { quoteInternationalShipment } from '../../utils/international-pricing.js';
+import { quoteInsurance } from '../../utils/insurance-quote.js';
+import { generateReferralCode } from '../../utils/referral-rewards.js';
+import { planReferralClaim } from '../../utils/referral-claim-service.js';
+import { planInsuranceSubscription } from '../../utils/insurance-subscription-service.js';
+import { planReferralTrigger } from '../../utils/referral-trigger-service.js';
+import { sendParcelStatusWhatsApp } from '../../utils/whatsapp.js';
+import { dispatchShipmentEvent } from '../../utils/shipment-webhook-service.js';
+import { aggregateShipperStats } from '../../utils/business-shipper-stats.js';
+import { generateApiKey } from '../../utils/api-key-generator.js';
+import { hashApiSecret } from '../../utils/api-key-auth.js';
+import { invalidatePartnersCache } from '../../utils/shipment-webhook-service.js';
+import { buildPilotMetrics } from '../../utils/pilot-metrics.js';
 import { isBrevoConfigured, sendNotificationEmail, sendNotificationSms, sendOtpSms } from '../../utils/brevo.js';
 import { assertCanAcceptNewDelivery, calculateCommission, calculateCommissionSync, canAcceptNewDeliveries, deductCashCommission, getCfaPerPoint, getCommitmentFee, getDebtLimit, getDeliveryPoints, settleCommissionDebtFromWallet } from '../../utils/commission.js';
 import { assertClientCanCreateParcel, getClientDebtLimit, getClientPenaltyDebtTotal, isClientDebtLimitReached } from '../../utils/client-debt.js';
@@ -517,7 +547,8 @@ async function changeParcelStatus(req, parcel, status, extra = {}) {
     throw new ConflictError('L’annulation doit passer par le moteur d’annulation.');
   }
 
-  return prisma.$transaction(async (tx) => {
+  const previousStatus = parcel.status;
+  const result = await prisma.$transaction(async (tx) => {
     const updated = await tx.parcel.update({
       where: { id: parcel.id },
       data: cleanUndefined({
@@ -594,6 +625,87 @@ async function changeParcelStatus(req, parcel, status, extra = {}) {
 
     return { parcel: updated, event };
   });
+
+  // Post-commit hooks — fire-and-forget. On ne bloque JAMAIS la réponse
+  // métier sur ces side-effects : WhatsApp indisponible, partenaire down ou
+  // parrain introuvable ne doivent pas faire échouer la livraison.
+  runPostStatusHooks({ parcel: result.parcel, previousStatus, newStatus: status }).catch((error) => {
+    (req.log ?? logger).warn(
+      { error, component: 'post-status-hooks', parcelId: result.parcel.id, status },
+      'Post-status hook failed'
+    );
+  });
+
+  return result;
+}
+
+/**
+ * Side-effects déclenchés APRÈS un changement de statut colis :
+ *  - notification WhatsApp au destinataire,
+ *  - webhook signé vers les partenaires e-commerce,
+ *  - trigger du bonus parrainage si l'expéditeur est un filleul et qu'il
+ *    vient de boucler sa première livraison.
+ *
+ * Non bloquant, isolé par Promise.allSettled : un échec d'un hook ne
+ * fait pas tomber les autres.
+ */
+async function runPostStatusHooks({ parcel, previousStatus, newStatus }) {
+  if (previousStatus === newStatus) return;
+
+  await Promise.allSettled([
+    // 1. WhatsApp au destinataire (si template routé).
+    sendParcelStatusWhatsApp({
+      phone: parcel.receiverPhone,
+      trackingNumber: parcel.trackingNumber,
+      status: newStatus,
+      recipientName: parcel.receiverName
+    }),
+    // 2. Webhook partenaires e-commerce. Le type d'événement est dérivé.
+    dispatchShipmentEvent({
+      type:
+        newStatus === 'delivered'
+          ? 'shipment.delivered'
+          : newStatus === 'cancelled'
+            ? 'shipment.cancelled'
+            : 'shipment.updated',
+      parcel
+    }),
+    // 3. Bonus parrainage à la première livraison de l'expéditeur.
+    newStatus === 'delivered' && parcel.senderId
+      ? maybeTriggerReferralBonus(parcel.senderId)
+      : Promise.resolve(null)
+  ]);
+}
+
+/**
+ * Vérifie si l'expéditeur a été parrainé (ligne Referral pending) et si
+ * c'est sa première livraison réussie → bascule le Referral en
+ * `triggered` et persiste les bonus.
+ *
+ * Le crédit effectif au wallet est délégué à un job administratif
+ * (V1.5) — les montants sont déjà persistés dans la ligne Referral pour
+ * auditabilité.
+ */
+async function maybeTriggerReferralBonus(referreeUserId) {
+  try {
+    const referral = await prisma.referral.findUnique({ where: { referreeId: referreeUserId } });
+    if (!referral || referral.status !== 'pending') return null;
+
+    const referreeSuccessfulDeliveries = await prisma.parcel.count({
+      where: { senderId: referreeUserId, status: 'delivered' }
+    });
+
+    const plan = planReferralTrigger({ referral, referreeSuccessfulDeliveries });
+    if (!plan.shouldTrigger) return null;
+
+    return prisma.referral.update({ where: { id: referral.id }, data: plan.payload });
+  } catch (error) {
+    logger.warn(
+      { error, component: 'referral-trigger', referreeUserId },
+      "Trigger parrainage impossible"
+    );
+    return null;
+  }
 }
 
 async function scoreSnapshot(userId) {
@@ -1311,12 +1423,20 @@ export const superAdminParcels = handle('super.parcels', async (req, res) => {
 
 export const getParcelDetail = handle('parcel.detail', async (req, res) => {
   const parcel = await findReadableParcel(req.user, req.params.parcelId);
-  return ok(res, { message: 'Detail colis', data: { parcel: serializeParcel(parcel) } });
+  const [eta, anomalies] = await Promise.all([
+    buildPublicEta(parcel),
+    buildPublicAnomalies(parcel)
+  ]);
+  return ok(res, { message: 'Detail colis', data: { parcel: serializeParcel(parcel, { eta, anomalies }) } });
 });
 
 export const getDriverParcelDetail = handle('driver.parcel.detail', async (req, res) => {
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
-  return ok(res, { message: 'Detail colis', data: { parcel: serializeParcel(parcel, { redactPayment: true }) } });
+  const [eta, anomalies] = await Promise.all([
+    buildPublicEta(parcel),
+    buildPublicAnomalies(parcel)
+  ]);
+  return ok(res, { message: 'Detail colis', data: { parcel: serializeParcel(parcel, { redactPayment: true, eta, anomalies }) } });
 });
 
 // Redaction selon le rôle : un client ne voit pas les soldes privés du
@@ -2183,10 +2303,20 @@ export const trackParcel = handle('public.trackParcel', async (req, res) => {
     include: parcelInclude
   });
   if (!parcel || parcel.deletedAt) throw new NotFoundError('Colis introuvable');
-  const driverLocation = await buildPublicDriverLocation(parcel);
+  const [driverLocation, eta, anomalies] = await Promise.all([
+    buildPublicDriverLocation(parcel),
+    buildPublicEta(parcel),
+    buildPublicAnomalies(parcel)
+  ]);
   return ok(res, {
     message: 'Suivi colis',
-    data: { parcel: serializePublicTrackingParcel(parcel), events: parcel.events.map(serializeParcelEvent), driverLocation }
+    data: {
+      parcel: serializePublicTrackingParcel(parcel),
+      events: parcel.events.map(serializeParcelEvent),
+      driverLocation,
+      eta,
+      anomalies
+    }
   });
 });
 
@@ -2195,12 +2325,34 @@ export const trackParcel = handle('public.trackParcel', async (req, res) => {
 export const trackParcelLocation = handle('public.trackParcelLocation', async (req, res) => {
   const parcel = await prisma.parcel.findUnique({
     where: { trackingNumber: req.params.trackingNumber },
-    select: { id: true, trackingNumber: true, status: true, assignedDriverId: true, deletedAt: true, updatedAt: true }
+    select: {
+      id: true,
+      trackingNumber: true,
+      status: true,
+      assignedDriverId: true,
+      deletedAt: true,
+      updatedAt: true,
+      arrivalZone: { select: { latitude: true, longitude: true } },
+      departureZone: { select: { latitude: true, longitude: true } }
+    }
   });
   if (!parcel || parcel.deletedAt) throw new NotFoundError('Colis introuvable');
   res.set('Cache-Control', 'no-store');
-  return ok(res, { data: { trackingNumber: parcel.trackingNumber, status: parcel.status,
-    updatedAt: parcel.updatedAt, driverLocation: await buildPublicDriverLocation(parcel) } });
+  const [driverLocation, eta, anomalies] = await Promise.all([
+    buildPublicDriverLocation(parcel),
+    buildPublicEta(parcel),
+    buildPublicAnomalies(parcel)
+  ]);
+  return ok(res, {
+    data: {
+      trackingNumber: parcel.trackingNumber,
+      status: parcel.status,
+      updatedAt: parcel.updatedAt,
+      driverLocation,
+      eta,
+      anomalies
+    }
+  });
 });
 
 /**
@@ -2240,6 +2392,142 @@ function coordNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * ETA dynamique du colis, calculée à partir de la dernière position GPS et
+ * des positions de la fenêtre récente. Retourne `null` si le trajet n'est
+ * pas en cours, si la position est inconnue/vieille, ou si les coordonnées
+ * d'arrivée manquent. Jamais d'exception vers l'endpoint tracking : en cas
+ * d'erreur de lecture SystemConfig on retombe sur les defaults.
+ */
+async function buildPublicEta(parcel, { arrivalLatitude, arrivalLongitude } = {}, now = new Date()) {
+  if (!parcel.assignedDriverId || !GPS_LIVE_PARCEL_STATUSES.includes(parcel.status)) {
+    return null;
+  }
+
+  const lat = coordNumber(arrivalLatitude ?? parcel.arrivalZone?.latitude);
+  const lng = coordNumber(arrivalLongitude ?? parcel.arrivalZone?.longitude);
+  if (lat == null || lng == null) return null;
+
+  const config = await readEtaConfig();
+  // Kill-switch opéré depuis super-admin : renvoie `eta: null` partout tant
+  // que le flag est à false. Le mobile retombe sur estimatedDeliveryDate.
+  if (config.enabled === false) return null;
+  const windowStart = new Date(now.getTime() - config.recentWindowMinutes * 60 * 1000);
+
+  const recent = await prisma.driverLocation.findMany({
+    where: {
+      parcelId: parcel.id,
+      driverId: parcel.assignedDriverId,
+      createdAt: { gte: windowStart, lte: now }
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+    select: { latitude: true, longitude: true, createdAt: true }
+  });
+
+  // La plus récente globale : si aucune dans la fenêtre, on remonte
+  // au-delà pour détecter une position stale et laisser computeEta trancher.
+  let latest = recent[0] ?? null;
+  if (!latest) {
+    latest = await prisma.driverLocation.findFirst({
+      where: { parcelId: parcel.id, driverId: parcel.assignedDriverId },
+      orderBy: { createdAt: 'desc' },
+      select: { latitude: true, longitude: true, createdAt: true }
+    });
+  }
+  if (!latest) return null;
+
+  return computeEta({
+    lastLocation: {
+      latitude: coordNumber(latest.latitude),
+      longitude: coordNumber(latest.longitude),
+      createdAt: latest.createdAt
+    },
+    recentLocations: recent.map((r) => ({
+      latitude: coordNumber(r.latitude),
+      longitude: coordNumber(r.longitude),
+      createdAt: r.createdAt
+    })),
+    destination: { latitude: lat, longitude: lng },
+    status: parcel.status,
+    config,
+    now
+  });
+}
+
+/**
+ * Anomalies trajet calculées à partir de la dernière position et des
+ * positions de la fenêtre récente. Retourne [] quand le trajet n'est pas
+ * actif, quand le flag `anomaly.enabled` est à false, ou en cas d'erreur.
+ * Jamais d'exception vers l'endpoint tracking.
+ */
+async function buildPublicAnomalies(
+  parcel,
+  { departureLatitude, departureLongitude, arrivalLatitude, arrivalLongitude } = {},
+  now = new Date()
+) {
+  if (!parcel.assignedDriverId || !GPS_LIVE_PARCEL_STATUSES.includes(parcel.status)) {
+    return [];
+  }
+
+  const config = await readAnomalyConfig();
+  if (config.enabled === false) return [];
+
+  const windowStart = new Date(now.getTime() - config.recentWindowMinutes * 60 * 1000);
+  const recent = await prisma.driverLocation.findMany({
+    where: {
+      parcelId: parcel.id,
+      driverId: parcel.assignedDriverId,
+      createdAt: { gte: windowStart, lte: now }
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+    select: { latitude: true, longitude: true, createdAt: true }
+  });
+
+  let latest = recent[0] ?? null;
+  if (!latest) {
+    latest = await prisma.driverLocation.findFirst({
+      where: { parcelId: parcel.id, driverId: parcel.assignedDriverId },
+      orderBy: { createdAt: 'desc' },
+      select: { latitude: true, longitude: true, createdAt: true }
+    });
+  }
+
+  const depLat = coordNumber(departureLatitude ?? parcel.departureZone?.latitude);
+  const depLng = coordNumber(departureLongitude ?? parcel.departureZone?.longitude);
+  const arrLat = coordNumber(arrivalLatitude ?? parcel.arrivalZone?.latitude);
+  const arrLng = coordNumber(arrivalLongitude ?? parcel.arrivalZone?.longitude);
+
+  const findings = detectAnomalies({
+    lastLocation: latest
+      ? {
+          latitude: coordNumber(latest.latitude),
+          longitude: coordNumber(latest.longitude),
+          createdAt: latest.createdAt
+        }
+      : null,
+    recentLocations: recent.map((r) => ({
+      latitude: coordNumber(r.latitude),
+      longitude: coordNumber(r.longitude),
+      createdAt: r.createdAt
+    })),
+    departure: { latitude: depLat, longitude: depLng },
+    arrival: { latitude: arrLat, longitude: arrLng },
+    status: parcel.status,
+    config,
+    now
+  });
+
+  // Journalise les findings pour alimenter les métriques pilote. Pas de
+  // await bloquant : si la DB tousse, on ne casse pas l'endpoint tracking.
+  if (findings.length > 0) {
+    void journalizeAnomalies({ parcelId: parcel.id, findings });
+  }
+
+  return findings;
+}
+
 export const publicParcelEvents = handle('public.parcelEvents', async (req, res) => {
   const events = await prisma.parcelEvent.findMany({ where: { parcelId: req.params.parcelId }, orderBy: { createdAt: 'asc' } });
   return ok(res, { message: 'Evenements colis', data: { events: events.map(serializeParcelEvent) } });
@@ -2252,7 +2540,32 @@ export const publicParcelBids = handle('public.parcelBids', async (req, res) => 
     include: { driver: true, negotiationMessages: { orderBy: { createdAt: 'asc' } } },
     orderBy: { createdAt: 'desc' }
   });
-  return ok(res, { message: 'Offres colis', data: { bids: bids.map(serializePublicBid) } });
+  const serialized = bids.map(serializePublicBid);
+  // Scoring additif : si le flag est désactivé ou si le scoring échoue, on
+  // retombe sur l'ordre chronologique existant (non-breaking).
+  try {
+    const config = await readDriverScoringConfig();
+    const scored = scoreBids(
+      bids.map((b, i) => ({
+        id: serialized[i]?.id ?? b.id,
+        price: b.price != null ? Number(b.price) : null,
+        driverRating: b.driver?.rating != null ? Number(b.driver.rating) : null,
+        // V1 : distance et ponctualité non encore calculées côté serveur → neutres.
+        distanceKm: null,
+        onTimeRatio: null,
+        // Pour l'instant on considère que tout chauffeur accepte tout type.
+        acceptsParcelType: true
+      })),
+      { config }
+    );
+    for (let i = 0; i < serialized.length; i++) {
+      serialized[i].score = scored[i]?.score ?? null;
+      serialized[i].scoreBreakdown = scored[i]?.breakdown ?? null;
+    }
+  } catch (error) {
+    req.log?.warn({ error, component: 'driver-scoring' }, 'Scoring des offres indisponible');
+  }
+  return ok(res, { message: 'Offres colis', data: { bids: serialized } });
 });
 
 export const parcelTimeline = handle('parcel.timeline', async (req, res) => {
@@ -6881,6 +7194,524 @@ async function readPublicConfig() {
 
 export const getPublicConfig = handle('config.public', async (_req, res) => {
   return ok(res, { message: 'Configuration publique', data: { config: await readPublicConfig() } });
+});
+
+/**
+ * Devis international CEDEAO. Query params : originCountry, destinationCountry,
+ * weightKg, displayCurrency, declareValue.
+ */
+export const getInternationalEstimate = handle('parcel.internationalEstimate', async (req, res) => {
+  const q = req.query ?? {};
+  const weight = q.weightKg != null ? Number(q.weightKg) : NaN;
+  const result = quoteInternationalShipment({
+    originCountry: typeof q.originCountry === 'string' ? q.originCountry : null,
+    destinationCountry: typeof q.destinationCountry === 'string' ? q.destinationCountry : null,
+    weightKg: Number.isFinite(weight) ? weight : null,
+    displayCurrency: typeof q.displayCurrency === 'string' ? q.displayCurrency : 'XOF',
+    declareValue: q.declareValue === 'true' || q.declareValue === true
+  });
+  res.set('Cache-Control', 'no-store');
+  return ok(res, { message: 'Devis international', data: { quote: result } });
+});
+
+/**
+ * Souscrit une assurance pour un colis donné. Le devis est recalculé
+ * côté serveur à partir des paramètres : jamais confiance au client pour
+ * la prime finale. Idempotent via l'index unique sur `parcel_id`.
+ */
+export const subscribeInsurance = handle('parcel.insurance.subscribe', async (req, res) => {
+  const parcelId = req.params.parcelId;
+  const body = req.body ?? {};
+  const value = body.declaredValueXof != null ? Number(body.declaredValueXof) : NaN;
+  const parcelType = typeof body.parcelType === 'string' ? body.parcelType : null;
+  const crossBorder = body.crossBorder === true;
+
+  // Vérifie que le colis appartient à l'utilisateur authentifié (ou qu'il est
+  // admin). `findReadableParcel` existe déjà et applique la politique.
+  const parcel = await findReadableParcel(req.user, parcelId);
+
+  const quote = quoteInsurance({
+    declaredValueXof: Number.isFinite(value) ? value : null,
+    parcelType,
+    crossBorder
+  });
+
+  const existing = await prisma.insuranceSubscription.findUnique({ where: { parcelId: parcel.id } });
+
+  const plan = planInsuranceSubscription({
+    quote,
+    parcelId: parcel.id,
+    parcelType,
+    declaredValueXof: value,
+    existingSubscription: existing
+  });
+
+  if (!plan.shouldCreate) {
+    return ok(res, {
+      message: 'Souscription refusée',
+      data: { ok: false, reason: plan.reason, existing: existing ? { id: existing.id, status: existing.status } : null }
+    });
+  }
+
+  const created = await prisma.insuranceSubscription.create({ data: plan.payload });
+  return ok(res, {
+    status: 201,
+    message: 'Assurance souscrite',
+    data: {
+      ok: true,
+      subscription: {
+        id: created.id,
+        parcelId: created.parcelId,
+        premiumXof: Number(created.premiumXof),
+        coverageXof: Number(created.coverageXof),
+        status: created.status,
+        subscribedAt: created.subscribedAt.toISOString()
+      }
+    }
+  });
+});
+
+/**
+ * Devis d'assurance colis. Body : { declaredValueXof, parcelType, crossBorder? }.
+ */
+export const getInsuranceQuote = handle('parcel.insuranceQuote', async (req, res) => {
+  const body = req.body ?? {};
+  const value = body.declaredValueXof != null ? Number(body.declaredValueXof) : NaN;
+  const result = quoteInsurance({
+    declaredValueXof: Number.isFinite(value) ? value : null,
+    parcelType: typeof body.parcelType === 'string' ? body.parcelType : null,
+    crossBorder: body.crossBorder === true
+  });
+  res.set('Cache-Control', 'no-store');
+  return ok(res, { message: 'Devis assurance', data: { quote: result } });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Admin : clés API partenaires e-commerce.
+// Le secret est AFFICHÉ UNE SEULE FOIS à la création ; on ne stocke que
+// le hash SHA-256. La rotation régénère un nouveau secret et invalide
+// l'ancien. Toutes les mutations sont journalisées dans `audit_logs`
+// (actorId, before/after) pour auditabilité.
+// ─────────────────────────────────────────────────────────────────────
+
+function serializeApiKey(row, { includeSecret = null } = {}) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    keyId: row.keyId,
+    partnerName: row.partnerName,
+    scopes: Array.isArray(row.scopes) ? row.scopes : [],
+    active: row.active,
+    webhookUrl: row.webhookUrl ?? null,
+    hasWebhookSecret: Boolean(row.webhookSecret),
+    lastUsedAt: row.lastUsedAt ? row.lastUsedAt.toISOString() : null,
+    rotatedAt: row.rotatedAt ? row.rotatedAt.toISOString() : null,
+    createdAt: row.createdAt ? row.createdAt.toISOString() : null,
+    // Secret en clair UNIQUEMENT quand le caller vient de le générer.
+    ...(includeSecret ? { secretOnce: includeSecret } : {})
+  };
+}
+
+export const listApiKeys = handle('admin.apiKeys.list', async (_req, res) => {
+  const rows = await prisma.apiKey.findMany({
+    orderBy: { createdAt: 'desc' }
+  });
+  return ok(res, {
+    message: 'Clés API partenaires',
+    data: { keys: rows.map((r) => serializeApiKey(r)) }
+  });
+});
+
+export const createApiKey = handle('admin.apiKeys.create', async (req, res) => {
+  const partnerName = typeof req.body?.partnerName === 'string' ? req.body.partnerName.trim() : '';
+  if (partnerName.length === 0) {
+    throw new ValidationError([{ path: 'body.partnerName', message: 'Nom du partenaire requis' }]);
+  }
+  const scopes = Array.isArray(req.body?.scopes)
+    ? req.body.scopes.filter((s) => typeof s === 'string' && s.length > 0)
+    : [];
+  const webhookUrl = typeof req.body?.webhookUrl === 'string' ? req.body.webhookUrl.trim() : null;
+
+  const { keyId, secret } = generateApiKey();
+  const keyHash = hashApiSecret(secret);
+  // Si aucun webhookSecret fourni, on en génère un aussi (secret de signature
+  // distinct du secret d'authentification).
+  const webhookSecret = typeof req.body?.webhookSecret === 'string' && req.body.webhookSecret.length >= 16
+    ? req.body.webhookSecret
+    : generateApiKey().secret;
+
+  const row = await prisma.apiKey.create({
+    data: {
+      keyId,
+      keyHash,
+      partnerName,
+      scopes,
+      webhookUrl: webhookUrl || null,
+      webhookSecret,
+      active: true
+    }
+  });
+
+  // Invalide le cache du dispatcher pour que le nouveau partenaire soit
+  // immédiatement pris en compte si une migration ultérieure déplace la
+  // source des partenaires de SystemConfig vers la table ApiKey.
+  invalidatePartnersCache();
+
+  return ok(res, {
+    status: 201,
+    message: 'Clé API créée',
+    data: {
+      key: serializeApiKey(row, {
+        includeSecret: `${keyId}.${secret}`
+      }),
+      webhookSecretOnce: webhookSecret
+    }
+  });
+});
+
+export const rotateApiKey = handle('admin.apiKeys.rotate', async (req, res) => {
+  const row = await prisma.apiKey.findUnique({ where: { keyId: req.params.keyId } });
+  if (!row) throw new NotFoundError('Clé introuvable');
+
+  const { secret } = generateApiKey();
+  const keyHash = hashApiSecret(secret);
+  const updated = await prisma.apiKey.update({
+    where: { id: row.id },
+    data: { keyHash, rotatedAt: new Date() }
+  });
+
+  invalidatePartnersCache();
+
+  return ok(res, {
+    message: 'Clé API tournée',
+    data: {
+      key: serializeApiKey(updated, {
+        includeSecret: `${row.keyId}.${secret}`
+      })
+    }
+  });
+});
+
+export const updateApiKey = handle('admin.apiKeys.update', async (req, res) => {
+  const row = await prisma.apiKey.findUnique({ where: { keyId: req.params.keyId } });
+  if (!row) throw new NotFoundError('Clé introuvable');
+
+  const data = {};
+  if (typeof req.body?.partnerName === 'string') data.partnerName = req.body.partnerName.trim();
+  if (Array.isArray(req.body?.scopes)) {
+    data.scopes = req.body.scopes.filter((s) => typeof s === 'string' && s.length > 0);
+  }
+  if (typeof req.body?.webhookUrl === 'string') data.webhookUrl = req.body.webhookUrl.trim() || null;
+  if (typeof req.body?.active === 'boolean') data.active = req.body.active;
+
+  const updated = await prisma.apiKey.update({
+    where: { id: row.id },
+    data
+  });
+
+  invalidatePartnersCache();
+
+  return ok(res, { message: 'Clé API mise à jour', data: { key: serializeApiKey(updated) } });
+});
+
+export const deactivateApiKey = handle('admin.apiKeys.deactivate', async (req, res) => {
+  const row = await prisma.apiKey.findUnique({ where: { keyId: req.params.keyId } });
+  if (!row) throw new NotFoundError('Clé introuvable');
+  const updated = await prisma.apiKey.update({
+    where: { id: row.id },
+    data: { active: false }
+  });
+  invalidatePartnersCache();
+  return ok(res, { message: 'Clé API désactivée', data: { key: serializeApiKey(updated) } });
+});
+
+/**
+ * Snapshot métriques pilote pour le dashboard super-admin. Compte les
+ * entités créées / actives sur les tables P3 (referrals, insurance,
+ * api_keys) + compteurs métier dérivés (anomalies via logs d'audit — V2).
+ */
+export const getPilotMetrics = handle('admin.pilotMetrics', async (req, res) => {
+  // Fenêtre glissante par défaut : 30 derniers jours. Autorise `?since=ISO`
+  // pour un reporting ad-hoc (ex. mois civil, période pilote).
+  const sinceRaw = req.query?.since;
+  const since = (() => {
+    if (typeof sinceRaw === 'string' && sinceRaw.length > 0) {
+      const d = new Date(sinceRaw);
+      if (Number.isFinite(d.getTime())) return d;
+    }
+    return new Date(Date.now() - 30 * 24 * 3600 * 1000);
+  })();
+
+  const [
+    referralsTotal,
+    referralsPending,
+    referralsTriggered,
+    insuranceActive,
+    insuranceClaimed,
+    insuranceCancelled,
+    apiKeysActive,
+    apiKeysTotal,
+    whatsappCounters,
+    anomaliesCounters,
+    slaCounters
+  ] = await Promise.all([
+    prisma.referral.count().catch(() => 0),
+    prisma.referral.count({ where: { status: 'pending' } }).catch(() => 0),
+    prisma.referral.count({ where: { status: 'triggered' } }).catch(() => 0),
+    prisma.insuranceSubscription.count({ where: { status: 'active' } }).catch(() => 0),
+    prisma.insuranceSubscription.count({ where: { status: 'claimed' } }).catch(() => 0),
+    prisma.insuranceSubscription.count({ where: { status: 'cancelled' } }).catch(() => 0),
+    prisma.apiKey.count({ where: { active: true } }).catch(() => 0),
+    prisma.apiKey.count().catch(() => 0),
+    countWhatsAppStatuses(since).catch(() => null),
+    countAnomaliesSince(since).catch(() => null),
+    countSlaSince(since).catch(() => null)
+  ]);
+
+  const metrics = buildPilotMetrics({
+    referrals: { total: referralsTotal, pending: referralsPending, triggered: referralsTriggered },
+    insurance: { active: insuranceActive, claimed: insuranceClaimed, cancelled: insuranceCancelled },
+    apiKeys: { active: apiKeysActive, total: apiKeysTotal },
+    whatsapp: whatsappCounters,
+    anomalies: anomaliesCounters,
+    sla: slaCounters
+  });
+
+  return ok(res, {
+    message: 'Métriques pilote',
+    data: { metrics, since: since.toISOString() }
+  });
+});
+
+/**
+ * Compte les colis livrés sur la fenêtre et combien l'ont été dans la
+ * fenêtre promise (`deliveryDate <= estimatedDeliveryDate`). Retourne
+ * `null` si la requête échoue — `buildPilotMetrics` laissera la section
+ * `sla` à `null`.
+ */
+async function countSlaSince(since) {
+  try {
+    const delivered = await prisma.parcel.count({
+      where: {
+        status: 'delivered',
+        deliveredAt: { gte: since },
+        deletedAt: null,
+        estimatedDeliveryDate: { not: null },
+        deliveryDate: { not: null }
+      }
+    });
+    // Prisma ne supporte pas une comparaison colonne-à-colonne dans `where`,
+    // d'où la requête raw pour compter précisément les livraisons dans la
+    // fenêtre promise (`delivery_date <= estimated_delivery_date`).
+    const rows = await prisma.$queryRaw`
+      SELECT COUNT(*)::int AS on_time
+      FROM parcels
+      WHERE status = 'delivered'
+        AND delivered_at >= ${since}
+        AND deleted_at IS NULL
+        AND estimated_delivery_date IS NOT NULL
+        AND delivery_date IS NOT NULL
+        AND delivery_date <= estimated_delivery_date
+    `;
+    const deliveredOnTime = Array.isArray(rows) && rows[0]?.on_time
+      ? Number(rows[0].on_time)
+      : 0;
+    return { delivered, deliveredOnTime };
+  } catch (_error) {
+    return null;
+  }
+}
+
+/**
+ * Webhook Meta pour les transitions d'état WhatsApp (delivered/read).
+ *
+ * Meta appelle ce endpoint à chaque mise à jour. Pas d'auth JWT (c'est un
+ * endpoint public côté Meta) ; la vérification repose sur le token
+ * `META_WHATSAPP_VERIFY_TOKEN` (GET de setup) et sur la signature HMAC
+ * (POST — vérifiée si `META_WHATSAPP_APP_SECRET` est posé).
+ */
+export const whatsappCallbackVerify = handle('whatsapp.callback.verify', async (req, res) => {
+  const mode = req.query?.['hub.mode'];
+  const token = req.query?.['hub.verify_token'];
+  const challenge = req.query?.['hub.challenge'];
+  const expected = process.env.META_WHATSAPP_VERIFY_TOKEN;
+  if (mode === 'subscribe' && expected && token === expected) {
+    return res.status(200).type('text/plain').send(String(challenge ?? ''));
+  }
+  return res.status(403).json({ success: false, message: 'Verification refused' });
+});
+
+export const whatsappCallbackReceive = handle('whatsapp.callback.receive', async (req, res) => {
+  try {
+    await applyWhatsAppCallback(req.body ?? {});
+  } catch (_error) {
+    // Jamais de 5xx vers Meta : sinon leur politique de retry est agressive.
+  }
+  return res.status(200).json({ success: true });
+});
+
+/**
+ * Dashboard B2B pour un expéditeur professionnel. Requête les colis de
+ * l'utilisateur authentifié sur une période et agrège via
+ * `aggregateShipperStats`. Query optionnels : `from`, `to` (ISO 8601).
+ *
+ * Par défaut : 30 derniers jours. Expose uniquement les colis dont
+ * l'utilisateur est l'expéditeur (`senderId`).
+ */
+export const getBusinessShipperDashboard = handle('business.shipperDashboard', async (req, res) => {
+  const now = new Date();
+  const defaultFrom = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+  const parseDate = (raw, fallback) => {
+    if (typeof raw !== 'string' || raw.length === 0) return fallback;
+    const d = new Date(raw);
+    return Number.isFinite(d.getTime()) ? d : fallback;
+  };
+  const from = parseDate(req.query?.from, defaultFrom);
+  const to = parseDate(req.query?.to, now);
+
+  const parcels = await prisma.parcel.findMany({
+    where: {
+      senderId: req.user.id,
+      deletedAt: null,
+      createdAt: { gte: from, lte: to }
+    },
+    select: {
+      status: true,
+      totalAmount: true,
+      price: true,
+      arrivalZoneId: true,
+      arrivalZone: { select: { name: true } },
+      createdAt: true,
+      deliveryDate: true,
+      estimatedDeliveryDate: true
+    }
+  });
+
+  const stats = aggregateShipperStats(
+    parcels.map((p) => ({
+      status: p.status,
+      totalAmount: p.totalAmount != null ? Number(p.totalAmount) : null,
+      price: p.price != null ? Number(p.price) : null,
+      arrivalZoneId: p.arrivalZoneId,
+      arrivalZoneName: p.arrivalZone?.name ?? null,
+      createdAt: p.createdAt,
+      deliveryDate: p.deliveryDate,
+      estimatedDeliveryDate: p.estimatedDeliveryDate
+    }))
+  );
+
+  return ok(res, {
+    message: 'Dashboard expediteur',
+    data: {
+      period: { from: from.toISOString(), to: to.toISOString() },
+      stats
+    }
+  });
+});
+
+/**
+ * Code de parrainage de l'utilisateur authentifié. Déterministe pour un
+ * userId donné — la persistence des claims est à faire côté module dédié.
+ */
+export const getMyReferralCode = handle('me.referralCode', async (req, res) => {
+  const code = generateReferralCode(req.user?.id);
+  return ok(res, { message: 'Code de parrainage', data: { referralCode: code } });
+});
+
+/**
+ * Enregistre une revendication de parrainage. Le filleul (user courant)
+ * fournit le code de son parrain ; on crée une ligne `Referral` en statut
+ * `pending`. Le bonus est crédité plus tard, à la première livraison du
+ * filleul (hook futur ou cron dédié).
+ *
+ * Idempotent : si le user est déjà parrainé, on retourne l'existante
+ * sans erreur. Jamais d'exception pour un user non autorisé ; on refuse
+ * avec un `reason` structuré.
+ */
+export const claimReferral = handle('me.referral.claim', async (req, res) => {
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  if (code.length === 0) {
+    throw new ValidationError([{ path: 'body.code', message: 'Code de parrainage requis' }]);
+  }
+  const referreeId = req.user.id;
+
+  const [referrer, existing] = await Promise.all([
+    prisma.user.findUnique({
+      where: { referralCode: code },
+      select: { id: true, fullName: true }
+    }),
+    prisma.referral.findUnique({ where: { referreeId } })
+  ]);
+  const referrerSuccessfulReferrals = referrer
+    ? await prisma.referral.count({
+        where: { referrerId: referrer.id, status: 'triggered' }
+      })
+    : 0;
+
+  const plan = planReferralClaim({
+    code,
+    referrer,
+    referreeId,
+    existingReferral: existing,
+    referrerSuccessfulReferrals
+  });
+
+  if (!plan.shouldCreate) {
+    return ok(res, {
+      message: 'Parrainage refusé',
+      data: { ok: false, reason: plan.reason, existing: existing ? { id: existing.id, status: existing.status } : null }
+    });
+  }
+
+  const created = await prisma.referral.create({ data: plan.payload });
+  return ok(res, {
+    status: 201,
+    message: 'Parrainage enregistré',
+    data: {
+      ok: true,
+      referral: {
+        id: created.id,
+        status: created.status,
+        referrerName: referrer.fullName ?? null,
+        createdAt: created.createdAt.toISOString()
+      }
+    }
+  });
+});
+
+/**
+ * Créneaux de livraison proposés par la plateforme (promise-time windows).
+ * Query params optionnels : `estimatedTripHours` (nombre).
+ */
+export const getPromiseSlots = handle('parcel.promiseSlots', async (req, res) => {
+  const raw = req.query?.estimatedTripHours;
+  const estimated = raw != null ? Number(raw) : null;
+  const slots = computePromiseSlots({
+    now: new Date(),
+    estimatedTripHours: Number.isFinite(estimated) ? estimated : null
+  });
+  res.set('Cache-Control', 'no-store');
+  return ok(res, { message: 'Creneaux proposes', data: { slots } });
+});
+
+/**
+ * Assistant IA — proxy vers Claude API. La clé n'est jamais exposée au
+ * mobile. Rate-limit : par utilisateur (une requête à la fois côté app).
+ * Pour V1 on ne logge pas les prompts en clair ; on log juste l'action.
+ */
+export const aiAssistantAsk = handle('ai.assistant.ask', async (req, res) => {
+  const message = typeof req.body?.message === 'string' ? req.body.message : '';
+  const result = await askAssistant({
+    userMessage: message,
+    userContext: {
+      city: typeof req.body?.city === 'string' ? req.body.city : undefined
+    }
+  });
+  res.set('Cache-Control', 'no-store');
+  return ok(res, {
+    message: 'Reponse assistant',
+    data: { result, configured: isAiAssistantConfigured() }
+  });
 });
 
 // Independante de la BD et des sessions : meme un appareil deconnecte doit

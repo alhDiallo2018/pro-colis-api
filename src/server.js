@@ -4,12 +4,17 @@ import { logger } from './config/logger.js';
 import { disconnectPrisma } from './config/prisma.js';
 import { attachNotificationPushBridge } from './utils/push.js';
 import { startSupportReassignmentWorker } from './modules/support/chat.service.js';
+import { startWebhookWorker, stopWebhookWorker } from './utils/webhook-queue.js';
 
 // Toute notification creee part aussi en push vers les appareils du
 // destinataire. Branche ici et pas dans `app.js` : les tests montent l'app sans
 // devoir declencher d'appels reseau.
 attachNotificationPushBridge();
 const stopSupportWorker = startSupportReassignmentWorker();
+// Worker in-process pour rejouer les webhooks sortants échoués avec backoff
+// exponentiel. Activé seulement hors tests (les tests appellent
+// `tickWebhookWorker` à la main pour déterminisme).
+startWebhookWorker();
 
 const server = app.listen(env.PORT, () => {
   logger.info({ port: env.PORT }, 'PRO COLIS API started');
@@ -21,6 +26,7 @@ async function shutdown(signal, exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   stopSupportWorker();
+  stopWebhookWorker();
 
   logger.info({ signal, exitCode }, 'Stopping PRO COLIS API');
 

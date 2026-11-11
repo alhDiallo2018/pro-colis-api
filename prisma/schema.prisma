@@ -259,6 +259,8 @@ model User {
   isVerified              Boolean                @default(false) @map("is_verified")
   isProfileComplete       Boolean                @default(false) @map("is_profile_complete")
   notificationPreferences Json?                  @map("notification_preferences")
+  whatsappOptIn           Boolean                @default(false) @map("whatsapp_opt_in")
+  referralCode            String?                @unique @map("referral_code")
   lastLogin               DateTime?              @map("last_login") @db.Timestamptz
   lastActiveAt            DateTime?              @map("last_active_at") @db.Timestamptz
   deletedAt               DateTime?              @map("deleted_at") @db.Timestamptz
@@ -324,6 +326,8 @@ model User {
   assignedSupportChats    SupportChatConversation[] @relation("SupportChatAssignee")
   supportChatMessages     SupportChatEntry[]
   supportPresences        SupportPresence[]
+  referralsMade           Referral[]              @relation("ReferralReferrer")
+  referralReceived        Referral?               @relation("ReferralReferree")
 
   @@map("users")
 }
@@ -1509,4 +1513,151 @@ model TransitLineStop {
   @@id([transitLineId, order])
   @@index([zoneId])
   @@map("transit_line_stops")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P3.15 — Parrainage / fidélité.
+// Un filleul (`referreeId`) ne peut être parrainé qu'une seule fois : contrainte
+// d'unicité sur `referreeId`. Les montants bonus sont persistés pour permettre
+// un recalcul audit sans dépendre des règles courantes.
+// ─────────────────────────────────────────────────────────────────────────────
+model Referral {
+  id              String    @id @default(uuid()) @db.Uuid
+  referrerId      String    @map("referrer_id") @db.Uuid
+  referreeId      String    @unique @map("referree_id") @db.Uuid
+  code            String    @map("code")
+  status          String    @default("pending") @map("status")
+  // Bonus crédités au déclenchement (en XOF).
+  referrerBonusXof Decimal? @map("referrer_bonus_xof") @db.Decimal(12, 2)
+  referreeBonusXof Decimal? @map("referree_bonus_xof") @db.Decimal(12, 2)
+  triggeredAt     DateTime? @map("triggered_at") @db.Timestamptz
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  referrer User @relation("ReferralReferrer", fields: [referrerId], references: [id], onDelete: Cascade)
+  referree User @relation("ReferralReferree", fields: [referreeId], references: [id], onDelete: Cascade)
+
+  @@index([referrerId])
+  @@index([status])
+  @@map("referrals")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P3.14 — Assurance colis : trace de la souscription à la prime calculée au
+// moment de la création du colis. Un colis ne peut avoir qu'une souscription
+// active à la fois.
+// ─────────────────────────────────────────────────────────────────────────────
+model InsuranceSubscription {
+  id             String    @id @default(uuid()) @db.Uuid
+  parcelId       String    @unique @map("parcel_id") @db.Uuid
+  premiumXof     Decimal   @map("premium_xof") @db.Decimal(12, 2)
+  coverageXof    Decimal   @map("coverage_xof") @db.Decimal(12, 2)
+  declaredValueXof Decimal @map("declared_value_xof") @db.Decimal(12, 2)
+  parcelType     String    @map("parcel_type")
+  status         String    @default("active") @map("status")
+  exclusions     Json?     @map("exclusions")
+  subscribedAt   DateTime  @default(now()) @map("subscribed_at") @db.Timestamptz
+  cancelledAt    DateTime? @map("cancelled_at") @db.Timestamptz
+  claimedAt      DateTime? @map("claimed_at") @db.Timestamptz
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([status])
+  @@map("insurance_subscriptions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P2.8 — Clés API partenaires e-commerce. Le `keyHash` est le SHA-256 de la
+// partie secrète (jamais stockée en clair). Les scopes contrôlent ce que la
+// clé peut faire (ex. `shipments.read`, `shipments.write`).
+// ─────────────────────────────────────────────────────────────────────────────
+model ApiKey {
+  id             String    @id @default(uuid()) @db.Uuid
+  keyId          String    @unique @map("key_id")
+  keyHash        String    @map("key_hash")
+  partnerName    String    @map("partner_name")
+  webhookUrl     String?   @map("webhook_url")
+  webhookSecret  String?   @map("webhook_secret")
+  scopes         String[]  @default([]) @map("scopes")
+  active         Boolean   @default(true) @map("active")
+  lastUsedAt     DateTime? @map("last_used_at") @db.Timestamptz
+  rotatedAt      DateTime? @map("rotated_at") @db.Timestamptz
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([active])
+  @@map("api_keys")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Modernisation 2026-11 — Livraison fiable des webhooks sortants. Chaque
+// tentative d'envoi est persistée ; en cas d'échec on re-livre avec backoff
+// exponentiel (nextAttemptAt). `attempts` et `maxAttempts` bornent la
+// boucle. Un worker interne scanne les lignes `pending` dues et marque
+// `delivered` ou `dead` au terme.
+// ─────────────────────────────────────────────────────────────────────────────
+model WebhookDelivery {
+  id              String    @id @default(uuid()) @db.Uuid
+  partnerKeyId    String    @map("partner_key_id")
+  partnerName     String    @map("partner_name")
+  url             String
+  secret          String
+  eventType       String    @map("event_type")
+  payload         Json      @map("payload")
+  status          String    @default("pending") @map("status") // pending | delivered | dead
+  attempts        Int       @default(0) @map("attempts")
+  maxAttempts     Int       @default(6) @map("max_attempts")
+  lastStatusCode  Int?      @map("last_status_code")
+  lastError       String?   @map("last_error")
+  nextAttemptAt   DateTime  @default(now()) @map("next_attempt_at") @db.Timestamptz
+  deliveredAt     DateTime? @map("delivered_at") @db.Timestamptz
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([status, nextAttemptAt])
+  @@index([partnerKeyId])
+  @@map("webhook_deliveries")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Modernisation 2026-11 — Traçabilité des notifications WhatsApp.
+// Alimente les compteurs du dashboard pilote (sent / delivered / read).
+// Les transitions d'état sont faites par le callback Meta (webhook à
+// brancher). Jamais relu pour dédupliquer : un `messageId` Meta par ligne.
+// ─────────────────────────────────────────────────────────────────────────────
+model WhatsAppDispatch {
+  id           String    @id @default(uuid()) @db.Uuid
+  messageId    String?   @unique @map("message_id")
+  phone        String
+  templateName String    @map("template_name")
+  parcelId     String?   @map("parcel_id") @db.Uuid
+  status       String    @default("sent") @map("status") // sent | delivered | read | failed
+  sentAt       DateTime  @default(now()) @map("sent_at") @db.Timestamptz
+  deliveredAt  DateTime? @map("delivered_at") @db.Timestamptz
+  readAt       DateTime? @map("read_at") @db.Timestamptz
+  failedAt     DateTime? @map("failed_at") @db.Timestamptz
+  errorReason  String?   @map("error_reason")
+
+  @@index([status])
+  @@index([parcelId])
+  @@map("whatsapp_dispatches")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Modernisation 2026-11 — Journal des anomalies détectées sur un trajet.
+// Alimente la section « anomalies » du dashboard pilote et sert de source
+// pour toute analyse rétrospective. Pas de contrainte foreign-key (on ne
+// veut pas que la suppression d'un colis casse l'historique métriques).
+// ─────────────────────────────────────────────────────────────────────────────
+model AnomalyEvent {
+  id          String   @id @default(uuid()) @db.Uuid
+  parcelId    String?  @map("parcel_id") @db.Uuid
+  type        String   // gpsSilence | prolongedStop | routeDeviation
+  severity    String   @default("info") @map("severity") // info | warning | critical
+  details     Json?    @map("details")
+  detectedAt  DateTime @default(now()) @map("detected_at") @db.Timestamptz
+
+  @@index([type, detectedAt])
+  @@index([parcelId])
+  @@map("anomaly_events")
 }

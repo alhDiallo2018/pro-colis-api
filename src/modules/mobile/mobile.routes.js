@@ -231,6 +231,36 @@ mobileRouter.get('/super-admin/audit-logs', authenticate, supportReadRoles, mobi
 mobileRouter.get('/super-admin/payments/cash-declarations', authenticate, supportReadRoles, mobileController.pendingCashDeclarations);
 mobileRouter.get('/public/broadcasts', optionalAuthenticate, mobileController.getPublicBroadcasts);
 mobileRouter.get('/public/config', optionalAuthenticate, mobileController.getPublicConfig);
+// Assistant IA : auth requise pour éviter l'abus (coût LLM par utilisateur).
+mobileRouter.post('/ai/assistant', authenticate, mobileController.aiAssistantAsk);
+// Promise-time : créneaux proposés (public, aide à la saisie).
+mobileRouter.get('/parcels/promise-slots', optionalAuthenticate, mobileController.getPromiseSlots);
+// Devis international CEDEAO (public — aide au client avant création colis).
+mobileRouter.get('/parcels/international-estimate', optionalAuthenticate, mobileController.getInternationalEstimate);
+// Devis assurance colis (auth : lié au choix de type/valeur par l'expéditeur).
+mobileRouter.post('/parcels/insurance/quote', authenticate, mobileController.getInsuranceQuote);
+// Souscription d'assurance pour un colis donné.
+mobileRouter.post('/parcels/:parcelId/insurance/subscribe', authenticate, mobileController.subscribeInsurance);
+// Code de parrainage personnel.
+mobileRouter.get('/me/referral-code', authenticate, mobileController.getMyReferralCode);
+// Revendication d'un code de parrainage par le filleul.
+mobileRouter.post('/me/referral/claim', authenticate, mobileController.claimReferral);
+// Dashboard B2B expéditeur professionnel (volumes, SLA, destinations).
+mobileRouter.get('/business-shipper/dashboard', authenticate, mobileController.getBusinessShipperDashboard);
+
+// Admin : gestion des clés API partenaires e-commerce.
+const superAdminOnly = requireRoles('super_admin');
+mobileRouter.get('/super-admin/api-keys', authenticate, supportReadRoles, mobileController.listApiKeys);
+mobileRouter.post('/super-admin/api-keys', authenticate, superAdminOnly, mobileController.createApiKey);
+mobileRouter.post('/super-admin/api-keys/:keyId/rotate', authenticate, superAdminOnly, mobileController.rotateApiKey);
+mobileRouter.patch('/super-admin/api-keys/:keyId', authenticate, superAdminOnly, mobileController.updateApiKey);
+mobileRouter.post('/super-admin/api-keys/:keyId/deactivate', authenticate, superAdminOnly, mobileController.deactivateApiKey);
+// Métriques pilote (lecture seule, support étendu).
+mobileRouter.get('/super-admin/pilot-metrics', authenticate, supportReadRoles, mobileController.getPilotMetrics);
+// Webhook Meta pour les transitions WhatsApp (delivered/read). Public : la
+// vérification repose sur le token Meta configuré via env.
+mobileRouter.get('/webhooks/whatsapp', mobileController.whatsappCallbackVerify);
+mobileRouter.post('/webhooks/whatsapp', mobileController.whatsappCallbackReceive);
 mobileRouter.get('/public/mobile-update', mobileController.getAppUpdate);
 // Alias de la premiere integration mobile.
 mobileRouter.get('/public/app-update', mobileController.getAppUpdate);
