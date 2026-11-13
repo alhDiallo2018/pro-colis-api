@@ -39,6 +39,32 @@ import { planReferralTrigger } from '../../utils/referral-trigger-service.js';
 import { sendParcelStatusWhatsApp } from '../../utils/whatsapp.js';
 import { dispatchShipmentEvent } from '../../utils/shipment-webhook-service.js';
 import { aggregateShipperStats } from '../../utils/business-shipper-stats.js';
+import { validateOfferStops } from '../../utils/transit-offer-stops.js';
+import { optimizeTour } from '../../utils/tour-optimizer.js';
+import { estimateShipping as estimateInternationalShipping } from '../../utils/international-carriers.js';
+import {
+  initiateHandover as svcInitiateHandover,
+  confirmHandover as svcConfirmHandover,
+  cancelHandover as svcCancelHandover,
+  listParcelHandovers as svcListHandovers,
+  serializeHandover
+} from '../parcels/handover.service.js';
+import {
+  createBatch as svcCreateBatch,
+  attachParcels as svcAttachBatchParcels,
+  detachParcel as svcDetachBatchParcel,
+  closeBatch as svcCloseBatch,
+  getBatch as svcGetBatch,
+  listBatches as svcListBatches,
+  serializeBatch
+} from '../parcels/shipment-batch.service.js';
+import {
+  createParcelCustoms as svcCreateCustoms,
+  updateParcelCustoms as svcUpdateCustoms,
+  getParcelCustoms as svcGetCustoms,
+  signParcelCustoms as svcSignCustoms,
+  serializeCustoms
+} from '../parcels/customs.service.js';
 import { generateApiKey } from '../../utils/api-key-generator.js';
 import { hashApiSecret } from '../../utils/api-key-auth.js';
 import { invalidatePartnersCache } from '../../utils/shipment-webhook-service.js';
@@ -673,8 +699,27 @@ async function runPostStatusHooks({ parcel, previousStatus, newStatus }) {
     // 3. Bonus parrainage à la première livraison de l'expéditeur.
     newStatus === 'delivered' && parcel.senderId
       ? maybeTriggerReferralBonus(parcel.senderId)
+      : Promise.resolve(null),
+    // 4. POLISH-5 — Envoi automatique du code PIN de livraison au destinataire
+    //    au passage `out_for_delivery`. Le driver scannera/saisira ce code dans
+    //    confirm_delivery_screen ; le code est immuable pour toute la vie du colis
+    //    (getOrCreateDeliveryCode) : déjà envoyé n'est pas re-généré.
+    newStatus === 'out_for_delivery'
+      ? deliverPinAutoSend(parcel).catch(() => null)
       : Promise.resolve(null)
   ]);
+}
+
+async function deliverPinAutoSend(parcel) {
+  if (!parcel?.id || !parcel?.receiverPhone) return;
+  const { code, phone } = await getOrCreateDeliveryCode(parcel.id, parcel.receiverPhone);
+  if (!code || !phone) return;
+  const message = `PRO COLIS — code de remise de votre colis ${parcel.trackingNumber ?? ''} : ${code}. Communiquez-le au chauffeur à la livraison.`;
+  if (isBrevoConfigured()) {
+    sendNotificationSms({ phone, message, tag: 'delivery_pin' }).catch(() => { });
+  }
+  // WhatsApp template `out_for_delivery` est déjà envoyé plus haut : on évite
+  // le doublon. Le SMS reste indispensable pour les destinataires non WhatsApp.
 }
 
 /**
@@ -1200,6 +1245,84 @@ export const createParcel = handle('parcel.create', async (req, res) => {
     status: 201, 
     message: result.proposedDriverId ? 'Proposition envoyée au chauffeur' : 'Colis créé', 
     data: { parcel: serializeParcel(result) } 
+  });
+});
+
+/**
+ * Création groupée de colis. Processe chaque ligne via `createParcel` en
+ * récupérant le succès/échec individuellement : une erreur sur une ligne
+ * ne bloque pas les autres. Retourne `{results: [{success, parcel?, message?}]}`.
+ *
+ * Volontairement non-atomique entre lignes : le front CSV affiche le détail
+ * par ligne, et un rollback global serait pire UX (tout ou rien sur 200
+ * colis). Chaque appel interne garde son propre `$transaction` pour les
+ * garanties de cohérence intra-colis (idempotence, debt gating…).
+ */
+export const bulkCreateParcels = handle('parcel.bulkCreate', async (req, res) => {
+  const parcels = Array.isArray(req.body?.parcels) ? req.body.parcels : null;
+  if (!parcels || parcels.length === 0) {
+    throw new ValidationError([{ path: 'body.parcels', message: 'Liste de colis requise' }]);
+  }
+  if (parcels.length > 200) {
+    throw new ValidationError([{ path: 'body.parcels', message: 'Maximum 200 colis par appel' }]);
+  }
+
+  const results = [];
+  for (const row of parcels) {
+    try {
+      // Simule un sous-req minimal pour réutiliser `createParcel`. On n'appelle
+      // pas directement le handler (il écrit dans `res`) ; on inline la partie
+      // création en respectant les mêmes garde-fous que l'endpoint unitaire.
+      if (!row?.receiverName || !row?.receiverPhone || !row?.description || !row?.weight) {
+        results.push({ success: false, message: 'Champs colis obligatoires manquants' });
+        continue;
+      }
+      const requestId = validateRequestId(row.requestId);
+      const { requestId: _rid, ...payload } = row;
+      const saved = await prisma.$transaction(async (tx) => once(tx, req.user.id, 'parcel.create', requestId, payload, async () => {
+        if (req.user.role === 'client') {
+          await assertClientCanCreateParcel(tx, req.user.id);
+        }
+        const parcel = await tx.parcel.create({
+          data: buildParcelData(req.user, row),
+          include: parcelInclude
+        });
+        await tx.parcelEvent.create({
+          data: {
+            parcelId: parcel.id,
+            status: parcel.status,
+            description: statusDescription(parcel.status),
+            userId: req.user.id,
+            userName: req.user.fullName,
+            userRole: req.user.role,
+            metadata: {}
+          }
+        });
+        return { parcelId: parcel.id };
+      }));
+      const created = await prisma.parcel.findFirst({
+        where: { id: saved.parcelId, createdBy: req.user.id, deletedAt: null },
+        include: parcelInclude
+      });
+      if (!created) {
+        results.push({ success: false, message: 'Colis créé puis supprimé' });
+        continue;
+      }
+      results.push({ success: true, parcel: serializeParcel(created) });
+    } catch (err) {
+      const normalized = normalizeError(err);
+      results.push({
+        success: false,
+        message: normalized?.publicMessage || err?.message || 'Création impossible'
+      });
+    }
+  }
+
+  const createdCount = results.filter(r => r.success).length;
+  return ok(res, {
+    status: createdCount > 0 ? 201 : 200,
+    message: `${createdCount}/${results.length} colis créés`,
+    data: { results }
   });
 });
 
@@ -5967,9 +6090,27 @@ export const createAdvertisementOffer = handle('advertisements.offerCreate', asy
     }
   }
 
+  // Phase 1 — Affectation d'arrêts sur ligne (navette). Nullable : préservé pour
+  // les annonces libres sans transitLineId.
+  const transitLineStops = ad.transitLineId
+    ? await prisma.transitLineStop.findMany({
+        where: { transitLineId: ad.transitLineId },
+        select: { order: true }
+      })
+    : [];
+  const stopAssignment = validateOfferStops(ad, req.body, { transitLineStops });
+
   const offer = await prisma.$transaction(async (tx) => {
     const created = await tx.advertisementOffer.create({
-      data: { advertisementId: ad.id, clientId: req.user.id, parcelId, price, message: req.body.message },
+      data: {
+        advertisementId: ad.id,
+        clientId: req.user.id,
+        parcelId,
+        price,
+        message: req.body.message,
+        boardingStopOrder: stopAssignment.boardingStopOrder,
+        dropOffStopOrder: stopAssignment.dropOffStopOrder
+      },
       include: { client: true, parcel: { include: { media: true } } }
     });
     await notify(tx, {
@@ -5993,6 +6134,672 @@ export const advertisementOffers = handle('advertisements.offers', async (req, r
   if (req.user.role !== 'super_admin' && advertisement.driverId !== req.user.id) throw new ForbiddenError('Annonce non autorisee');
   const offers = await prisma.advertisementOffer.findMany({ where: { advertisementId: advertisement.id }, include: { client: true, parcel: true }, orderBy: { createdAt: 'desc' } });
   return ok(res, { message: 'Offres annonce', data: { offers: offers.map(serializeAdvertisementOffer) } });
+});
+
+// OPS-4 — Dashboard pilote 14 jours agrégeant les flux Phase 1-6.
+export const adminPilot14dMetrics = handle('admin.pilot14d', async (req, res) => {
+  if (req.user.role !== 'super_admin') throw new ForbiddenError('Accès réservé');
+  const windowDays = Math.min(Math.max(Number(req.query?.windowDays) || 14, 1), 90);
+  const { build14dPilotMetrics } = await import('../../utils/pilot-metrics-14d.js');
+  const metrics = await build14dPilotMetrics(prisma, { windowDays });
+  return ok(res, { message: 'Métriques pilote', data: metrics });
+});
+
+// ADM-1 — Admin dashboards : agrégats récents des flux Phase 1-5.
+export const adminRecentWebhooks = handle('admin.recentWebhooks', async (req, res) => {
+  if (req.user.role !== 'super_admin') throw new ForbiddenError('Accès réservé');
+  const limit = Math.min(Number(req.query?.limit) || 50, 200);
+  const rows = await prisma.webhookDelivery.findMany({
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    select: {
+      id: true, partnerKeyId: true, partnerName: true, url: true,
+      eventType: true, status: true, attempts: true, maxAttempts: true,
+      lastStatusCode: true, nextAttemptAt: true, deliveredAt: true, createdAt: true
+    }
+  });
+  const stats = await prisma.webhookDelivery.groupBy({
+    by: ['status'], _count: { _all: true }
+  });
+  return ok(res, {
+    message: 'Webhooks récents',
+    data: {
+      deliveries: rows.map((r) => ({
+        ...r,
+        createdAt: r.createdAt?.toISOString() ?? null,
+        deliveredAt: r.deliveredAt?.toISOString() ?? null,
+        nextAttemptAt: r.nextAttemptAt?.toISOString() ?? null
+      })),
+      statusCounts: Object.fromEntries(stats.map((s) => [s.status, s._count._all]))
+    }
+  });
+});
+
+export const adminRecentStopEvents = handle('admin.recentStopEvents', async (req, res) => {
+  if (req.user.role !== 'super_admin') throw new ForbiddenError('Accès réservé');
+  const limit = Math.min(Number(req.query?.limit) || 50, 200);
+  const rows = await prisma.journeyStopEvent.findMany({
+    orderBy: { reachedAt: 'desc' },
+    take: limit
+  });
+  return ok(res, {
+    message: 'Arrêts atteints récents',
+    data: {
+      events: rows.map((r) => ({
+        id: r.id,
+        advertisementId: r.advertisementId,
+        driverId: r.driverId,
+        vehicleId: r.vehicleId,
+        transitLineId: r.transitLineId,
+        stopOrder: r.stopOrder,
+        stopLabel: r.stopLabel,
+        zoneId: r.zoneId,
+        distanceMeters: r.distanceMeters,
+        radiusMeters: r.radiusMeters,
+        reachedAt: r.reachedAt?.toISOString() ?? null,
+        confirmedBy: r.confirmedBy,
+        createdAt: r.createdAt?.toISOString() ?? null
+      }))
+    }
+  });
+});
+
+export const adminRecentHandovers = handle('admin.recentHandovers', async (req, res) => {
+  if (req.user.role !== 'super_admin') throw new ForbiddenError('Accès réservé');
+  const limit = Math.min(Number(req.query?.limit) || 50, 200);
+  const rows = await prisma.parcelHandover.findMany({
+    orderBy: { initiatedAt: 'desc' },
+    take: limit,
+    include: { parcel: { select: { trackingNumber: true } } }
+  });
+  const stats = await prisma.parcelHandover.groupBy({
+    by: ['status'], _count: { _all: true }
+  });
+  return ok(res, {
+    message: 'Correspondances récentes',
+    data: {
+      handovers: rows.map((h) => ({
+        id: h.id,
+        parcelId: h.parcelId,
+        trackingNumber: h.parcel?.trackingNumber ?? null,
+        fromDriverId: h.fromDriverId,
+        toDriverId: h.toDriverId,
+        status: h.status,
+        initiatedAt: h.initiatedAt?.toISOString() ?? null,
+        confirmedAt: h.confirmedAt?.toISOString() ?? null,
+        cancelledAt: h.cancelledAt?.toISOString() ?? null,
+        cancellationReason: h.cancellationReason
+      })),
+      statusCounts: Object.fromEntries(stats.map((s) => [s.status, s._count._all]))
+    }
+  });
+});
+
+// Phase 5 — Devis carriers internationaux (SCP-041).
+// GET /parcels/:parcelId/international-offers → agrège les tarifs stubs
+// DHL-like + économique. Nécessite une déclaration douanière signée (sinon
+// on ne connaît ni l'origine ni la destination ni le poids déclaré).
+export const parcelInternationalOffers = handle('parcel.internationalOffers', async (req, res) => {
+  const parcel = await prisma.parcel.findUnique({
+    where: { id: req.params.parcelId },
+    select: { id: true, senderId: true, assignedDriverId: true, deletedAt: true, weight: true, customs: { select: { originCountry: true, destinationCountry: true, weightKg: true, signedAt: true } } }
+  });
+  if (!parcel || parcel.deletedAt) throw new NotFoundError('Colis introuvable');
+  if (req.user.role !== 'super_admin' && parcel.senderId !== req.user.id && parcel.assignedDriverId !== req.user.id) {
+    throw new ForbiddenError('Accès refusé');
+  }
+  if (!parcel.customs) {
+    throw new ValidationError([{ path: 'customs', message: 'Déclaration douanière requise pour obtenir un devis international' }]);
+  }
+  try {
+    const result = estimateInternationalShipping({
+      origin: parcel.customs.originCountry,
+      destination: parcel.customs.destinationCountry,
+      parcel: {
+        weightKg: Number(parcel.customs.weightKg ?? parcel.weight ?? 0)
+      }
+    });
+    return ok(res, {
+      message: 'Devis internationaux',
+      data: {
+        parcelId: parcel.id,
+        origin: parcel.customs.originCountry,
+        destination: parcel.customs.destinationCountry,
+        isCustomsSigned: Boolean(parcel.customs.signedAt),
+        offers: result.offers,
+        acceptedCarriers: result.acceptedCarriers
+      }
+    });
+  } catch (err) {
+    throw new ValidationError([{ path: 'customs', message: err.message }]);
+  }
+});
+
+// Phase 5 — Déclarations douanières (SCP-040).
+export const createParcelCustoms = handle('parcel.customs.create', async (req, res) => {
+  const row = await svcCreateCustoms({ parcelId: req.params.parcelId, actor: req.user, body: req.body });
+  return ok(res, { status: 201, message: 'Déclaration créée', data: { customs: serializeCustoms(row) } });
+});
+
+export const updateParcelCustoms = handle('parcel.customs.update', async (req, res) => {
+  const row = await svcUpdateCustoms({ parcelId: req.params.parcelId, actor: req.user, body: req.body });
+  return ok(res, { message: 'Déclaration mise à jour', data: { customs: serializeCustoms(row) } });
+});
+
+export const getParcelCustoms = handle('parcel.customs.get', async (req, res) => {
+  const row = await svcGetCustoms({ parcelId: req.params.parcelId, actor: req.user });
+  return ok(res, { message: 'Déclaration', data: { customs: serializeCustoms(row) } });
+});
+
+export const signParcelCustoms = handle('parcel.customs.sign', async (req, res) => {
+  const row = await svcSignCustoms({ parcelId: req.params.parcelId, actor: req.user });
+  return ok(res, { message: 'Déclaration signée', data: { customs: serializeCustoms(row) } });
+});
+
+// Phase 4 — Expéditions groupées (B2B / e-commerce).
+export const createShipmentBatch = handle('shipment.batch.create', async (req, res) => {
+  const batch = await svcCreateBatch({ actor: req.user, body: req.body });
+  return ok(res, { status: 201, message: 'Lot créé', data: { batch: serializeBatch(batch) } });
+});
+
+export const attachParcelsToBatch = handle('shipment.batch.attach', async (req, res) => {
+  const batch = await svcAttachBatchParcels({ batchId: req.params.batchId, actor: req.user, parcelIds: req.body?.parcelIds });
+  return ok(res, { message: 'Colis rattachés', data: { batch: serializeBatch(batch) } });
+});
+
+export const detachParcelFromBatch = handle('shipment.batch.detach', async (req, res) => {
+  const batch = await svcDetachBatchParcel({ batchId: req.params.batchId, parcelId: req.params.parcelId, actor: req.user });
+  return ok(res, { message: 'Colis détaché', data: { batch: serializeBatch(batch) } });
+});
+
+export const closeShipmentBatch = handle('shipment.batch.close', async (req, res) => {
+  const batch = await svcCloseBatch({ batchId: req.params.batchId, actor: req.user });
+  return ok(res, { message: 'Lot clôturé', data: { batch: serializeBatch(batch) } });
+});
+
+export const getShipmentBatch = handle('shipment.batch.get', async (req, res) => {
+  const batch = await svcGetBatch({ batchId: req.params.batchId, actor: req.user });
+  return ok(res, { message: 'Lot', data: { batch: serializeBatch(batch) } });
+});
+
+export const listShipmentBatches = handle('shipment.batch.list', async (req, res) => {
+  const batches = await svcListBatches({ actor: req.user, query: req.query });
+  return ok(res, { message: 'Lots', data: { batches: batches.map((b) => serializeBatch(b)) } });
+});
+
+/**
+ * Événements de tournée d'un lot d'expédition (arrivée arrêt, incident…).
+ * V1 : persistés dans `AuditLog` (`entityType='shipment_batch'`,
+ * `action='stop_event'`) pour éviter une migration de schéma avant que la
+ * feature ne soit stabilisée. Si la volumétrie grandit, extraire dans une
+ * table dédiée `shipment_batch_stop_events`.
+ */
+const BATCH_EVENT_TYPES = new Set([
+  'arrival',
+  'departure',
+  'incident',
+  'delay',
+  'delivered',
+  'event'
+]);
+
+export const listShipmentBatchStopEvents = handle('shipment.batch.events.list', async (req, res) => {
+  const batch = await svcGetBatch({ batchId: req.params.batchId, actor: req.user });
+  const rows = await prisma.auditLog.findMany({
+    where: {
+      entityType: 'shipment_batch',
+      entityId: batch.id,
+      action: 'stop_event'
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 200
+  });
+  const events = rows.map((row) => {
+    const data = row.afterData || {};
+    return {
+      id: row.id,
+      type: typeof data.type === 'string' ? data.type : 'event',
+      label: typeof data.label === 'string' ? data.label : null,
+      description: typeof data.description === 'string' ? data.description : null,
+      parcelId: typeof data.parcelId === 'string' ? data.parcelId : null,
+      stopLabel: typeof data.stopLabel === 'string' ? data.stopLabel : null,
+      occurredAt:
+        typeof data.occurredAt === 'string'
+          ? data.occurredAt
+          : row.createdAt?.toISOString() ?? null
+    };
+  });
+  return ok(res, { message: 'Événements', data: { events } });
+});
+
+/**
+ * Litiges formels (disputes) côté client/driver.
+ *
+ * V1 : persistés via `SupportTicket` (subject = sujet du litige, body =
+ * description, category = `dispute:<kind>`). Les commentaires sont stockés
+ * comme AuditLog (`action='dispute.comment'`, `entityId=ticketId`). Le
+ * statut suit TicketStatus : open → pending/in_progress → resolved, plus
+ * un statut synthétique `rejected` encodé dans `resolutionNote`.
+ */
+const DISPUTE_CATEGORIES = new Set(['damage', 'lost', 'delay', 'payment', 'other']);
+const DISPUTE_CATEGORY_PREFIX = 'dispute:';
+
+function disputeStatusFrom(ticket) {
+  if (ticket.status === 'resolved') {
+    const note = ticket.body?.includes('[DISPUTE_REJECTED]') ? 'rejected' : 'resolved';
+    return note;
+  }
+  if (ticket.status === 'in_progress' || ticket.status === 'pending') return 'in_review';
+  return 'open';
+}
+
+function disputeCategoryFrom(ticket) {
+  if (typeof ticket.category === 'string' && ticket.category.startsWith(DISPUTE_CATEGORY_PREFIX)) {
+    return ticket.category.slice(DISPUTE_CATEGORY_PREFIX.length);
+  }
+  return 'other';
+}
+
+function serializeDispute(ticket, events = []) {
+  return {
+    id: ticket.id,
+    parcelId: ticket.parcelId ?? null,
+    parcelTrackingNumber: ticket.parcelTrackingNumber ?? null,
+    status: disputeStatusFrom(ticket),
+    category: disputeCategoryFrom(ticket),
+    subject: ticket.subject ?? null,
+    description: ticket.body ?? '',
+    claimedAmount: ticket.claimedAmount ?? null,
+    currency: 'XOF',
+    createdAt: ticket.createdAt?.toISOString() ?? null,
+    resolvedAt: ticket.resolvedAt?.toISOString() ?? null,
+    resolutionNote:
+      typeof ticket.resolutionNote === 'string' && ticket.resolutionNote.length > 0
+        ? ticket.resolutionNote
+        : null,
+    attachments: Array.isArray(ticket.attachments) ? ticket.attachments : [],
+    events
+  };
+}
+
+export const listMyDisputes = handle('disputes.listMine', async (req, res) => {
+  const tickets = await prisma.supportTicket.findMany({
+    where: {
+      requesterId: req.user.id,
+      category: { startsWith: DISPUTE_CATEGORY_PREFIX }
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 100
+  });
+  const disputes = tickets.map((t) => serializeDispute(t));
+  return ok(res, { message: 'Litiges', data: { disputes } });
+});
+
+export const getDispute = handle('disputes.get', async (req, res) => {
+  const ticket = await prisma.supportTicket.findFirst({
+    where: {
+      id: req.params.disputeId,
+      category: { startsWith: DISPUTE_CATEGORY_PREFIX },
+      // Lecture limitée au propriétaire ou aux rôles support/admin.
+      OR: [
+        { requesterId: req.user.id },
+        ...(['super_admin', 'support', 'support_technique'].includes(req.user.role) ? [{}] : [])
+      ]
+    }
+  });
+  if (!ticket) throw new NotFoundError('Litige introuvable');
+  const events = await prisma.auditLog.findMany({
+    where: { entityType: 'dispute', entityId: ticket.id },
+    orderBy: { createdAt: 'asc' },
+    take: 200
+  });
+  const serialized = events.map((e) => ({
+    id: e.id,
+    type: e.action?.split('.').pop() || 'event',
+    actorName: typeof e.afterData?.actorName === 'string' ? e.afterData.actorName : null,
+    message: typeof e.afterData?.message === 'string' ? e.afterData.message : null,
+    occurredAt: e.createdAt?.toISOString() ?? null
+  }));
+  return ok(res, { message: 'Litige', data: { dispute: serializeDispute(ticket, serialized) } });
+});
+
+export const openDispute = handle('disputes.open', async (req, res) => {
+  const parcel = await findReadableParcel(req.user, req.params.parcelId);
+  const body = req.body || {};
+  const category = typeof body.category === 'string' && DISPUTE_CATEGORIES.has(body.category)
+    ? body.category
+    : 'other';
+  const description = typeof body.description === 'string' ? body.description.trim() : '';
+  if (description.length < 20) {
+    throw new ValidationError([{ path: 'body.description', message: 'Description trop courte (20+ caractères)' }]);
+  }
+  const subject = typeof body.subject === 'string' && body.subject.trim().length > 0
+    ? body.subject.trim().slice(0, 160)
+    : `Litige ${category} · ${parcel.trackingNumber}`;
+
+  const reference = `DIS-${Date.now().toString(36).toUpperCase()}`;
+  const ticket = await prisma.supportTicket.create({
+    data: {
+      reference,
+      subject,
+      body: description,
+      requesterId: req.user.id,
+      category: `${DISPUTE_CATEGORY_PREFIX}${category}`,
+      status: 'open',
+      priority: category === 'lost' || category === 'damage' ? 'high' : 'normal'
+    }
+  });
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'dispute.created',
+      entityType: 'dispute',
+      entityId: ticket.id,
+      afterData: { actorName: req.user.fullName, parcelId: parcel.id }
+    }
+  });
+  const enriched = { ...ticket, parcelId: parcel.id, parcelTrackingNumber: parcel.trackingNumber };
+  return ok(res, {
+    status: 201,
+    message: 'Litige ouvert',
+    data: { dispute: serializeDispute(enriched, []) }
+  });
+});
+
+export const commentDispute = handle('disputes.comment', async (req, res) => {
+  const ticket = await prisma.supportTicket.findFirst({
+    where: {
+      id: req.params.disputeId,
+      category: { startsWith: DISPUTE_CATEGORY_PREFIX }
+    }
+  });
+  if (!ticket) throw new NotFoundError('Litige introuvable');
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  if (message.length === 0) {
+    throw new ValidationError([{ path: 'body.message', message: 'Message requis' }]);
+  }
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'dispute.comment',
+      entityType: 'dispute',
+      entityId: ticket.id,
+      afterData: { actorName: req.user.fullName, message }
+    }
+  });
+  const events = await prisma.auditLog.findMany({
+    where: { entityType: 'dispute', entityId: ticket.id },
+    orderBy: { createdAt: 'asc' },
+    take: 200
+  });
+  const serialized = events.map((e) => ({
+    id: e.id,
+    type: e.action?.split('.').pop() || 'event',
+    actorName: typeof e.afterData?.actorName === 'string' ? e.afterData.actorName : null,
+    message: typeof e.afterData?.message === 'string' ? e.afterData.message : null,
+    occurredAt: e.createdAt?.toISOString() ?? null
+  }));
+  return ok(res, {
+    message: 'Commentaire ajouté',
+    data: { dispute: serializeDispute(ticket, serialized) }
+  });
+});
+
+export const createShipmentBatchStopEvent = handle('shipment.batch.events.create', async (req, res) => {
+  const batch = await svcGetBatch({ batchId: req.params.batchId, actor: req.user });
+  const body = req.body || {};
+  const type = typeof body.type === 'string' && BATCH_EVENT_TYPES.has(body.type) ? body.type : 'event';
+  const label = typeof body.label === 'string' ? body.label.slice(0, 200) : null;
+  const description = typeof body.description === 'string' ? body.description.slice(0, 2000) : null;
+  const parcelId = typeof body.parcelId === 'string' ? body.parcelId : null;
+  const stopLabel = typeof body.stopLabel === 'string' ? body.stopLabel.slice(0, 200) : null;
+  const occurredAt = typeof body.occurredAt === 'string' ? body.occurredAt : new Date().toISOString();
+
+  const entry = await prisma.auditLog.create({
+    data: {
+      actorId: req.user.id,
+      actorRole: req.user.role,
+      action: 'stop_event',
+      entityType: 'shipment_batch',
+      entityId: batch.id,
+      afterData: { type, label, description, parcelId, stopLabel, occurredAt }
+    }
+  });
+  return ok(res, {
+    status: 201,
+    message: 'Événement enregistré',
+    data: {
+      event: {
+        id: entry.id,
+        type,
+        label,
+        description,
+        parcelId,
+        stopLabel,
+        occurredAt
+      }
+    }
+  });
+});
+
+// Phase 6 — Optimisation de tournée pour un trajet navette.
+// Retourne l'ordre de visite optimal des destinataires des offres acceptées.
+// Origine : departureZone de l'annonce → JourneyLive si disponible → première offre (fallback).
+// Les coord destinataires viennent de `parcel.arrivalZone` (Zone.latitude/longitude).
+export const advertisementOptimizeRoute = handle('advertisements.optimizeRoute', async (req, res) => {
+  const ad = await prisma.advertisement.findUnique({
+    where: { id: req.params.advertisementId },
+    include: { departureZone: { select: { latitude: true, longitude: true } } }
+  });
+  if (!ad) throw new NotFoundError('Annonce introuvable');
+  const isDriver = ad.driverId === req.user.id;
+  const isAdmin = req.user.role === 'super_admin';
+  if (!isDriver && !isAdmin) throw new ForbiddenError('Annonce non autorisee');
+
+  const offers = await prisma.advertisementOffer.findMany({
+    where: { advertisementId: ad.id, status: 'accepted', parcelId: { not: null } },
+    include: { parcel: { include: { arrivalZone: { select: { latitude: true, longitude: true } } } } },
+    orderBy: { createdAt: 'asc' }
+  });
+
+  const stops = [];
+  for (const offer of offers) {
+    const z = offer.parcel?.arrivalZone;
+    if (!z) continue;
+    stops.push({
+      id: offer.id,
+      parcelId: offer.parcelId,
+      trackingNumber: offer.parcel.trackingNumber,
+      receiverName: offer.parcel.receiverName,
+      latitude: Number(z.latitude),
+      longitude: Number(z.longitude),
+      dropOffStopOrder: offer.dropOffStopOrder
+    });
+  }
+
+  if (!stops.length) {
+    return ok(res, {
+      message: 'Aucun colis géolocalisé à ordonner',
+      data: { advertisementId: ad.id, ordered: [], distanceKm: 0, improvedBy: 0, iterations: 0 }
+    });
+  }
+
+  // Détermine l'origine : departure zone → journey live → premier arrêt (fallback).
+  let origin = ad.departureZone && Number.isFinite(Number(ad.departureZone.latitude))
+    ? { latitude: Number(ad.departureZone.latitude), longitude: Number(ad.departureZone.longitude) }
+    : null;
+  if (!origin) {
+    const live = await prisma.journeyLive.findUnique({
+      where: { advertisementId: ad.id },
+      select: { latitude: true, longitude: true }
+    });
+    if (live) origin = { latitude: Number(live.latitude), longitude: Number(live.longitude) };
+  }
+  if (!origin) origin = { latitude: stops[0].latitude, longitude: stops[0].longitude };
+
+  const config = (req.body && typeof req.body === 'object' && req.body.config && typeof req.body.config === 'object') ? req.body.config : {};
+  const result = optimizeTour({ origin, stops, config });
+  return ok(res, {
+    message: 'Tournée optimisée',
+    data: {
+      advertisementId: ad.id,
+      origin,
+      ordered: result.ordered.map((s) => ({
+        offerId: s.id,
+        parcelId: s.parcelId,
+        trackingNumber: s.trackingNumber,
+        receiverName: s.receiverName,
+        latitude: s.latitude,
+        longitude: s.longitude,
+        dropOffStopOrder: s.dropOffStopOrder
+      })),
+      distanceKm: result.distanceKm,
+      improvedBy: result.improvedBy,
+      iterations: result.iterations
+    }
+  });
+});
+
+// Phase 2 — Correspondances inter-véhicules (handover).
+// Les secrets `pickupPin` et `pickupQrToken` ne sont exposés qu'à l'initiateur
+// de l'initiation. Ensuite ils ne sont plus accessibles (seul leur hash est persisté).
+export const initiateParcelHandover = handle('parcels.handover.initiate', async (req, res) => {
+  const { handover, pickupPin, pickupQrToken } = await svcInitiateHandover({
+    parcelId: req.params.parcelId,
+    actor: req.user,
+    body: req.body
+  });
+  return ok(res, {
+    status: 201,
+    message: 'Correspondance initiée',
+    data: { handover: serializeHandover(handover, { reveal: { pickupPin, pickupQrToken } }) }
+  });
+});
+
+export const confirmParcelHandover = handle('parcels.handover.confirm', async (req, res) => {
+  const handover = await svcConfirmHandover({
+    parcelId: req.params.parcelId,
+    handoverId: req.params.handoverId,
+    actor: req.user,
+    body: req.body
+  });
+  return ok(res, { message: 'Correspondance confirmée', data: { handover: serializeHandover(handover) } });
+});
+
+export const cancelParcelHandover = handle('parcels.handover.cancel', async (req, res) => {
+  const handover = await svcCancelHandover({
+    parcelId: req.params.parcelId,
+    handoverId: req.params.handoverId,
+    actor: req.user,
+    body: req.body
+  });
+  return ok(res, { message: 'Correspondance annulée', data: { handover: serializeHandover(handover) } });
+});
+
+export const listParcelHandovers = handle('parcels.handover.list', async (req, res) => {
+  const rows = await svcListHandovers({ parcelId: req.params.parcelId, actor: req.user });
+  return ok(res, { message: 'Correspondances', data: { handovers: rows.map((h) => serializeHandover(h)) } });
+});
+
+// Phase 1 — Arrêts atteints du trajet navette (évalués par le détecteur GPS).
+export const advertisementReachedStops = handle('advertisements.reachedStops', async (req, res) => {
+  const advertisement = await prisma.advertisement.findUnique({
+    where: { id: req.params.advertisementId },
+    select: { id: true, driverId: true, transitLineId: true }
+  });
+  if (!advertisement) throw new NotFoundError('Annonce introuvable');
+  const isDriver = advertisement.driverId === req.user.id;
+  const isAdmin = req.user.role === 'super_admin';
+  if (!isDriver && !isAdmin) {
+    const ownsAccepted = await prisma.advertisementOffer.count({
+      where: { advertisementId: advertisement.id, clientId: req.user.id, status: 'accepted' }
+    });
+    if (!ownsAccepted) throw new ForbiddenError('Annonce non autorisee');
+  }
+  const events = await prisma.journeyStopEvent.findMany({
+    where: { advertisementId: advertisement.id },
+    orderBy: { stopOrder: 'asc' }
+  });
+  return ok(res, {
+    message: 'Arrêts atteints',
+    data: {
+      advertisementId: advertisement.id,
+      transitLineId: advertisement.transitLineId,
+      reachedStops: events.map((ev) => ({
+        stopOrder: ev.stopOrder,
+        stopLabel: ev.stopLabel,
+        zoneId: ev.zoneId,
+        distanceMeters: ev.distanceMeters,
+        radiusMeters: ev.radiusMeters,
+        reachedAt: ev.reachedAt.toISOString(),
+        confirmedBy: ev.confirmedBy
+      }))
+    }
+  });
+});
+
+// Phase 1 — Manifeste de trajet navette : offres acceptées regroupées par arrêt.
+// À chaque arrêt, `picked` liste les colis à embarquer, `dropOffs` ceux à remettre.
+// Permissions : driver de l'annonce, super_admin, ou clients ayant une offre
+// acceptée sur ce trajet (destinataire futur du colis).
+export const advertisementManifest = handle('advertisements.manifest', async (req, res) => {
+  const advertisement = await prisma.advertisement.findUnique({
+    where: { id: req.params.advertisementId },
+    include: { transitLine: { include: { stops: { orderBy: { order: 'asc' } } } } }
+  });
+  if (!advertisement) throw new NotFoundError('Annonce introuvable');
+
+  const isDriver = advertisement.driverId === req.user.id;
+  const isAdmin = req.user.role === 'super_admin';
+  if (!isDriver && !isAdmin) {
+    const ownsAccepted = await prisma.advertisementOffer.count({
+      where: { advertisementId: advertisement.id, clientId: req.user.id, status: 'accepted' }
+    });
+    if (!ownsAccepted) throw new ForbiddenError('Annonce non autorisee');
+  }
+
+  const offers = await prisma.advertisementOffer.findMany({
+    where: { advertisementId: advertisement.id, status: 'accepted' },
+    include: { client: true, parcel: { include: { media: true } }, advertisement: { include: { transitLine: { include: { stops: { orderBy: { order: 'asc' } } } } } } },
+    orderBy: { createdAt: 'asc' }
+  });
+
+  const stops = (advertisement.transitLine?.stops ?? []).map((stop) => ({
+    order: stop.order,
+    label: stop.label,
+    zoneId: stop.zoneId,
+    picked: [],
+    dropOffs: []
+  }));
+  const stopByOrder = new Map(stops.map((s) => [s.order, s]));
+
+  const unassigned = [];
+  for (const offer of offers) {
+    const serialized = serializeAdvertisementOffer(offer);
+    let placed = false;
+    if (offer.boardingStopOrder !== null && stopByOrder.has(offer.boardingStopOrder)) {
+      stopByOrder.get(offer.boardingStopOrder).picked.push(serialized);
+      placed = true;
+    }
+    if (offer.dropOffStopOrder !== null && stopByOrder.has(offer.dropOffStopOrder)) {
+      stopByOrder.get(offer.dropOffStopOrder).dropOffs.push(serialized);
+      placed = true;
+    }
+    if (!placed) unassigned.push(serialized);
+  }
+
+  return ok(res, {
+    message: 'Manifeste annonce',
+    data: {
+      advertisementId: advertisement.id,
+      transitLineId: advertisement.transitLineId,
+      totalOffers: offers.length,
+      stops,
+      unassigned
+    }
+  });
 });
 
 export const acceptAdvertisementOffer = handle('advertisements.offerAccept', async (req, res) => {
@@ -6775,7 +7582,9 @@ const ASSIGNABLE_ROLES = [
   'super_admin',
   'support',
   'support_technique',
-  'support_commercial'
+  'support_commercial',
+  // SCP-060 — opérateur de transport collectif.
+  'shuttle_operator'
 ];
 
 export const superAdminUpdateUserRole = handle('super.userRole', async (req, res) => {
@@ -7558,6 +8367,71 @@ export const whatsappCallbackReceive = handle('whatsapp.callback.receive', async
  * Par défaut : 30 derniers jours. Expose uniquement les colis dont
  * l'utilisateur est l'expéditeur (`senderId`).
  */
+/**
+ * Factures de l'expéditeur professionnel. V1 : aucune table Invoice n'est
+ * encore matérialisée — on agrège les colis livrés et payés par mois en
+ * « factures synthétiques » pour alimenter l'UI mobile. Dès qu'un vrai
+ * module de facturation sera introduit, remplacer ce bloc par une lecture
+ * de la table `invoices`.
+ */
+export const getBusinessShipperInvoices = handle('business.shipperInvoices', async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query?.limit) || 12, 1), 60);
+
+  const parcels = await prisma.parcel.findMany({
+    where: {
+      senderId: req.user.id,
+      deletedAt: null,
+      status: 'delivered',
+      deliveryDate: { not: null }
+    },
+    select: {
+      id: true,
+      totalAmount: true,
+      price: true,
+      deliveryDate: true,
+      trackingNumber: true
+    },
+    orderBy: { deliveryDate: 'desc' }
+  });
+
+  // Agrégation par mois (YYYY-MM) : chaque bucket devient une facture.
+  const buckets = new Map();
+  for (const p of parcels) {
+    const d = p.deliveryDate;
+    if (!d) continue;
+    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    const existing = buckets.get(key) || { key, issuedAt: d, amount: 0, count: 0 };
+    const amount = Number(p.totalAmount ?? p.price ?? 0);
+    existing.amount += Number.isFinite(amount) ? amount : 0;
+    existing.count += 1;
+    // La facture datée au dernier jour du mois (plus proche de l'intention
+    // comptable d'un relevé mensuel).
+    if (d > existing.issuedAt) existing.issuedAt = d;
+    buckets.set(key, existing);
+  }
+
+  const invoices = Array.from(buckets.values())
+    .sort((a, b) => b.issuedAt.getTime() - a.issuedAt.getTime())
+    .slice(0, limit)
+    .map((b) => ({
+      id: `synth-${b.key}`,
+      number: `FA-${b.key}`,
+      issuedAt: b.issuedAt.toISOString(),
+      amount: b.amount,
+      currency: 'XOF',
+      status: 'generated',
+      // Pas de PDF matérialisé : le mobile masque le bouton de téléchargement
+      // quand `pdfUrl` est absent.
+      pdfUrl: null,
+      parcelCount: b.count
+    }));
+
+  return ok(res, {
+    message: 'Factures',
+    data: { invoices }
+  });
+});
+
 export const getBusinessShipperDashboard = handle('business.shipperDashboard', async (req, res) => {
   const now = new Date();
   const defaultFrom = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
@@ -7616,6 +8490,40 @@ export const getBusinessShipperDashboard = handle('business.shipperDashboard', a
 export const getMyReferralCode = handle('me.referralCode', async (req, res) => {
   const code = generateReferralCode(req.user?.id);
   return ok(res, { message: 'Code de parrainage', data: { referralCode: code } });
+});
+
+/**
+ * Récompenses de parrainage accumulées pour l'utilisateur courant.
+ * Les compteurs sont dérivés des lignes `Referral` dont il est parrain.
+ * V1 : `bonusAvailable` est égal à `bonusEarned` tant qu'aucune table de
+ * consommation n'existe — la différence apparaîtra naturellement lorsque
+ * le mécanisme de dépense sera introduit.
+ */
+export const getMyReferralRewards = handle('me.referralRewards', async (req, res) => {
+  const userId = req.user?.id;
+  const referrals = await prisma.referral.findMany({
+    where: { referrerId: userId },
+    select: {
+      status: true,
+      referrerBonusXof: true,
+      triggeredAt: true
+    }
+  });
+  const totalInvites = referrals.length;
+  const confirmedInvites = referrals.filter(r => r.status === 'triggered').length;
+  const toNumber = v => (v == null ? 0 : Number(v));
+  const bonusEarned = referrals.reduce((sum, r) => sum + toNumber(r.referrerBonusXof), 0);
+  const bonusAvailable = bonusEarned;
+  return ok(res, {
+    message: 'Récompenses de parrainage',
+    data: {
+      totalInvites,
+      confirmedInvites,
+      bonusEarned,
+      bonusAvailable,
+      currency: 'XOF'
+    }
+  });
 });
 
 /**
@@ -7711,6 +8619,27 @@ export const aiAssistantAsk = handle('ai.assistant.ask', async (req, res) => {
   return ok(res, {
     message: 'Reponse assistant',
     data: { result, configured: isAiAssistantConfigured() }
+  });
+});
+
+/**
+ * Stub transcription vocale. V1 : pas de moteur STT branché, on renvoie
+ * `text: null` pour que le mobile affiche son message d'indisponibilité.
+ * Le point de montage existe pour que la feature flag mobile (micro) n'ait
+ * pas à être masquée côté UI — elle dégrade naturellement sur ce no-op.
+ *
+ * Quand un fournisseur STT sera branché (OpenAI Whisper, Google STT, etc.),
+ * remplacer `text: null` par le résultat de la transcription.
+ */
+export const aiAssistantTranscribe = handle('ai.assistant.transcribe', async (req, res) => {
+  const audioUrl = typeof req.body?.audioUrl === 'string' ? req.body.audioUrl.trim() : '';
+  if (!audioUrl) {
+    throw new ValidationError([{ path: 'body.audioUrl', message: 'audioUrl requise' }]);
+  }
+  res.set('Cache-Control', 'no-store');
+  return ok(res, {
+    message: 'Transcription indisponible',
+    data: { text: null, configured: false }
   });
 });
 

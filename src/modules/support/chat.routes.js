@@ -62,4 +62,10 @@ supportChatRouter.post('/conversations/:id/transfer', staff, handle('support.tra
   const value = parse(z.object({ agentId: z.string().uuid(), expectedAssignedToId: z.string().uuid().nullable() }), req.body);
   return { conversation: await chat.transferChat(req.user, id(req), value.agentId, value.expectedAssignedToId) };
 }));
-supportChatRouter.post('/conversations/:id/close', staff, handle('support.close', req => chat.closeChat(req.user, id(req))));
+supportChatRouter.post('/conversations/:id/close', staff, handle('support.close', req => {
+  const value = parse(z.object({
+    reason: z.string().trim().min(5).max(2000).optional(),
+    category: z.enum(['resolved', 'duplicate', 'spam', 'no_answer']).optional()
+  }).default({}), req.body ?? {});
+  return chat.closeChat(req.user, id(req), value);
+}));

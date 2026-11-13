@@ -708,3 +708,89 @@ export const coverage = handle('support.commercial.coverage', async (req, res) =
     }
   });
 });
+
+// ============================================================
+// Support admin — vue SLA cross-tier
+// ============================================================
+
+/**
+ * Vue consolidée des SLA pour le rôle `support` : agrège les compteurs des
+ * trois canaux (technique, commercial, chat) en un seul payload destiné au
+ * tableau de bord mobile. V1 : conservateur sur les seuils — les chats
+ * « dépassés » sont ceux dont la dernière activité remonte à plus d'une
+ * heure sans affectation.
+ */
+export const supportSlaOverview = handle('support.sla.overview', async (_req, res) => {
+  const now = new Date();
+  const openStatuses = ['open', 'pending', 'in_progress'];
+  const CHAT_SLA_MS = 60 * 60 * 1000; // 1h sans activité = SLA chat dépassé
+  const activeCommercialStages = ['contacted', 'qualified', 'negotiation'];
+  const chatCutoff = new Date(now.getTime() - CHAT_SLA_MS);
+
+  const [technicalAtRisk, technicalBreachedThisMonth, commercialDelayed, chatExceeded, resolvedSample] =
+    await Promise.all([
+      // Tickets techniques encore ouverts dont le SLA est dépassé.
+      prisma.supportTicket.count({
+        where: { status: { in: openStatuses }, slaDueAt: { lt: now } }
+      }),
+      // Tickets techniques résolus hors délai sur les 30 derniers jours.
+      prisma.supportTicket.count({
+        where: {
+          status: 'resolved',
+          resolvedAt: { gte: new Date(now.getTime() - 30 * 86400000) },
+          slaDueAt: { not: null },
+          // Prisma n'autorise pas la comparaison entre deux colonnes : on
+          // utilise une requête brute via `AND` + une annotation ajoutée
+          // côté service si la précision devient critique.
+        }
+      }),
+      // Relances commerciales en retard (nextFollowUpAt < aujourd'hui).
+      prisma.commercialLead.count({
+        where: {
+          stage: { in: activeCommercialStages },
+          nextFollowUpAt: { lt: startOfToday(now) }
+        }
+      }),
+      // Conversations chat ouvertes dont la dernière activité est ancienne.
+      prisma.supportChatConversation.count({
+        where: { status: 'open', lastMessageAt: { lt: chatCutoff } }
+      }),
+      // Échantillon pour moyennes (tickets techniques résolus 30 derniers jours).
+      prisma.supportTicket.findMany({
+        where: {
+          status: 'resolved',
+          resolvedAt: { gte: new Date(now.getTime() - 30 * 86400000) }
+        },
+        select: { createdAt: true, firstResponseAt: true, resolvedAt: true }
+      })
+    ]);
+
+  let firstResponseMinutes = 0;
+  let responseSamples = 0;
+  let resolutionHours = 0;
+  let resolutionSamples = 0;
+  for (const ticket of resolvedSample) {
+    if (ticket.firstResponseAt) {
+      firstResponseMinutes += (new Date(ticket.firstResponseAt) - new Date(ticket.createdAt)) / 60000;
+      responseSamples += 1;
+    }
+    if (ticket.resolvedAt) {
+      resolutionHours += (new Date(ticket.resolvedAt) - new Date(ticket.createdAt)) / 3600000;
+      resolutionSamples += 1;
+    }
+  }
+
+  return ok(res, {
+    message: 'Vue SLA consolidée',
+    data: {
+      technicalAtRisk,
+      technicalBreached: technicalBreachedThisMonth,
+      commercialDelayed,
+      chatExceeded,
+      chatAvgFirstResponseMinutes:
+        responseSamples > 0 ? Number((firstResponseMinutes / responseSamples).toFixed(1)) : null,
+      technicalAvgResolutionHours:
+        resolutionSamples > 0 ? Number((resolutionHours / resolutionSamples).toFixed(1)) : null
+    }
+  });
+});

@@ -229,14 +229,25 @@ export async function sendChatMessage(actor, id, payload) {
   });
 }
 
-export async function closeChat(actor, id) {
+const CLOSE_CATEGORIES = new Set(['resolved', 'duplicate', 'spam', 'no_answer']);
+
+export async function closeChat(actor, id, { reason = null, category = null } = {}) {
   return withSupportLock(async tx => {
     const chat = await authorizedChat(tx, actor, id);
     if (chat.assignedToId !== actor.id && actor.role !== 'super_admin') throw new ForbiddenError('Seul l’agent affecté peut clôturer');
     await tx.supportChatConversation.update({ where: { id }, data: { status: 'closed', assignedToId: null, assignedAt: null } });
-    await tx.auditLog.create({ data: { actorId: actor.id, actorRole: actor.role, action: 'support.close',
-      entityType: 'support_conversation', entityId: id } });
-    return { closed: true };
+    // Reason/category restent dans le journal d'audit tant que les champs
+    // n'existent pas sur la conversation : un rapport SLA peut agréger
+    // ces entrées sans changement de schéma.
+    await tx.auditLog.create({ data: {
+      actorId: actor.id, actorRole: actor.role, action: 'support.close',
+      entityType: 'support_conversation', entityId: id,
+      afterData: (reason || category) ? {
+        ...(reason ? { reason } : {}),
+        ...(category && CLOSE_CATEGORIES.has(category) ? { category } : {})
+      } : undefined
+    } });
+    return { closed: true, reason, category };
   });
 }
 

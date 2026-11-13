@@ -10,6 +10,11 @@ export const supportRouter = Router();
 // son pipeline. Le super admin conserve un accès transverse aux deux espaces.
 const technique = [authenticate, requireRoles('support_technique', 'super_admin')];
 const commercial = [authenticate, requireRoles('support_commercial', 'super_admin')];
+// Vue transverse réservée aux rôles ayant la lecture sur les trois canaux.
+const supportAdmin = [authenticate, requireRoles('support', 'super_admin')];
+
+// --- Vue SLA cross-tier ---
+supportRouter.get('/support-admin/sla-overview', ...supportAdmin, supportController.supportSlaOverview);
 
 // --- Profils ---
 supportRouter.put(

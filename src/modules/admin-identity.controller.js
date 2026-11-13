@@ -153,3 +153,66 @@ export const rejectIdentity = handle('identity.reject', async (req, res) => {
   if (!reason) throw new ValidationError([{ path: 'body.reason', message: 'Motif de refus requis' }]);
   return review(req, res, { status: 'rejected', reason });
 });
+
+export const deleteIdentity = handle('identity.delete', async (req, res) => {
+  const existing = await prisma.identityVerification.findUnique({
+    where: { id: req.params.verificationId },
+    include: includeUser
+  });
+  if (!existing) throw new NotFoundError('Vérification introuvable');
+
+  await prisma.$transaction(async (tx) => {
+    await tx.identityVerification.delete({ where: { id: existing.id } });
+    // Si c'était la seule vérification approuvée, l'utilisateur redevient
+    // non vérifié : garantit la cohérence du drapeau isVerified.
+    if (existing.status === 'approved') {
+      const stillApproved = await tx.identityVerification.count({
+        where: { userId: existing.userId, status: 'approved' }
+      });
+      if (stillApproved === 0) {
+        await tx.user.update({
+          where: { id: existing.userId },
+          data: { isVerified: false }
+        });
+      }
+    }
+  });
+
+  return ok(res, {
+    message: 'Vérification supprimée',
+    data: { id: existing.id }
+  });
+});
+
+export const requestInfoIdentity = handle('identity.requestInfo', async (req, res) => {
+  const message = req.body.message ? String(req.body.message).trim() : '';
+  if (message.length < 5) {
+    throw new ValidationError([
+      { path: 'body.message', message: 'Message d’au moins 5 caractères requis' }
+    ]);
+  }
+
+  const existing = await prisma.identityVerification.findUnique({
+    where: { id: req.params.verificationId },
+    include: includeUser
+  });
+  if (!existing) throw new NotFoundError('Vérification introuvable');
+
+  // La demande ne change pas le statut : elle notifie l'utilisateur et
+  // laisse la vérification en pending pour une re-soumission.
+  await prisma.notification.create({
+    data: {
+      userId: existing.userId,
+      type: 'identity_request_info',
+      title: 'Complément requis pour votre vérification',
+      body: message,
+      data: { verificationId: existing.id, requestedBy: req.user.id },
+      priority: 'high'
+    }
+  });
+
+  return ok(res, {
+    message: 'Demande envoyée',
+    data: { verification: serialize(existing) }
+  });
+});

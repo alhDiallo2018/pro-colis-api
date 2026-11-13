@@ -30,6 +30,7 @@ mobileRouter.get('/client/debts', authenticate, requireRoles('client'), mobileCo
 mobileRouter.put('/client/profile', authenticate, requireRoles('client'), mobileController.updateProfile);
 mobileRouter.get('/client/parcels/my-parcels', authenticate, requireRoles('client'), mobileController.clientParcels);
 mobileRouter.post('/client/parcels/create', authenticate, requireRoles('client'), mobileController.createParcel);
+mobileRouter.post('/client/parcels/bulk-create', authenticate, requireRoles('client'), mobileController.bulkCreateParcels);
 mobileRouter.get('/client/parcels/:parcelId', authenticate, requireRoles('client'), mobileController.getParcelDetail);
 mobileRouter.put('/client/parcels/:parcelId', authenticate, requireRoles('client'), mobileController.updateParcel);
 mobileRouter.get('/client/parcels/:parcelId/delivery-code', authenticate, requireRoles('client'), mobileController.clientDeliveryCode);
@@ -233,6 +234,7 @@ mobileRouter.get('/public/broadcasts', optionalAuthenticate, mobileController.ge
 mobileRouter.get('/public/config', optionalAuthenticate, mobileController.getPublicConfig);
 // Assistant IA : auth requise pour éviter l'abus (coût LLM par utilisateur).
 mobileRouter.post('/ai/assistant', authenticate, mobileController.aiAssistantAsk);
+mobileRouter.post('/ai/assistant/transcribe', authenticate, mobileController.aiAssistantTranscribe);
 // Promise-time : créneaux proposés (public, aide à la saisie).
 mobileRouter.get('/parcels/promise-slots', optionalAuthenticate, mobileController.getPromiseSlots);
 // Devis international CEDEAO (public — aide au client avant création colis).
@@ -243,10 +245,14 @@ mobileRouter.post('/parcels/insurance/quote', authenticate, mobileController.get
 mobileRouter.post('/parcels/:parcelId/insurance/subscribe', authenticate, mobileController.subscribeInsurance);
 // Code de parrainage personnel.
 mobileRouter.get('/me/referral-code', authenticate, mobileController.getMyReferralCode);
+// Récompenses accumulées (invitations confirmées + bonus).
+mobileRouter.get('/me/referral-rewards', authenticate, mobileController.getMyReferralRewards);
 // Revendication d'un code de parrainage par le filleul.
 mobileRouter.post('/me/referral/claim', authenticate, mobileController.claimReferral);
 // Dashboard B2B expéditeur professionnel (volumes, SLA, destinations).
 mobileRouter.get('/business-shipper/dashboard', authenticate, mobileController.getBusinessShipperDashboard);
+// Factures mensuelles synthétisées depuis les colis livrés.
+mobileRouter.get('/business-shipper/invoices', authenticate, mobileController.getBusinessShipperInvoices);
 
 // Admin : gestion des clés API partenaires e-commerce.
 const superAdminOnly = requireRoles('super_admin');
@@ -539,7 +545,7 @@ mobileRouter.delete('/advertisements/:advertisementId/live', authenticate, requi
 mobileRouter.get('/advertisements', optionalAuthenticate, mobileController.listAdvertisements);
 mobileRouter.get('/advertisements/my', authenticate, mobileController.myAdvertisements);
 mobileRouter.get('/advertisements/drivers', optionalAuthenticate, mobileController.listAdvertisements);
-mobileRouter.post('/advertisements', authenticate, requireRoles('driver'), mobileController.createAdvertisement);
+mobileRouter.post('/advertisements', authenticate, requireRoles('driver', 'shuttle_operator'), mobileController.createAdvertisement);
 mobileRouter.get('/advertisements/stats', authenticate, mobileController.advertisementStats);
 mobileRouter.get('/advertisements/:advertisementId', optionalAuthenticate, mobileController.advertisementDetail);
 mobileRouter.put('/advertisements/:advertisementId', authenticate, mobileController.updateAdvertisement);
@@ -547,6 +553,46 @@ mobileRouter.delete('/advertisements/:advertisementId', authenticate, mobileCont
 mobileRouter.post('/advertisements/:advertisementId/close', authenticate, mobileController.closeAdvertisement);
 mobileRouter.post('/advertisements/:advertisementId/offers', authenticate, requireRoles('client'), mobileController.createAdvertisementOffer);
 mobileRouter.get('/advertisements/:advertisementId/offers', authenticate, mobileController.advertisementOffers);
+mobileRouter.get('/advertisements/:advertisementId/manifest', authenticate, mobileController.advertisementManifest);
+mobileRouter.get('/advertisements/:advertisementId/reached-stops', authenticate, mobileController.advertisementReachedStops);
+mobileRouter.post('/advertisements/:advertisementId/optimize-route', authenticate, mobileController.advertisementOptimizeRoute);
+
+// OPS-4 — Métriques pilote 14 jours.
+mobileRouter.get('/super-admin/pilot-metrics/14d', authenticate, requireRoles('super_admin'), mobileController.adminPilot14dMetrics);
+
+// ADM-1 — Dashboard admin (webhooks, arrêts atteints, correspondances).
+mobileRouter.get('/super-admin/webhooks/recent', authenticate, requireRoles('super_admin'), mobileController.adminRecentWebhooks);
+mobileRouter.get('/super-admin/stop-events/recent', authenticate, requireRoles('super_admin'), mobileController.adminRecentStopEvents);
+mobileRouter.get('/super-admin/handovers/recent', authenticate, requireRoles('super_admin'), mobileController.adminRecentHandovers);
+
+// Phase 5 — Déclarations douanières (SCP-040) + devis carriers (SCP-041).
+mobileRouter.get('/parcels/:parcelId/international-offers', authenticate, mobileController.parcelInternationalOffers);
+mobileRouter.get('/parcels/:parcelId/customs', authenticate, mobileController.getParcelCustoms);
+mobileRouter.post('/parcels/:parcelId/customs', authenticate, mobileController.createParcelCustoms);
+mobileRouter.put('/parcels/:parcelId/customs', authenticate, mobileController.updateParcelCustoms);
+mobileRouter.post('/parcels/:parcelId/customs/sign', authenticate, mobileController.signParcelCustoms);
+
+// Phase 4 — Expéditions groupées (B2B / e-commerce).
+mobileRouter.post('/shipment-batches', authenticate, mobileController.createShipmentBatch);
+mobileRouter.get('/shipment-batches', authenticate, mobileController.listShipmentBatches);
+mobileRouter.get('/shipment-batches/:batchId', authenticate, mobileController.getShipmentBatch);
+mobileRouter.post('/shipment-batches/:batchId/parcels', authenticate, mobileController.attachParcelsToBatch);
+mobileRouter.delete('/shipment-batches/:batchId/parcels/:parcelId', authenticate, mobileController.detachParcelFromBatch);
+mobileRouter.post('/shipment-batches/:batchId/close', authenticate, mobileController.closeShipmentBatch);
+mobileRouter.get('/shipment-batches/:batchId/stop-events', authenticate, mobileController.listShipmentBatchStopEvents);
+mobileRouter.post('/shipment-batches/:batchId/stop-events', authenticate, mobileController.createShipmentBatchStopEvent);
+
+// --- Litiges formels (disputes) ---
+mobileRouter.get('/me/disputes', authenticate, mobileController.listMyDisputes);
+mobileRouter.get('/disputes/:disputeId', authenticate, mobileController.getDispute);
+mobileRouter.post('/parcels/:parcelId/disputes', authenticate, mobileController.openDispute);
+mobileRouter.post('/disputes/:disputeId/comments', authenticate, mobileController.commentDispute);
+
+// Phase 2 — Correspondances inter-véhicules (handover de colis).
+mobileRouter.post('/parcels/:parcelId/handovers', authenticate, requireRoles('driver', 'shuttle_operator'), mobileController.initiateParcelHandover);
+mobileRouter.get('/parcels/:parcelId/handovers', authenticate, mobileController.listParcelHandovers);
+mobileRouter.post('/parcels/:parcelId/handovers/:handoverId/confirm', authenticate, requireRoles('driver', 'shuttle_operator'), mobileController.confirmParcelHandover);
+mobileRouter.post('/parcels/:parcelId/handovers/:handoverId/cancel', authenticate, mobileController.cancelParcelHandover);
 mobileRouter.post(
   '/advertisements/:advertisementId/offers/:offerId/accept',
   authenticate,
@@ -637,6 +683,8 @@ mobileRouter.delete('/super-admin/assistances/:assistanceId', authenticate, requ
 mobileRouter.get('/super-admin/identity-verifications', authenticate, supportReadRoles, adminIdentityController.listIdentityVerifications);
 mobileRouter.post('/super-admin/identity-verifications/:verificationId/approve', authenticate, supportWriteRoles, adminIdentityController.approveIdentity);
 mobileRouter.post('/super-admin/identity-verifications/:verificationId/reject', authenticate, supportWriteRoles, adminIdentityController.rejectIdentity);
+mobileRouter.post('/super-admin/identity-verifications/:verificationId/request-info', authenticate, supportWriteRoles, adminIdentityController.requestInfoIdentity);
+mobileRouter.delete('/super-admin/identity-verifications/:verificationId', authenticate, supportWriteRoles, adminIdentityController.deleteIdentity);
 
 // ============================================================
 // SUPER ADMIN - EXPENSES
