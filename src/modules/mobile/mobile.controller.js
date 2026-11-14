@@ -42,6 +42,7 @@ import { aggregateShipperStats } from '../../utils/business-shipper-stats.js';
 import { validateOfferStops } from '../../utils/transit-offer-stops.js';
 import { optimizeTour } from '../../utils/tour-optimizer.js';
 import { estimateShipping as estimateInternationalShipping } from '../../utils/international-carriers.js';
+import { buildTextPdf, suggestTruncate } from '../../utils/invoice-pdf.js';
 import {
   initiateHandover as svcInitiateHandover,
   confirmHandover as svcConfirmHandover,
@@ -6109,7 +6110,8 @@ export const createAdvertisementOffer = handle('advertisements.offerCreate', asy
         price,
         message: req.body.message,
         boardingStopOrder: stopAssignment.boardingStopOrder,
-        dropOffStopOrder: stopAssignment.dropOffStopOrder
+        dropOffStopOrder: stopAssignment.dropOffStopOrder,
+        lastOfferBy: 'client'
       },
       include: { client: true, parcel: { include: { media: true } } }
     });
@@ -6847,6 +6849,14 @@ export const acceptAdvertisementOffer = handle('advertisements.offerAccept', asy
     if (currentOffer.status === 'rejected') {
       throw new ConflictError('Cette offre a deja ete refusee');
     }
+    // Anti self-validation : si le driver (propriétaire de l'annonce) a posé
+    // la dernière contre-offre, il doit attendre la réponse du client avant
+    // de pouvoir l'accepter. Le NULL historique est traité comme 'client' pour
+    // préserver le flow des offres pré-migration (créées par un client).
+    const effectiveLastOffer = currentOffer.lastOfferBy ?? 'client';
+    if (effectiveLastOffer === 'driver') {
+      throw new ConflictError('Votre contre-offre est déjà envoyée : attendez la réponse du client');
+    }
     if (advertisement.status !== 'open' && currentOffer.status !== 'accepted') {
       throw new ConflictError('Cette annonce n\'accepte plus de nouvelles offres');
     }
@@ -7075,12 +7085,24 @@ export const negotiateAdvertisementOffer = handle('advertisements.offerNegotiate
       throw new ConflictError('Cette annonce n\'est plus ouverte a la negociation');
     }
 
+    // Anti self-counter : celui qui a posé la dernière offre ne peut pas
+    // immédiatement en reposer une autre — il doit attendre la réponse de
+    // l'autre partie. NULL historique est traité comme 'client' (création).
+    const viewerRole = isDriver ? 'driver' : 'client';
+    const effectiveLastOffer = current.lastOfferBy ?? 'client';
+    if (!isDriver && !isClient && req.user.role === 'super_admin') {
+      // Un super_admin peut arbitrer sans restriction métier.
+    } else if (effectiveLastOffer === viewerRole) {
+      throw new ConflictError('Votre contre-offre est déjà envoyée : attendez la réponse de l\'autre partie');
+    }
+
     const updated = await tx.advertisementOffer.update({
       where: { id: current.id },
       data: {
         price,
         responseMessage: req.body.message,
         status: 'countered',
+        lastOfferBy: viewerRole,
         respondedAt: new Date()
       },
       include: { client: true, parcel: { include: { media: true } } }
@@ -8373,7 +8395,73 @@ export const whatsappCallbackReceive = handle('whatsapp.callback.receive', async
  * « factures synthétiques » pour alimenter l'UI mobile. Dès qu'un vrai
  * module de facturation sera introduit, remplacer ce bloc par une lecture
  * de la table `invoices`.
+ *
+ * Les IDs synthétiques (`synth-YYYY-MM`) sont décodés par les endpoints
+ * détail/PDF pour reconstruire l'agrégation à la demande. Idempotent tant
+ * que les colis livrés ne sont pas modifiés.
  */
+const INVOICE_ID_RE = /^synth-(\d{4})-(\d{2})$/;
+
+function parseInvoiceId(id) {
+  const match = INVOICE_ID_RE.exec(id || '');
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) {
+    return null;
+  }
+  return { year, month, key: `${match[1]}-${match[2]}` };
+}
+
+function invoiceMonthRange(year, month) {
+  const start = new Date(Date.UTC(year, month - 1, 1));
+  const end = new Date(Date.UTC(year, month, 1));
+  return { start, end };
+}
+
+async function fetchInvoiceParcels(userId, year, month) {
+  const { start, end } = invoiceMonthRange(year, month);
+  return prisma.parcel.findMany({
+    where: {
+      senderId: userId,
+      deletedAt: null,
+      status: 'delivered',
+      deliveryDate: { gte: start, lt: end }
+    },
+    select: {
+      id: true,
+      totalAmount: true,
+      price: true,
+      deliveryDate: true,
+      trackingNumber: true,
+      receiverName: true
+    },
+    orderBy: { deliveryDate: 'asc' }
+  });
+}
+
+function summarizeInvoice(key, parcels) {
+  let issuedAt = null;
+  let amount = 0;
+  for (const p of parcels) {
+    const v = Number(p.totalAmount ?? p.price ?? 0);
+    if (Number.isFinite(v)) amount += v;
+    if (p.deliveryDate && (!issuedAt || p.deliveryDate > issuedAt)) {
+      issuedAt = p.deliveryDate;
+    }
+  }
+  return {
+    id: `synth-${key}`,
+    number: `FA-${key}`,
+    issuedAt: issuedAt ? issuedAt.toISOString() : null,
+    amount,
+    currency: 'XOF',
+    status: 'generated',
+    pdfUrl: `/business-shipper/invoices/synth-${key}/pdf`,
+    parcelCount: parcels.length
+  };
+}
+
 export const getBusinessShipperInvoices = handle('business.shipperInvoices', async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query?.limit) || 12, 1), 60);
 
@@ -8394,7 +8482,6 @@ export const getBusinessShipperInvoices = handle('business.shipperInvoices', asy
     orderBy: { deliveryDate: 'desc' }
   });
 
-  // Agrégation par mois (YYYY-MM) : chaque bucket devient une facture.
   const buckets = new Map();
   for (const p of parcels) {
     const d = p.deliveryDate;
@@ -8404,8 +8491,6 @@ export const getBusinessShipperInvoices = handle('business.shipperInvoices', asy
     const amount = Number(p.totalAmount ?? p.price ?? 0);
     existing.amount += Number.isFinite(amount) ? amount : 0;
     existing.count += 1;
-    // La facture datée au dernier jour du mois (plus proche de l'intention
-    // comptable d'un relevé mensuel).
     if (d > existing.issuedAt) existing.issuedAt = d;
     buckets.set(key, existing);
   }
@@ -8420,9 +8505,7 @@ export const getBusinessShipperInvoices = handle('business.shipperInvoices', asy
       amount: b.amount,
       currency: 'XOF',
       status: 'generated',
-      // Pas de PDF matérialisé : le mobile masque le bouton de téléchargement
-      // quand `pdfUrl` est absent.
-      pdfUrl: null,
+      pdfUrl: `/business-shipper/invoices/synth-${b.key}/pdf`,
       parcelCount: b.count
     }));
 
@@ -8430,6 +8513,67 @@ export const getBusinessShipperInvoices = handle('business.shipperInvoices', asy
     message: 'Factures',
     data: { invoices }
   });
+});
+
+export const getBusinessShipperInvoice = handle('business.shipperInvoiceDetail', async (req, res) => {
+  const parsed = parseInvoiceId(req.params.invoiceId);
+  if (!parsed) throw new NotFoundError('Facture introuvable');
+  const parcels = await fetchInvoiceParcels(req.user.id, parsed.year, parsed.month);
+  if (parcels.length === 0) throw new NotFoundError('Facture introuvable');
+  const invoice = summarizeInvoice(parsed.key, parcels);
+  return ok(res, {
+    message: 'Détail facture',
+    data: {
+      invoice,
+      parcels: parcels.map((p) => ({
+        id: p.id,
+        trackingNumber: p.trackingNumber,
+        receiverName: p.receiverName,
+        deliveryDate: p.deliveryDate ? p.deliveryDate.toISOString() : null,
+        amount: Number(p.totalAmount ?? p.price ?? 0)
+      }))
+    }
+  });
+});
+
+export const getBusinessShipperInvoicePdf = handle('business.shipperInvoicePdf', async (req, res) => {
+  const parsed = parseInvoiceId(req.params.invoiceId);
+  if (!parsed) throw new NotFoundError('Facture introuvable');
+  const parcels = await fetchInvoiceParcels(req.user.id, parsed.year, parsed.month);
+  if (parcels.length === 0) throw new NotFoundError('Facture introuvable');
+  const invoice = summarizeInvoice(parsed.key, parcels);
+
+  const lines = [
+    `Numéro : ${invoice.number}`,
+    `Émise le : ${invoice.issuedAt ? invoice.issuedAt.slice(0, 10) : '—'}`,
+    `Nombre de colis : ${invoice.parcelCount}`,
+    `Total : ${Math.round(invoice.amount).toLocaleString('fr-FR')} ${invoice.currency}`,
+    '',
+    '— Détail des envois —'
+  ];
+  for (const p of parcels) {
+    const date = p.deliveryDate ? p.deliveryDate.toISOString().slice(0, 10) : '—';
+    const amount = Math.round(Number(p.totalAmount ?? p.price ?? 0)).toLocaleString('fr-FR');
+    const label = suggestTruncate(
+      `${date}  ${p.trackingNumber ?? p.id}  →  ${p.receiverName ?? '—'}`,
+      380,
+      11
+    );
+    lines.push(`${label}   ${amount} XOF`);
+  }
+
+  const pdf = buildTextPdf({
+    title: `Relevé mensuel ${parsed.key}`,
+    lines
+  });
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader(
+    'Content-Disposition',
+    `inline; filename="${invoice.number}.pdf"`
+  );
+  res.setHeader('Content-Length', pdf.length.toString());
+  res.status(200).end(pdf);
 });
 
 export const getBusinessShipperDashboard = handle('business.shipperDashboard', async (req, res) => {

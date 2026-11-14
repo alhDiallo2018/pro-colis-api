@@ -253,6 +253,8 @@ mobileRouter.post('/me/referral/claim', authenticate, mobileController.claimRefe
 mobileRouter.get('/business-shipper/dashboard', authenticate, mobileController.getBusinessShipperDashboard);
 // Factures mensuelles synthétisées depuis les colis livrés.
 mobileRouter.get('/business-shipper/invoices', authenticate, mobileController.getBusinessShipperInvoices);
+mobileRouter.get('/business-shipper/invoices/:invoiceId', authenticate, mobileController.getBusinessShipperInvoice);
+mobileRouter.get('/business-shipper/invoices/:invoiceId/pdf', authenticate, mobileController.getBusinessShipperInvoicePdf);
 
 // Admin : gestion des clés API partenaires e-commerce.
 const superAdminOnly = requireRoles('super_admin');

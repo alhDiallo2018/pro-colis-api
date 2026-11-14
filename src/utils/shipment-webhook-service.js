@@ -112,13 +112,20 @@ function toPublicShipmentPayload(parcel) {
 export async function dispatchShipmentEvent({
   type,
   parcel,
-  requiredScope = 'shipments.read'
+  requiredScope = 'shipments.read',
+  extraPayload = null
 } = {}) {
   // Les entrées invalides retournent l'ancien shape pour que les callers
   // conditionnels (`if (r.sent === 0)`) ne cassent pas pendant la bascule.
   if (typeof type !== 'string' || !type) return { sent: 0, failed: 0 };
-  const payload = toPublicShipmentPayload(parcel);
-  if (!payload) return { sent: 0, failed: 0 };
+  const base = toPublicShipmentPayload(parcel);
+  if (!base) return { sent: 0, failed: 0 };
+  // Enrichissement événement-spécifique (ex : stop_reached ajoute stopOrder,
+  // stopLabel, distanceMeters). Fusion stable : les extras ne remplacent
+  // jamais les champs canoniques du payload public.
+  const payload = extraPayload && typeof extraPayload === 'object' && !Array.isArray(extraPayload)
+    ? { ...extraPayload, ...base }
+    : base;
 
   const partners = await loadActivePartners();
   const eligible = partners.filter((p) => p.scopes.includes(requiredScope));

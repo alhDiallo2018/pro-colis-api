@@ -15,6 +15,8 @@ enum UserRole {
   support
   support_technique
   support_commercial
+  // Opérateur de transport collectif (Tata/AFTU/DDD). Gère flotte + lignes.
+  shuttle_operator
 }
 
 enum TicketChannel {
@@ -295,6 +297,10 @@ model User {
   driverLocations         DriverLocation[]
   ratingsGiven            Rating[]               @relation("RatingAuthor")
   ratingsReceived         Rating[]               @relation("RatingDriver")
+  handoversAsFromDriver   ParcelHandover[]       @relation("ParcelHandoverFromDriver")
+  handoversAsToDriver     ParcelHandover[]       @relation("ParcelHandoverToDriver")
+  shipmentBatches         ShipmentBatch[]
+  customsDeclarationsSigned ParcelCustoms[] @relation("ParcelCustomsSignedBy")
   supportMessages         SupportMessage[]
   identityVerifications   IdentityVerification[] @relation("IdentityOwner")
   reviewedIdentities      IdentityVerification[] @relation("IdentityReviewer")
@@ -381,6 +387,11 @@ model Parcel {
   id                    String               @id @default(uuid()) @db.Uuid
   trackingNumber        String               @unique @map("tracking_number")
   senderId              String?              @map("sender_id") @db.Uuid
+  // Regroupement commercial (B2B / e-commerce). Nullable : un colis isolé n'a
+  // pas de batch. Voir ShipmentBatch.
+  batchId               String?              @map("batch_id") @db.Uuid
+  batch                 ShipmentBatch?       @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  customs               ParcelCustoms?
   senderName            String               @map("sender_name")
   senderPhone           String               @map("sender_phone")
   senderEmail           String?              @map("sender_email")
@@ -462,6 +473,7 @@ model Parcel {
   advertisementOffers   AdvertisementOffer[]
   driverLocations       DriverLocation[]
   ratings               Rating[]
+  handovers             ParcelHandover[]
   messages              Message[]
   negotiationMessages   NegotiationMessage[]
   clientPenaltyDebts    ClientPenaltyDebt[]
@@ -839,6 +851,8 @@ model RefreshToken {
 model Advertisement {
   routeAlertDeliveries RouteAlertDelivery[]
   journeyLive JourneyLive?
+  handoversFrom ParcelHandover[] @relation("ParcelHandoverFromAd")
+  handoversTo   ParcelHandover[] @relation("ParcelHandoverToAd")
   id                String               @id @default(uuid()) @db.Uuid
   driverId          String               @map("driver_id") @db.Uuid
   departureGarageId String?              @map("departure_garage_id") @db.Uuid
@@ -870,21 +884,31 @@ model Advertisement {
 }
 
 model AdvertisementOffer {
-  id              String        @id @default(uuid()) @db.Uuid
-  advertisementId String        @map("advertisement_id") @db.Uuid
-  clientId        String        @map("client_id") @db.Uuid
-  parcelId        String?       @map("parcel_id") @db.Uuid
-  price           Decimal       @db.Decimal(12, 2)
-  message         String?
-  status          BidStatus     @default(pending)
-  responseMessage String?       @map("response_message")
-  respondedAt     DateTime?     @map("responded_at") @db.Timestamptz
-  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz
-  advertisement   Advertisement @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
-  client          User          @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  parcel          Parcel?       @relation(fields: [parcelId], references: [id], onDelete: SetNull)
+  id                 String        @id @default(uuid()) @db.Uuid
+  advertisementId    String        @map("advertisement_id") @db.Uuid
+  clientId           String        @map("client_id") @db.Uuid
+  parcelId           String?       @map("parcel_id") @db.Uuid
+  price              Decimal       @db.Decimal(12, 2)
+  message            String?
+  status             BidStatus     @default(pending)
+  responseMessage    String?       @map("response_message")
+  // Côté qui a posé la dernière proposition. Indispensable pour verrouiller
+  // l'accepter : on ne valide jamais son propre prix (anti self-validation).
+  lastOfferBy        NegotiationRole? @map("last_offer_by")
+  respondedAt        DateTime?     @map("responded_at") @db.Timestamptz
+  // Arrêts d'embarquement et de descente du colis sur la ligne du trajet.
+  // Nullable : offres sur annonces sans transit_line_id (voitures libres).
+  // Validés applicativement contre transit_line_stops via advertisement.transit_line_id.
+  boardingStopOrder  Int?          @map("boarding_stop_order")
+  dropOffStopOrder   Int?          @map("drop_off_stop_order")
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+  advertisement      Advertisement @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
+  client             User          @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  parcel             Parcel?       @relation(fields: [parcelId], references: [id], onDelete: SetNull)
 
+  @@index([boardingStopOrder])
+  @@index([dropOffStopOrder])
   @@map("advertisement_offers")
 }
 
@@ -1367,12 +1391,143 @@ model JourneyLive {
   longitude       Decimal       @db.Decimal(10, 7)
   accuracyMeters  Float         @map("accuracy_meters")
   capturedAt      DateTime      @map("captured_at") @db.Timestamptz
+  // Ring buffer des N dernières positions GPS (JSON array de { lat, lng, t })
+  // alimenté par updateJourneyLive. Sert à la détection d'arrivée aux arrêts
+  // (confirmation par consécutivité) sans table d'historique dédiée.
+  recentPositions Json          @default("[]") @map("recent_positions")
   startedAt       DateTime      @default(now()) @map("started_at") @db.Timestamptz
   updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz
   advertisement   Advertisement @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
   driver          User          @relation(fields: [driverId], references: [id], onDelete: Cascade)
   vehicle         Vehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
   @@map("journey_live")
+}
+
+// Expéditions groupées : regroupement commercial de N colis sous une entité
+// commune (B2B ou import e-commerce). Les colis restent individuels avec
+// leur propre tracking, mais partagent un référentiel commun pour la
+// facturation consolidée et le suivi global.
+model ShipmentBatch {
+  id            String    @id @default(uuid()) @db.Uuid
+  creatorId     String    @map("creator_id") @db.Uuid
+  apiKeyId      String?   @map("api_key_id")
+  reference     String?
+  label         String?
+  // draft | open | closed | cancelled (CHECK en base).
+  status        String    @default("draft")
+  totalParcels  Int       @default(0) @map("total_parcels")
+  totalWeightKg Decimal   @default(0) @db.Decimal(12, 2) @map("total_weight_kg")
+  totalAmount   Decimal?  @db.Decimal(14, 2) @map("total_amount")
+  currency      String?
+  metadata      Json      @default("{}")
+  closedAt      DateTime? @map("closed_at") @db.Timestamptz
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  creator       User      @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  parcels       Parcel[]
+
+  @@index([creatorId])
+  @@index([status])
+  @@index([reference])
+  @@map("shipment_batches")
+}
+
+// Déclarations douanières structurées (SCP-040). Relation 1:1 avec Parcel.
+// Minimum pour expéditions internationales : pays, contenu, valeur, HS code,
+// usage (commercial/gift/sample/personal/return), documents scannés.
+model ParcelCustoms {
+  id                   String    @id @default(uuid()) @db.Uuid
+  parcelId             String    @unique @map("parcel_id") @db.Uuid
+  originCountry        String    @map("origin_country")
+  destinationCountry   String    @map("destination_country")
+  contentsDescription  String    @map("contents_description")
+  hsCode               String?   @map("hs_code")
+  declaredValue        Decimal   @map("declared_value") @db.Decimal(14, 2)
+  declaredCurrency     String    @default("XOF") @map("declared_currency")
+  weightKg             Decimal?  @map("weight_kg") @db.Decimal(10, 2)
+  quantity             Int       @default(1)
+  category             String?
+  // commercial | gift | sample | personal | return (CHECK en base).
+  purpose              String    @default("personal")
+  isDangerous          Boolean   @default(false) @map("is_dangerous")
+  documentsUrls        Json      @default("[]") @map("documents_urls")
+  signedAt             DateTime? @map("signed_at") @db.Timestamptz
+  signedById           String?   @map("signed_by_id") @db.Uuid
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  parcel               Parcel    @relation(fields: [parcelId], references: [id], onDelete: Cascade)
+  signedBy             User?     @relation("ParcelCustomsSignedBy", fields: [signedById], references: [id], onDelete: SetNull)
+
+  @@index([destinationCountry])
+  @@index([originCountry])
+  @@map("parcel_customs")
+}
+
+// Correspondances inter-véhicules : transfert de responsabilité d'un colis
+// d'un chauffeur sortant vers un chauffeur entrant avec preuve réciproque.
+// Un seul handover actif par colis (contrainte unique partielle gérée par
+// un index SQL WHERE status = 'pending_pickup').
+model ParcelHandover {
+  id                   String    @id @default(uuid()) @db.Uuid
+  parcelId             String    @map("parcel_id") @db.Uuid
+  fromDriverId         String    @map("from_driver_id") @db.Uuid
+  toDriverId           String    @map("to_driver_id") @db.Uuid
+  fromAdvertisementId  String?   @map("from_advertisement_id") @db.Uuid
+  toAdvertisementId    String?   @map("to_advertisement_id") @db.Uuid
+  latitude             Decimal?  @db.Decimal(10, 7)
+  longitude            Decimal?  @db.Decimal(10, 7)
+  initiatedAt          DateTime  @default(now()) @map("initiated_at") @db.Timestamptz
+  confirmedAt          DateTime? @map("confirmed_at") @db.Timestamptz
+  cancelledAt          DateTime? @map("cancelled_at") @db.Timestamptz
+  // pending_pickup | completed | cancelled (CHECK en base).
+  status               String    @default("pending_pickup")
+  // Hash SHA-256 du PIN et du QR token. Les valeurs claires ne sont jamais
+  // persistées : elles sortent une seule fois côté réponse HTTP d'initiate.
+  pickupPinHash        String    @map("pickup_pin_hash")
+  pickupQrTokenHash    String    @map("pickup_qr_token_hash")
+  pickupPinLast4       String?   @map("pickup_pin_last4")
+  pickupProofType      String?   @map("pickup_proof_type")
+  cancellationReason   String?   @map("cancellation_reason")
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt            DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  parcel               Parcel    @relation(fields: [parcelId], references: [id], onDelete: Cascade)
+  fromDriver           User      @relation("ParcelHandoverFromDriver", fields: [fromDriverId], references: [id], onDelete: Cascade)
+  toDriver             User      @relation("ParcelHandoverToDriver", fields: [toDriverId], references: [id], onDelete: Cascade)
+  fromAdvertisement    Advertisement? @relation("ParcelHandoverFromAd", fields: [fromAdvertisementId], references: [id], onDelete: SetNull)
+  toAdvertisement      Advertisement? @relation("ParcelHandoverToAd", fields: [toAdvertisementId], references: [id], onDelete: SetNull)
+
+  @@index([parcelId])
+  @@index([toDriverId])
+  @@index([fromDriverId])
+  @@index([status])
+  @@map("parcel_handovers")
+}
+
+// Journal immuable des arrêts atteints pendant un trajet navette. Unique
+// (advertisement_id, stop_order) : un arrêt n'est marqué qu'une fois.
+model JourneyStopEvent {
+  id              String   @id @default(uuid()) @db.Uuid
+  advertisementId String   @map("advertisement_id") @db.Uuid
+  driverId        String   @map("driver_id") @db.Uuid
+  vehicleId       String   @map("vehicle_id") @db.Uuid
+  transitLineId   String?  @map("transit_line_id") @db.Uuid
+  stopOrder       Int      @map("stop_order")
+  stopLabel       String?  @map("stop_label")
+  zoneId          String?  @map("zone_id") @db.Uuid
+  distanceMeters  Int      @map("distance_meters")
+  radiusMeters    Int      @map("radius_meters")
+  reachedAt       DateTime @map("reached_at") @db.Timestamptz
+  confirmedBy     Int      @default(1) @map("confirmed_by")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@unique([advertisementId, stopOrder])
+  @@index([advertisementId])
+  @@index([driverId])
+  @@index([reachedAt])
+  @@map("journey_stop_events")
 }
 
 // Le trajet habituel ne contient ni date de départ, ni GPS, ni réservations.

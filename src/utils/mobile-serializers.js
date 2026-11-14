@@ -721,6 +721,8 @@ export function serializeAdvertisementOffer(offer) {
       lineNumber: offer.advertisement.metadata.itinerary.lineNumber,
       serviceType: offer.advertisement.metadata.itinerary.serviceType
     } : null,
+    boardingStop: resolveStopInfo(offer, offer.boardingStopOrder),
+    dropOffStop: resolveStopInfo(offer, offer.dropOffStopOrder),
     clientId: offer.clientId,
     client: serializeUser(offer.client),
     parcelId: offer.parcelId,
@@ -742,10 +744,36 @@ export function serializeAdvertisementOffer(offer) {
     message: offer.message,
     status: offer.status,
     responseMessage: offer.responseMessage,
+    // Anti self-validation : le mobile masque les boutons côté camp qui a
+    // posé la dernière offre. Fallback 'client' pour les offres historiques
+    // dont la colonne n'a pas pu être rétro-populée.
+    lastOfferBy: offer.lastOfferBy ?? (offer.status === 'pending' ? 'client' : null),
+    canDriverAccept:
+      (offer.status === 'pending' || offer.status === 'countered') &&
+      (offer.lastOfferBy ?? 'client') === 'client',
+    canClientAccept: false,
+    canDriverCounter:
+      (offer.status === 'pending' || offer.status === 'countered') &&
+      (offer.lastOfferBy ?? 'client') === 'client',
+    canClientCounter:
+      offer.status === 'countered' &&
+      (offer.lastOfferBy ?? 'client') === 'driver',
     respondedAt: dateToIso(offer.respondedAt),
     createdAt: dateToIso(offer.createdAt),
     updatedAt: dateToIso(offer.updatedAt)
   };
+}
+
+function resolveStopInfo(offer, order) {
+  if (order === null || order === undefined) return null;
+  const stops = offer?.advertisement?.transitLine?.stops;
+  if (Array.isArray(stops)) {
+    const match = stops.find((stop) => stop.order === order);
+    if (match) {
+      return { order: match.order, label: match.label ?? null, zoneId: match.zoneId ?? null };
+    }
+  }
+  return { order, label: null, zoneId: null };
 }
 
 /**

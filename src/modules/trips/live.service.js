@@ -2,6 +2,7 @@ import { prisma } from '../../config/prisma.js';
 import { ValidationError, ConflictError, ForbiddenError, NotFoundError } from '../../utils/errors.js';
 import { normalizeVehicleType } from '../../utils/vehicle-types.js';
 import { coordinate } from '../drivers/discovery.service.js';
+import { appendPosition, evaluateStopArrival } from './stop-arrival.service.js';
 function uuid(value, path) {
   if (typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) throw new ValidationError([{ path, message: 'Identifiant invalide' }]);
   return value;
@@ -64,14 +65,44 @@ export async function startJourneyLive(id, actor, body) {
 
 export async function updateJourneyLive(id, actor, body) {
   const fix = liveFix(body);
-  const { transport } = await ownedOpenJourney(id, actor, prisma);
-  // Le jeton de session interdit à un ancien flux GPS de réactiver une session
-  // arrêtée ou de déplacer le véhicule du départ suivant.
-  const result = await prisma.journeyLive.updateMany({ where: {
-    id: uuid(body.sessionId, 'sessionId'), advertisementId: id, driverId: actor.id, vehicleId: transport.vehicleId,
-    capturedAt: { lt: fix.capturedAt }
-  }, data: fix });
-  if (!result.count) throw new ConflictError('Session arrêtée ou mesure GPS déjà remplacée');
+  const sessionId = uuid(body.sessionId, 'sessionId');
+  return prisma.$transaction(async (tx) => {
+    const { transport } = await ownedOpenJourney(id, actor, tx);
+    const current = await tx.journeyLive.findFirst({
+      where: { id: sessionId, advertisementId: id, driverId: actor.id, vehicleId: transport.vehicleId },
+      include: { advertisement: { select: { id: true, transitLineId: true } } }
+    });
+    if (!current || current.capturedAt.getTime() >= fix.capturedAt.getTime()) {
+      throw new ConflictError('Session arrêtée ou mesure GPS déjà remplacée');
+    }
+    const nextBuffer = appendPosition(current.recentPositions, fix);
+    const updated = await tx.journeyLive.update({
+      where: { id: current.id },
+      data: { ...fix, recentPositions: nextBuffer },
+      include: { advertisement: { select: { id: true, transitLineId: true } } }
+    });
+    // Évaluation d'arrivée aux arrêts : non bloquant.
+    await evaluateStopArrival(tx, {
+      advertisementId: updated.advertisementId,
+      driverId: updated.driverId,
+      vehicleId: updated.vehicleId,
+      advertisement: updated.advertisement
+    }, nextBuffer);
+    return updated;
+  });
+}
+
+/**
+ * Lecture publique : liste des arrêts atteints pour un trajet donné.
+ * Non bloquant : si la ligne n'est pas associée ou s'il n'y a aucun événement,
+ * retourne un tableau vide.
+ */
+export async function reachedStopsForAdvertisement(advertisementId) {
+  uuid(advertisementId, 'advertisementId');
+  return prisma.journeyStopEvent.findMany({
+    where: { advertisementId },
+    orderBy: { stopOrder: 'asc' }
+  });
 }
 
 export async function stopJourneyLive(id, actor, sessionId) {

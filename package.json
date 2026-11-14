@@ -21,7 +21,9 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
     "test:db:setup": "DATABASE_URL=\"$(node scripts/db-url.mjs procolis_test)\" prisma migrate deploy",
-    "pilot:snapshot": "node scripts/pilot-snapshot.mjs"
+    "pilot:snapshot": "node scripts/pilot-snapshot.mjs",
+    "promote:role": "node scripts/promote-role.mjs",
+    "whatsapp:submit-templates": "node scripts/whatsapp-submit-templates.mjs"
   },
   "dependencies": {
     "@getbrevo/brevo": "^6.0.2",

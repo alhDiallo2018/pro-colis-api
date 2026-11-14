@@ -18,6 +18,7 @@ import { supportRouter } from './modules/support/support.routes.js';
 import { supportChatRouter } from './modules/support/chat.routes.js';
 import { zoneRouter } from './modules/zones/zone.routes.js';
 import { transitRouter } from './modules/trips/transit.routes.js';
+import { integrationsRouter } from './modules/integrations/integrations.routes.js';
 import { observabilityRouter } from './modules/observability/observability.routes.js';
 
 import { qualityRouter } from './modules/experience/quality.routes.js';
@@ -43,7 +44,13 @@ app.use(
 // Cette route n'est pas proxifiee par Caddy en production et exige en plus un
 // bearer token distinct des jetons utilisateurs.
 app.get('/internal/metrics', metricsHandler);
-app.use(express.json({ limit: '25mb' }));
+// `verify` capture le body brut : nécessaire pour vérifier les signatures
+// HMAC des webhooks entrants (Shopify, et futurs partenaires) sans dépendre
+// d'un parser spécifique par route.
+app.use(express.json({
+  limit: '25mb',
+  verify: (req, _res, buf) => { req.rawBody = buf; }
+}));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 // Uploaded media are public assets embedded by the web app (a different origin),
 // so override Helmet's default same-origin CORP to allow cross-origin embedding.
@@ -71,6 +78,7 @@ apiV1.use('/support/chat', supportChatRouter);
 apiV1.use('/experience', experienceRouter);
 apiV1.use('/quality', qualityRouter);
 apiV1.use('/transit', transitRouter);
+apiV1.use('/integrations', integrationsRouter);
 apiV1.use('/', mobileRouter);
 
 app.use('/api/v1', apiV1);
