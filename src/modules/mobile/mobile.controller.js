@@ -2257,9 +2257,14 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
     data: { isUsed: true }
   });
 
+  // Les champs `signature` et `proofImage` du body sont des URLs
+  // (upload préalable). `changeParcelStatus` écrit `signatureUrl` sur Parcel
+  // et `photoUrl` sur ParcelEvent — il faut traduire pour que ces preuves
+  // soient persistées. Historiquement passés sous leur nom brut, ils étaient
+  // silencieusement ignorés.
   const result = await changeParcelStatus(req, parcel, 'delivered', {
-    signature,
-    proofImage,
+    signatureUrl: signature,
+    photoUrl: proofImage,
     location,
     locationLat,
     locationLng,
