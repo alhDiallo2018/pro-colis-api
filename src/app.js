@@ -18,6 +18,7 @@ import { supportRouter } from './modules/support/support.routes.js';
 import { supportChatRouter } from './modules/support/chat.routes.js';
 import { zoneRouter } from './modules/zones/zone.routes.js';
 import { transitRouter } from './modules/trips/transit.routes.js';
+import { shuttleRouter } from './modules/shuttle/shuttle.routes.js';
 import { integrationsRouter } from './modules/integrations/integrations.routes.js';
 import { observabilityRouter } from './modules/observability/observability.routes.js';
 
@@ -78,6 +79,7 @@ apiV1.use('/support/chat', supportChatRouter);
 apiV1.use('/experience', experienceRouter);
 apiV1.use('/quality', qualityRouter);
 apiV1.use('/transit', transitRouter);
+apiV1.use('/shuttle-operator', shuttleRouter);
 apiV1.use('/integrations', integrationsRouter);
 apiV1.use('/', mobileRouter);
 
