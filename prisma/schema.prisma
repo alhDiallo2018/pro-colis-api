@@ -236,6 +236,7 @@ model User {
   journeyEvents JourneyEvent[]
   routeAlerts RouteAlert[]
   shipmentDrafts ShipmentDraft[]
+  apiKeys       ApiKey[]        @relation("ApiKeyCreatedBy")
   id                      String                 @id @default(uuid()) @db.Uuid
   email                   String?                @unique
   googleSubject           String?                @unique @map("google_subject")
@@ -1740,7 +1741,14 @@ model ApiKey {
   createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
   updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz
 
+  // NULL = clé partenaire créée par super-admin (historique).
+  // Non-NULL = clé self-service d'un business shipper ; seules ces clés
+  // sont visibles via `/business-shipper/api-keys/*`.
+  createdById    String?   @map("created_by_id") @db.Uuid
+  createdBy      User?     @relation("ApiKeyCreatedBy", fields: [createdById], references: [id], onDelete: Cascade)
+
   @@index([active])
+  @@index([createdById])
   @@map("api_keys")
 }
 

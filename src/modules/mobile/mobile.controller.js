@@ -8256,6 +8256,134 @@ export const deactivateApiKey = handle('admin.apiKeys.deactivate', async (req, r
   return ok(res, { message: 'Clé API désactivée', data: { key: serializeApiKey(updated) } });
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// Business shipper : self-service des clés API scopées au compte.
+// Les clés créées ici portent `createdById = req.user.id` ; les 5
+// handlers filtrent systématiquement par cet owner — un shipper ne voit
+// jamais les clés partenaires (createdById null) ni celles d'un autre
+// compte. Même garantie côté mutations : un `findFirst` sur
+// `{ keyId, createdById }` renvoie 404 au premier violation, pas 403,
+// pour ne rien laisser fuiter sur l'existence d'une clé tierce.
+// ─────────────────────────────────────────────────────────────────────
+
+/** Scopes qu'un business shipper peut s'auto-attribuer. Volontairement
+ * étroit : pas d'escalade possible via l'endpoint self-service. */
+const BUSINESS_SHIPPER_ALLOWED_SCOPES = new Set([
+  'parcel.read',
+  'parcel.write',
+  'webhook.receive'
+]);
+
+function sanitizeShipperScopes(input) {
+  if (!Array.isArray(input)) return [];
+  return [...new Set(
+    input
+      .filter((s) => typeof s === 'string' && s.length > 0)
+      .filter((s) => BUSINESS_SHIPPER_ALLOWED_SCOPES.has(s))
+  )];
+}
+
+export const listBusinessShipperApiKeys = handle('businessShipper.apiKeys.list', async (req, res) => {
+  const rows = await prisma.apiKey.findMany({
+    where: { createdById: req.user.id },
+    orderBy: { createdAt: 'desc' }
+  });
+  return ok(res, {
+    message: 'Mes clés API',
+    data: { keys: rows.map((r) => serializeApiKey(r)) }
+  });
+});
+
+export const createBusinessShipperApiKey = handle('businessShipper.apiKeys.create', async (req, res) => {
+  const partnerName = typeof req.body?.partnerName === 'string' ? req.body.partnerName.trim() : '';
+  if (partnerName.length === 0) {
+    throw new ValidationError([{ path: 'body.partnerName', message: 'Libellé de la clé requis' }]);
+  }
+  const scopes = sanitizeShipperScopes(req.body?.scopes);
+  const webhookUrl = typeof req.body?.webhookUrl === 'string' ? req.body.webhookUrl.trim() : null;
+
+  const { keyId, secret } = generateApiKey();
+  const keyHash = hashApiSecret(secret);
+  const webhookSecret = typeof req.body?.webhookSecret === 'string' && req.body.webhookSecret.length >= 16
+    ? req.body.webhookSecret
+    : generateApiKey().secret;
+
+  const row = await prisma.apiKey.create({
+    data: {
+      keyId,
+      keyHash,
+      partnerName,
+      scopes,
+      webhookUrl: webhookUrl || null,
+      webhookSecret,
+      active: true,
+      createdById: req.user.id
+    }
+  });
+
+  invalidatePartnersCache();
+
+  return ok(res, {
+    status: 201,
+    message: 'Clé API créée',
+    data: {
+      key: serializeApiKey(row, { includeSecret: `${keyId}.${secret}` }),
+      webhookSecretOnce: webhookSecret
+    }
+  });
+});
+
+export const rotateBusinessShipperApiKey = handle('businessShipper.apiKeys.rotate', async (req, res) => {
+  const row = await prisma.apiKey.findFirst({
+    where: { keyId: req.params.keyId, createdById: req.user.id }
+  });
+  if (!row) throw new NotFoundError('Clé introuvable');
+
+  const { secret } = generateApiKey();
+  const keyHash = hashApiSecret(secret);
+  const updated = await prisma.apiKey.update({
+    where: { id: row.id },
+    data: { keyHash, rotatedAt: new Date() }
+  });
+
+  invalidatePartnersCache();
+
+  return ok(res, {
+    message: 'Clé API tournée',
+    data: { key: serializeApiKey(updated, { includeSecret: `${row.keyId}.${secret}` }) }
+  });
+});
+
+export const updateBusinessShipperApiKey = handle('businessShipper.apiKeys.update', async (req, res) => {
+  const row = await prisma.apiKey.findFirst({
+    where: { keyId: req.params.keyId, createdById: req.user.id }
+  });
+  if (!row) throw new NotFoundError('Clé introuvable');
+
+  const data = {};
+  if (typeof req.body?.partnerName === 'string') data.partnerName = req.body.partnerName.trim();
+  if (Array.isArray(req.body?.scopes)) data.scopes = sanitizeShipperScopes(req.body.scopes);
+  if (typeof req.body?.webhookUrl === 'string') data.webhookUrl = req.body.webhookUrl.trim() || null;
+  if (typeof req.body?.active === 'boolean') data.active = req.body.active;
+
+  const updated = await prisma.apiKey.update({ where: { id: row.id }, data });
+  invalidatePartnersCache();
+  return ok(res, { message: 'Clé API mise à jour', data: { key: serializeApiKey(updated) } });
+});
+
+export const deactivateBusinessShipperApiKey = handle('businessShipper.apiKeys.deactivate', async (req, res) => {
+  const row = await prisma.apiKey.findFirst({
+    where: { keyId: req.params.keyId, createdById: req.user.id }
+  });
+  if (!row) throw new NotFoundError('Clé introuvable');
+  const updated = await prisma.apiKey.update({
+    where: { id: row.id },
+    data: { active: false }
+  });
+  invalidatePartnersCache();
+  return ok(res, { message: 'Clé API désactivée', data: { key: serializeApiKey(updated) } });
+});
+
 /**
  * Snapshot métriques pilote pour le dashboard super-admin. Compte les
  * entités créées / actives sur les tables P3 (referrals, insurance,

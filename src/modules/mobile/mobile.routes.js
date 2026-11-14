@@ -255,6 +255,16 @@ mobileRouter.get('/business-shipper/dashboard', authenticate, mobileController.g
 mobileRouter.get('/business-shipper/invoices', authenticate, mobileController.getBusinessShipperInvoices);
 mobileRouter.get('/business-shipper/invoices/:invoiceId', authenticate, mobileController.getBusinessShipperInvoice);
 mobileRouter.get('/business-shipper/invoices/:invoiceId/pdf', authenticate, mobileController.getBusinessShipperInvoicePdf);
+// Self-service clés API : un business shipper gère ses propres clés sans
+// passer par le super-admin. Chaque mutation ciblant une clé qu'il ne
+// possède pas renvoie 404 (cf. controller — on ne révèle pas l'existence
+// d'une clé tierce). Authenticate suffit : la propriété est vérifiée dans
+// chaque handler via `createdById: req.user.id`.
+mobileRouter.get('/business-shipper/api-keys', authenticate, mobileController.listBusinessShipperApiKeys);
+mobileRouter.post('/business-shipper/api-keys', authenticate, mobileController.createBusinessShipperApiKey);
+mobileRouter.post('/business-shipper/api-keys/:keyId/rotate', authenticate, mobileController.rotateBusinessShipperApiKey);
+mobileRouter.patch('/business-shipper/api-keys/:keyId', authenticate, mobileController.updateBusinessShipperApiKey);
+mobileRouter.post('/business-shipper/api-keys/:keyId/deactivate', authenticate, mobileController.deactivateBusinessShipperApiKey);
 
 // Admin : gestion des clés API partenaires e-commerce.
 const superAdminOnly = requireRoles('super_admin');
