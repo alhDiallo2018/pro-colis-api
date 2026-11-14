@@ -20,6 +20,7 @@ import jwt from 'jsonwebtoken';
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import { prisma } from '../config/prisma.js';
+import { sendWebPushToUser } from './web-push.js';
 
 const OAUTH_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const FCM_SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
@@ -348,7 +349,7 @@ async function pushCreatedNotification(notificationId) {
         ? notification.data
         : {};
 
-    await sendPushToUser(notification.userId, {
+    const commonPayload = {
       title: notification.title,
       body: notification.body,
       priority: notification.priority,
@@ -359,7 +360,17 @@ async function pushCreatedNotification(notificationId) {
         parcelId: notification.parcelId,
         bidId: notification.bidId
       }
-    });
+    };
+
+    // FCM (mobile) et Web Push (PWA) partagent la meme notification source :
+    // un utilisateur avec mobile + navigateur PWA doit recevoir les deux.
+    // Les envois sont paralleles mais independants — un echec d'un canal
+    // n'empeche jamais l'autre.
+    const badge = (await countUnreadForUser(notification.userId)).total;
+    await Promise.allSettled([
+      sendPushToUser(notification.userId, commonPayload),
+      sendWebPushToUser(notification.userId, { ...commonPayload, badge })
+    ]);
   } catch (error) {
     logger.warn({ component: 'push', err: error?.message }, 'Push de notification impossible');
   }

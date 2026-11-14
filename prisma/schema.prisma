@@ -320,6 +320,7 @@ model User {
   withdrawals             Withdrawal[]
   driverZones             ZoneDriver[]
   deviceTokens            DeviceToken[]
+  pushSubscriptions       PushSubscription[]
   expensesCreated         Expense[]              @relation("ExpenseCreatedBy")
   assistances             Assistance[]           @relation("AssistanceUser")
   assistancesHandled      Assistance[]           @relation("AssistanceHandledBy")
@@ -1347,6 +1348,28 @@ model DeviceToken {
 
   @@index([userId])
   @@map("device_tokens")
+}
+
+// Abonnement Web Push (W3C Push API) — distinct des jetons FCM utilises par
+// le mobile. `endpoint` est unique par navigateur/profil et sert de clef de
+// deduplication cote serveur : un meme utilisateur peut avoir plusieurs
+// navigateurs/postes, chacun avec son propre endpoint.
+model PushSubscription {
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  endpoint       String   @unique
+  p256dh         String
+  auth           String
+  userAgent      String?  @map("user_agent")
+  expirationTime DateTime? @map("expiration_time") @db.Timestamptz
+  lastSuccessAt  DateTime? @map("last_success_at") @db.Timestamptz
+  failureCount   Int      @default(0) @map("failure_count")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("push_subscriptions")
 }
 
 // Les jetons opaques ne sont jamais stockes en clair. Le challenge ne donne

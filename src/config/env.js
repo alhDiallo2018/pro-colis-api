@@ -119,6 +119,15 @@ const envSchema = z.object({
   FIREBASE_PROJECT_ID: z.string().optional(),
   FIREBASE_SERVICE_ACCOUNT_PATH: z.string().optional(),
   FIREBASE_SERVICE_ACCOUNT_JSON: z.string().optional(),
+  // --- Web Push (PWA) ---
+  // Paires VAPID generees une fois (`npx web-push generate-vapid-keys`).
+  // Absente, l'API expose un 503 explicite sur l'abonnement : la PWA peut
+  // demarrer sans elles et basculer en degrade sans boucle d'erreur.
+  VAPID_PUBLIC_KEY: z.string().optional(),
+  VAPID_PRIVATE_KEY: z.string().optional(),
+  // Contact (`mailto:` ou https) remonte au service de push. Les navigateurs
+  // le filtrent si absent — un simple `mailto:ops@example.com` suffit.
+  VAPID_SUBJECT: z.string().trim().default('mailto:ops@sendprocolis.com'),
   BREVO_API_KEY: z.string().optional(),
   // Compose transmet une chaine vide lorsque l'envoi email n'est pas configure.
   // Une adresse renseignee doit toutefois rester valide.

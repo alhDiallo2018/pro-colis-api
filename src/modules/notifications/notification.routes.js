@@ -4,15 +4,22 @@ import { authenticate } from '../../middlewares/auth.middleware.js';
 import { requireRoles } from '../../middlewares/rbac.middleware.js';
 import * as messagingController from './messaging.controller.js';
 import * as notificationController from './notification.controller.js';
+import * as webPushController from './web-push.controller.js';
 
 export const notificationRouter = Router();
 
+// `/web-push/public-key` est lue par la PWA avant toute authentification
+// forte : garder un acces authentifie suffit (JWT) mais ne pas exiger de
+// role. Seule la publication de la cle publique est anonyme-friendly.
 notificationRouter.use(authenticate);
 notificationRouter.get('/', notificationController.listNotifications);
 notificationRouter.get('/unread-count', notificationController.unreadCount);
 notificationRouter.get('/preferences', notificationController.getPreferences);
 notificationRouter.put('/preferences', notificationController.updatePreferences);
 notificationRouter.post('/device-token', messagingController.registerDeviceToken);
+notificationRouter.get('/web-push/public-key', webPushController.getPublicKey);
+notificationRouter.post('/web-push/subscribe', webPushController.subscribe);
+notificationRouter.post('/web-push/unsubscribe', webPushController.unsubscribe);
 notificationRouter.post('/sms/send', requireRoles('admin', 'super_admin'), messagingController.sendSmsMessage);
 notificationRouter.post('/email/send', requireRoles('admin', 'super_admin'), messagingController.sendEmailMessage);
 notificationRouter.post('/email/send-bulk', requireRoles('super_admin', 'support'), messagingController.sendBulkEmailMessage);
