@@ -1,4 +1,5 @@
 import { once, validateRequestId } from '../reliability/idempotency.js';
+import { saveMedia } from '../reliability/media.js';
 import { notifyRouteAlerts } from '../experience/alerts.service.js';
 import { rememberRoute, saveExistingRoute, scheduleRoute } from '../trips/templates.service.js';
 import { registeredTransport, startJourneyLive, updateJourneyLive, stopJourneyLive, liveJourneys } from '../trips/live.service.js';
@@ -2409,6 +2410,121 @@ export const driverDeliver = handle('driver.deliver', async (req, res) => {
       wallet: isPaid ? { earning: driverEarning, commission } : { pending: true },
       deliveryPoints: deliveryPoints
     }
+  });
+});
+
+/**
+ * Ajout d'une preuve de livraison (photo, signature, note) **après** que
+ * `driverDeliver` ait validé l'OTP. Historiquement, le mobile proposait cet
+ * écran en secondary action du succès de livraison mais le bouton ne faisait
+ * qu'un pop silencieux — aucune donnée n'atteignait le serveur. Cet endpoint
+ * ferme ce gap sans changer le contrat de `driverDeliver` (qui garde ses
+ * champs `signature`/`proofImage` pour les clients qui joignent la preuve
+ * en une seule requête).
+ *
+ * Invariants :
+ *  - le colis doit être `delivered` (on ne peut pas ajouter une preuve avant
+ *    la validation OTP — sinon ce serait une injection post-coup).
+ *  - le colis doit être assigné au driver courant.
+ *  - photoUrl/signatureUrl sont des URLs déjà uploadées (`/uploads/*`), pas
+ *    des blobs base64 : on reste côté métier, pas côté transport binaire.
+ *
+ * Effets :
+ *  - update `parcel.signatureUrl` si fourni.
+ *  - ajout d'un `parcelEvent` traçable (action `delivery_proof_added`).
+ *  - création d'un `ParcelMedia` pour la photo si fournie (idempotence par
+ *    requestId gérée par `saveMedia`).
+ */
+export const driverAttachDeliveryProof = handle('driver.proof', async (req, res) => {
+  const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
+  if (parcel.assignedDriverId !== req.user.id) {
+    throw new ForbiddenError('Vous n\'êtes pas assigné à ce colis');
+  }
+  if (parcel.status !== 'delivered') {
+    throw new ConflictError('La preuve ne peut être ajoutée qu\'après livraison confirmée.');
+  }
+
+  const { photoUrl = null, signatureUrl = null, note = null, requestId = null } = req.body ?? {};
+  // Au moins l'un des trois doit être présent — sinon l'appel ne fait rien.
+  if (!photoUrl && !signatureUrl && !note) {
+    throw new ValidationError(
+      [{ path: 'body', message: 'Au moins photoUrl, signatureUrl ou note est requis' }],
+      'Preuve vide'
+    );
+  }
+  // Validation légère des URLs : on refuse les chaînes manifestement malformées
+  // mais on laisse passer les URLs absolues et les chemins `/uploads/...`.
+  function isPlausibleMediaUrl(value) {
+    if (typeof value !== 'string' || value.length > 2000) return false;
+    return /^https?:\/\//.test(value) || value.startsWith('/uploads/');
+  }
+  if (photoUrl != null && !isPlausibleMediaUrl(photoUrl)) {
+    throw new ValidationError([{ path: 'photoUrl', message: 'URL de photo invalide' }]);
+  }
+  if (signatureUrl != null && !isPlausibleMediaUrl(signatureUrl)) {
+    throw new ValidationError([{ path: 'signatureUrl', message: 'URL de signature invalide' }]);
+  }
+  if (note != null && (typeof note !== 'string' || note.length > 1000)) {
+    throw new ValidationError([{ path: 'note', message: 'Note invalide (max 1000 car.)' }]);
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const data = {};
+    if (signatureUrl) data.signatureUrl = signatureUrl;
+    const parcelAfter = Object.keys(data).length
+      ? await tx.parcel.update({ where: { id: parcel.id }, data, include: parcelInclude })
+      : await tx.parcel.findUnique({ where: { id: parcel.id }, include: parcelInclude });
+
+    await tx.parcelEvent.create({
+      data: {
+        parcelId: parcel.id,
+        status: 'delivered',
+        description: note
+          ? `Preuve de livraison ajoutée — ${note}`
+          : 'Preuve de livraison ajoutée',
+        photoUrl: photoUrl || null,
+        userId: req.user.id,
+        userName: req.user.fullName,
+        userRole: req.user.role,
+        metadata: {
+          signatureUrl: signatureUrl || null,
+          note: note || null,
+          requestId: requestId || null,
+        }
+      }
+    });
+
+    if (photoUrl) {
+      // Idempotent : la media est attachée au colis. Si le client ré-essaie
+      // avec le même requestId, `saveMedia` renverra la ligne existante.
+      await saveMedia({
+        user: req.user,
+        requestId,
+        parcelId: parcel.id,
+        mediaType: 'photo',
+        filename: 'delivery-proof.jpg',
+        url: photoUrl,
+        checksum: null,
+      });
+    }
+
+    await audit(tx, req, {
+      action: 'parcel.delivery_proof_added',
+      entityType: 'parcel',
+      entityId: parcel.id,
+      afterData: {
+        hasPhoto: Boolean(photoUrl),
+        hasSignature: Boolean(signatureUrl),
+        hasNote: Boolean(note),
+      },
+    });
+
+    return parcelAfter;
+  });
+
+  return ok(res, {
+    message: 'Preuve enregistrée',
+    data: { parcel: serializeParcel(updated) }
   });
 });
 

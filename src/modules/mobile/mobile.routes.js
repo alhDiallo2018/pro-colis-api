@@ -167,6 +167,9 @@ mobileRouter.put('/driver/parcels/:parcelId/transit', authenticate, requireRoles
 mobileRouter.put('/driver/parcels/:parcelId/arrived', authenticate, requireRoles('driver'), mobileController.driverArrived);
 mobileRouter.put('/driver/parcels/:parcelId/out-for-delivery', authenticate, requireRoles('driver'), mobileController.driverOutForDelivery);
 mobileRouter.put('/driver/parcels/:parcelId/deliver', authenticate, requireRoles('driver'), mobileController.driverDeliver);
+// Preuve ajoutée après livraison (photo, signature, note). Idempotent par
+// requestId. Le colis doit être en statut `delivered` et appartenir au driver.
+mobileRouter.post('/driver/parcels/:parcelId/proof', authenticate, requireRoles('driver'), mobileController.driverAttachDeliveryProof);
 
 // Annulation d'une mission engagée par le chauffeur : même moteur central que
 // l'annulation client (responsabilité calculée côté serveur).
