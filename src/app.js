@@ -7,6 +7,7 @@ import { env } from './config/env.js';
 import { requestIdMiddleware } from './middlewares/request-id.middleware.js';
 import { httpLogger } from './middlewares/http-logger.middleware.js';
 import { errorMiddleware, notFoundMiddleware } from './middlewares/error.middleware.js';
+import { mobileVersionMiddleware } from './middlewares/mobile-version.middleware.js';
 import { metricsHandler, metricsMiddleware } from './observability/metrics.js';
 import { healthRouter } from './modules/health/health.routes.js';
 import { authRouter } from './modules/auth/auth.routes.js';
@@ -53,6 +54,10 @@ app.use(express.json({
   verify: (req, _res, buf) => { req.rawBody = buf; }
 }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+// Refuse les clients Android sous `MOBILE_ANDROID_MIN_VERSION_CODE` (défense en
+// profondeur : la gate app reste la première ligne). Désactivé par défaut tant
+// que la version obligatoire n'est pas effectivement disponible sur le store.
+app.use(mobileVersionMiddleware);
 // Uploaded media are public assets embedded by the web app (a different origin),
 // so override Helmet's default same-origin CORP to allow cross-origin embedding.
 app.use(
