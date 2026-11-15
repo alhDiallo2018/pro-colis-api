@@ -7,8 +7,11 @@ export const appUpdateEnvShape = {
   MOBILE_ANDROID_UPDATE_ENABLED: boolean.default('false'),
   // La version lisible sert uniquement a l'affichage. Seul versionCode ordonne
   // les APK Android, meme si le nom commercial change de format.
-  MOBILE_ANDROID_LATEST_VERSION: z.string().trim().min(1).max(64).default('1.1.5'),
-  MOBILE_ANDROID_LATEST_VERSION_CODE: versionCode.default(14),
+  MOBILE_ANDROID_LATEST_VERSION: z.string().trim().min(1).max(64).default('1.2.0'),
+  MOBILE_ANDROID_LATEST_VERSION_CODE: versionCode.default(17),
+  // Le minimum reste volontairement sous `latest` : avec UPDATE_ENABLED=false
+  // (defaut) la politique n'est pas appliquee, et si Ops l'active sans
+  // repositionner le minimum, les 1.1.x conservent l'acces.
   MOBILE_ANDROID_MIN_VERSION_CODE: versionCode.default(14),
   MOBILE_ANDROID_RELEASE_NOTES_FR: z.string().trim().max(4000).default(''),
   MOBILE_ANDROID_RELEASE_NOTES_EN: z.string().trim().max(4000).default(''),
