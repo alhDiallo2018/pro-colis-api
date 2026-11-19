@@ -20,6 +20,7 @@ shuttleRouter.use(authenticate);
 shuttleRouter.use(requireRoles('shuttle_operator'));
 
 shuttleRouter.get('/overview', shuttleController.overview);
+shuttleRouter.get('/live', shuttleController.live);
 
 shuttleRouter.get('/lines', shuttleController.listLines);
 shuttleRouter.post('/lines', shuttleController.createLine);

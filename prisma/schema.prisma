@@ -304,6 +304,7 @@ model User {
   ratingsReceived           Rating[]                  @relation("RatingDriver")
   handoversAsFromDriver     ParcelHandover[]          @relation("ParcelHandoverFromDriver")
   handoversAsToDriver       ParcelHandover[]          @relation("ParcelHandoverToDriver")
+  shuttleStopConfirmations  ShuttleStopConfirmation[] @relation("ShuttleStopConfirmationDriver")
   shipmentBatches           ShipmentBatch[]
   customsDeclarationsSigned ParcelCustoms[]           @relation("ParcelCustomsSignedBy")
   supportMessages           SupportMessage[]
@@ -884,6 +885,7 @@ model Advertisement {
   arrivalZone          Zone?                @relation("AdvertisementArrivalZone", fields: [arrivalZoneId], references: [id])
   transitLine          TransitLine?         @relation(fields: [transitLineId], references: [id])
   offers               AdvertisementOffer[]
+  stopConfirmations    ShuttleStopConfirmation[]
 
   @@index([transitLineId, status, departureAt])
   @@map("advertisements")
@@ -912,6 +914,7 @@ model AdvertisementOffer {
   advertisement     Advertisement    @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
   client            User             @relation(fields: [clientId], references: [id], onDelete: Cascade)
   parcel            Parcel?          @relation(fields: [parcelId], references: [id], onDelete: SetNull)
+  stopConfirmations ShuttleStopConfirmation[]
 
   @@index([boardingStopOrder])
   @@index([dropOffStopOrder])
@@ -1560,6 +1563,34 @@ model JourneyStopEvent {
   @@index([driverId])
   @@index([reachedAt])
   @@map("journey_stop_events")
+}
+
+// Confirmations manuelles par le chauffeur de la prise en charge (pickup) et
+// de la remise (dropoff) d'un colis à l'arrêt concerné d'un trajet navette.
+// Une seule confirmation par (offer, type) : idempotent, pas de re-confirmation.
+// `stopOrder` est figé à l'écriture pour tracer l'arrêt réellement confirmé
+// même si l'offre est modifiée par la suite (audit).
+model ShuttleStopConfirmation {
+  id              String   @id @default(uuid()) @db.Uuid
+  advertisementId String   @map("advertisement_id") @db.Uuid
+  offerId         String   @map("offer_id") @db.Uuid
+  driverId        String   @map("driver_id") @db.Uuid
+  stopOrder       Int      @map("stop_order")
+  type            String // 'pickup' | 'dropoff' (CHECK en base)
+  latitude        Decimal? @db.Decimal(10, 7)
+  longitude       Decimal? @db.Decimal(10, 7)
+  note            String?
+  confirmedAt     DateTime @default(now()) @map("confirmed_at") @db.Timestamptz
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  advertisement Advertisement      @relation(fields: [advertisementId], references: [id], onDelete: Cascade)
+  offer         AdvertisementOffer @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  driver        User               @relation("ShuttleStopConfirmationDriver", fields: [driverId], references: [id], onDelete: Cascade)
+
+  @@unique([offerId, type])
+  @@index([advertisementId])
+  @@index([driverId])
+  @@map("shuttle_stop_confirmations")
 }
 
 // Le trajet habituel ne contient ni date de départ, ni GPS, ni réservations.

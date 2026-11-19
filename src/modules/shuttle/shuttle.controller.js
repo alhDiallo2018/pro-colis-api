@@ -16,6 +16,7 @@ import { prisma } from '../../config/prisma.js';
 import { env } from '../../config/env.js';
 import { ok, fail } from '../../utils/api-response.js';
 import { ValidationError, NotFoundError, normalizeError } from '../../utils/errors.js';
+import { LIVE_TTL_MS } from '../trips/live.service.js';
 
 const TRANSIT_OPERATORS = ['ddd', 'aftu'];
 const TRANSIT_DIRECTIONS = ['aller', 'retour'];
@@ -488,4 +489,135 @@ export const deleteSchedule = handle('shuttle.schedules.delete', async (req, res
   await requireOwnedSchedule(req, req.params.scheduleId);
   await prisma.shuttleSchedule.delete({ where: { id: req.params.scheduleId } });
   return ok(res, { message: 'Horaire supprimé', data: { deleted: true } });
+});
+
+// ─── Live supervision ───────────────────────────────────────────────────────
+// SCP-006 (Phase 2 chantier 3) — Dashboard temps réel pour l'opérateur :
+// liste les trajets actifs sur SES lignes avec position GPS récente, arrêts
+// atteints, confirmations pickup/dropoff, et état de la flotte. Un trajet
+// est « actif » = JourneyLive avec capturedAt > now - LIVE_TTL_MS.
+export const live = handle('shuttle.live', async (req, res) => {
+  const operatorUserId = req.user.id;
+
+  // 1) Lignes de l'opérateur avec leurs arrêts (ordonnés) — clef du scoping.
+  const lines = await prisma.transitLine.findMany({
+    where: { operatorUserId },
+    include: { stops: { orderBy: { order: 'asc' } } },
+  });
+
+  // 2) Comptages flotte (toujours renvoyés, même sans ligne).
+  const fleetRows = await prisma.shuttleVehicle.groupBy({
+    by: ['status'],
+    where: { operatorUserId, deletedAt: null },
+    _count: { _all: true },
+  });
+  const fleet = { available: 0, maintenance: 0, retired: 0 };
+  for (const row of fleetRows) {
+    if (row.status in fleet) fleet[row.status] = row._count._all;
+  }
+
+  if (lines.length === 0) {
+    return ok(res, { message: 'Supervision temps réel', data: { activeJourneys: [], fleet, generatedAt: new Date().toISOString() } });
+  }
+
+  const lineIds = lines.map((l) => l.id);
+  const lineById = new Map(lines.map((l) => [l.id, l]));
+
+  // 3) Annonces ouvertes sur ces lignes avec un JourneyLive récent. On filtre
+  //    sur `advertisement.status = 'open'` et sur `journeyLive.capturedAt`
+  //    récent pour ne jamais exposer un trajet « zombie ».
+  const since = new Date(Date.now() - LIVE_TTL_MS);
+  const advertisements = await prisma.advertisement.findMany({
+    where: {
+      transitLineId: { in: lineIds },
+      status: 'open',
+      journeyLive: { is: { capturedAt: { gte: since } } },
+    },
+    select: {
+      id: true,
+      transitLineId: true,
+      departureAt: true,
+      driver: { select: { id: true, fullName: true } },
+      journeyLive: {
+        select: { latitude: true, longitude: true, accuracyMeters: true, capturedAt: true, vehicleId: true },
+      },
+      offers: {
+        where: { status: 'accepted' },
+        select: { id: true, boardingStopOrder: true, dropOffStopOrder: true },
+      },
+    },
+  });
+
+  if (advertisements.length === 0) {
+    return ok(res, { message: 'Supervision temps réel', data: { activeJourneys: [], fleet, generatedAt: new Date().toISOString() } });
+  }
+
+  const advertisementIds = advertisements.map((a) => a.id);
+
+  // 4) Arrêts atteints + confirmations en un seul round trip par type.
+  const [reachedRows, confirmationRows] = await Promise.all([
+    prisma.journeyStopEvent.findMany({
+      where: { advertisementId: { in: advertisementIds } },
+      select: { advertisementId: true, stopOrder: true },
+    }),
+    prisma.shuttleStopConfirmation.findMany({
+      where: { advertisementId: { in: advertisementIds } },
+      select: { advertisementId: true, type: true },
+    }),
+  ]);
+
+  const reachedByAd = new Map();
+  for (const r of reachedRows) {
+    const list = reachedByAd.get(r.advertisementId) ?? [];
+    list.push(r.stopOrder);
+    reachedByAd.set(r.advertisementId, list);
+  }
+  const confCountByAd = new Map();
+  for (const c of confirmationRows) {
+    const counts = confCountByAd.get(c.advertisementId) ?? { pickup: 0, dropoff: 0 };
+    counts[c.type] = (counts[c.type] ?? 0) + 1;
+    confCountByAd.set(c.advertisementId, counts);
+  }
+
+  const activeJourneys = advertisements.map((ad) => {
+    const line = lineById.get(ad.transitLineId);
+    const stops = line?.stops ?? [];
+    const reached = reachedByAd.get(ad.id) ?? [];
+    const maxReached = reached.length ? Math.max(...reached) : null;
+    const nextStop = stops.find((s) => (maxReached == null ? true : s.order > maxReached)) ?? null;
+
+    const pickupTotal = ad.offers.filter((o) => o.boardingStopOrder != null).length;
+    const dropoffTotal = ad.offers.filter((o) => o.dropOffStopOrder != null).length;
+    const confCounts = confCountByAd.get(ad.id) ?? { pickup: 0, dropoff: 0 };
+
+    return {
+      advertisementId: ad.id,
+      departureAt: ad.departureAt ? ad.departureAt.toISOString() : null,
+      driver: ad.driver,
+      line: line ? { id: line.id, number: line.number, name: line.name, direction: line.direction } : null,
+      position: ad.journeyLive
+        ? {
+            latitude: Number(ad.journeyLive.latitude),
+            longitude: Number(ad.journeyLive.longitude),
+            accuracyMeters: ad.journeyLive.accuracyMeters,
+            capturedAt: ad.journeyLive.capturedAt.toISOString(),
+            expiresAt: new Date(ad.journeyLive.capturedAt.getTime() + LIVE_TTL_MS).toISOString(),
+          }
+        : null,
+      stopsTotal: stops.length,
+      stopsReached: reached.length,
+      nextStop: nextStop ? { order: nextStop.order, label: nextStop.label, zoneId: nextStop.zoneId } : null,
+      confirmations: {
+        pickupDone: confCounts.pickup,
+        pickupTotal,
+        dropoffDone: confCounts.dropoff,
+        dropoffTotal,
+      },
+    };
+  });
+
+  return ok(res, {
+    message: 'Supervision temps réel',
+    data: { activeJourneys, fleet, generatedAt: new Date().toISOString() },
+  });
 });

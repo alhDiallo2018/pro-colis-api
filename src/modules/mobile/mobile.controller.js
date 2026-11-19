@@ -6863,6 +6863,129 @@ export const advertisementReachedStops = handle('advertisements.reachedStops', a
   });
 });
 
+// Phase 2 — Confirmation manuelle par le chauffeur de la prise en charge
+// (pickup) ou de la remise (dropoff) d'un colis à son arrêt. Idempotent :
+// une (offre, type) renvoie la confirmation existante en 200 au lieu de dupliquer.
+function serializeStopConfirmation(row) {
+  return {
+    id: row.id,
+    advertisementId: row.advertisementId,
+    offerId: row.offerId,
+    driverId: row.driverId,
+    stopOrder: row.stopOrder,
+    type: row.type,
+    latitude: row.latitude != null ? Number(row.latitude) : null,
+    longitude: row.longitude != null ? Number(row.longitude) : null,
+    note: row.note,
+    confirmedAt: row.confirmedAt.toISOString(),
+  };
+}
+
+export const confirmAdvertisementStop = handle('advertisements.stopConfirm', async (req, res) => {
+  const { advertisementId, offerId } = req.params;
+  const type = req.body?.type;
+  if (type !== 'pickup' && type !== 'dropoff') {
+    throw new ValidationError([{ path: 'type', message: "Attendu 'pickup' ou 'dropoff'" }]);
+  }
+
+  const advertisement = await prisma.advertisement.findUnique({
+    where: { id: advertisementId },
+    select: { id: true, driverId: true },
+  });
+  if (!advertisement) throw new NotFoundError('Annonce introuvable');
+  if (advertisement.driverId !== req.user.id) {
+    throw new ForbiddenError('Seul le chauffeur du trajet peut confirmer un arrêt');
+  }
+
+  const offer = await prisma.advertisementOffer.findFirst({
+    where: { id: offerId, advertisementId, status: 'accepted' },
+    select: { id: true, boardingStopOrder: true, dropOffStopOrder: true },
+  });
+  if (!offer) throw new NotFoundError('Offre introuvable pour cette annonce');
+
+  const expectedStopOrder = type === 'pickup' ? offer.boardingStopOrder : offer.dropOffStopOrder;
+  if (expectedStopOrder == null) {
+    throw new ValidationError([
+      { path: 'type', message: `Aucun arrêt ${type === 'pickup' ? "d'embarquement" : 'de descente'} défini sur cette offre` },
+    ]);
+  }
+
+  let latitude = null;
+  let longitude = null;
+  if (req.body?.latitude != null || req.body?.longitude != null) {
+    latitude = coordinate(req.body.latitude, 'latitude', -90, 90);
+    longitude = coordinate(req.body.longitude, 'longitude', -180, 180);
+  }
+  let note = null;
+  if (req.body?.note != null) {
+    if (typeof req.body.note !== 'string' || req.body.note.trim().length === 0 || req.body.note.length > 500) {
+      throw new ValidationError([{ path: 'note', message: 'Note 1-500 caractères' }]);
+    }
+    note = req.body.note.trim();
+  }
+
+  // Idempotence applicative : si la confirmation existe déjà, on retourne la
+  // ressource existante (200) plutôt que de violer la contrainte unique.
+  const existing = await prisma.shuttleStopConfirmation.findUnique({
+    where: { offerId_type: { offerId, type } },
+  });
+  if (existing) {
+    return ok(res, {
+      message: 'Confirmation déjà enregistrée',
+      data: { confirmation: serializeStopConfirmation(existing), created: false },
+    });
+  }
+
+  const created = await prisma.shuttleStopConfirmation.create({
+    data: {
+      advertisementId,
+      offerId,
+      driverId: req.user.id,
+      stopOrder: expectedStopOrder,
+      type,
+      latitude,
+      longitude,
+      note,
+    },
+  });
+  return ok(res, {
+    status: 201,
+    message: 'Arrêt confirmé',
+    data: { confirmation: serializeStopConfirmation(created), created: true },
+  });
+});
+
+// Liste les confirmations d'arrêt d'un trajet. Permissions miroir du manifeste :
+// chauffeur du trajet, super_admin, ou client ayant une offre acceptée.
+export const listAdvertisementStopConfirmations = handle('advertisements.stopConfirmations', async (req, res) => {
+  const advertisement = await prisma.advertisement.findUnique({
+    where: { id: req.params.advertisementId },
+    select: { id: true, driverId: true },
+  });
+  if (!advertisement) throw new NotFoundError('Annonce introuvable');
+
+  const isDriver = advertisement.driverId === req.user.id;
+  const isAdmin = req.user.role === 'super_admin';
+  if (!isDriver && !isAdmin) {
+    const ownsAccepted = await prisma.advertisementOffer.count({
+      where: { advertisementId: advertisement.id, clientId: req.user.id, status: 'accepted' },
+    });
+    if (!ownsAccepted) throw new ForbiddenError('Annonce non autorisée');
+  }
+
+  const rows = await prisma.shuttleStopConfirmation.findMany({
+    where: { advertisementId: advertisement.id },
+    orderBy: [{ stopOrder: 'asc' }, { confirmedAt: 'asc' }],
+  });
+  return ok(res, {
+    message: 'Confirmations d\'arrêt',
+    data: {
+      advertisementId: advertisement.id,
+      confirmations: rows.map(serializeStopConfirmation),
+    },
+  });
+});
+
 // Phase 1 — Manifeste de trajet navette : offres acceptées regroupées par arrêt.
 // À chaque arrêt, `picked` liste les colis à embarquer, `dropOffs` ceux à remettre.
 // Permissions : driver de l'annonce, super_admin, ou clients ayant une offre

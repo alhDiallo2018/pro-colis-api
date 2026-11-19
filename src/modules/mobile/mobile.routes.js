@@ -570,6 +570,8 @@ mobileRouter.post('/advertisements/:advertisementId/offers', authenticate, requi
 mobileRouter.get('/advertisements/:advertisementId/offers', authenticate, mobileController.advertisementOffers);
 mobileRouter.get('/advertisements/:advertisementId/manifest', authenticate, mobileController.advertisementManifest);
 mobileRouter.get('/advertisements/:advertisementId/reached-stops', authenticate, mobileController.advertisementReachedStops);
+mobileRouter.get('/advertisements/:advertisementId/stop-confirmations', authenticate, mobileController.listAdvertisementStopConfirmations);
+mobileRouter.post('/advertisements/:advertisementId/offers/:offerId/stop-confirmations', authenticate, requireRoles('driver'), mobileController.confirmAdvertisementStop);
 mobileRouter.post('/advertisements/:advertisementId/optimize-route', authenticate, mobileController.advertisementOptimizeRoute);
 
 // OPS-4 — Métriques pilote 14 jours.

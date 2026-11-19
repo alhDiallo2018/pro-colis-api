@@ -25,6 +25,24 @@ Identifiants `SCP-xxx` stables d'une session à l'autre. Statuts : TODO / IN_PRO
 |---|---|---|---|---|---|---|
 | SCP-004 | Notifier le client dont `dropOffStopOrder` est atteint (FCM auto + WhatsApp opt-in) | P1 | 1 | DONE | `src/modules/trips/stop-arrival.service.js` (`notifyRecipientsAtDropOff`), `tests/stop-arrival-notifications.test.js` | 3/3 tests : notification ciblée, pipeline complet, idempotence ; non bloquant ; WhatsApp opt-in only |
 
+## SCP-005 — Confirmations manuelles d'arrêt (Phase 2, chantier 1)
+
+| ID | Tâche | Prio | Phase | Statut | Fichiers | Critères d'acceptation |
+|---|---|---|---|---|---|---|
+| SCP-005 | Modèle `ShuttleStopConfirmation` + endpoints driver POST/GET + UI Mobile par colis dans l'écran manifeste | P1 | 2 | DONE | migration `20261123000000_shuttle_stop_confirmations/`, `prisma/schema.prisma` (ShuttleStopConfirmation + back-refs Advertisement/AdvertisementOffer/User), `src/modules/mobile/mobile.controller.js` (`confirmAdvertisementStop`, `listAdvertisementStopConfirmations`), `src/modules/mobile/mobile.routes.js`, `tests/shuttle-stop-confirmations.test.js`, Mobile : `lib/services/api/advertisement_extra_api.dart` (ShuttleStopConfirmation + confirmStop + fetchStopConfirmations), `lib/providers/reached_stops_provider.dart` (stopConfirmationsProvider), `lib/screens/driver/advertisement_manifest_screen.dart` (bouton par colis + état) | 11/11 tests API verts : pickup/dropoff 201, idempotence applicative (200 sur re-POST), type invalide 422, offre sans arrêt 422, autre chauffeur 403, rôle client 403, offre inexistante 404, visibilité driver + client acceptant, tiers 403 ; `flutter analyze` propre sur les 3 fichiers Dart modifiés |
+
+## SCP-006 — Dashboard de supervision cross-plateforme (Phase 2, chantier 3)
+
+| ID | Tâche | Prio | Phase | Statut | Fichiers | Critères d'acceptation |
+|---|---|---|---|---|---|---|
+| SCP-006 | Endpoint `GET /shuttle-operator/live` (trajets actifs scopés à l'opérateur + comptes flotte) + page Web `/shuttle/supervision` avec table auto-refresh 15s | P1 | 2 | DONE | `src/modules/shuttle/shuttle.controller.js` (`live`), `src/modules/shuttle/shuttle.routes.js`, `tests/shuttle-live.test.js`, Web : `src/lib/api/shuttle-operator.ts` (types ShuttleLive* + `getLive`), `src/features/shuttleOperator/ShuttleLivePage.tsx`, routes `screens.tsx` + `index.tsx` (nav `/shuttle/supervision` + route sous le guard `shuttle_operator`) | 5/5 tests API verts : RBAC client 403, aucune JourneyLive active → vide + fleet renseignée, trajet actif → métriques (position, stopsReached, nextStop, confirmations pickup/dropoff), ownership (autre opérateur vide), JourneyLive périmée (>60s) exclue ; `tsc -b --noEmit` clean |
+
+## SCP-007 — Espace opérateur navette côté Mobile Flutter (Phase 2, chantier 2)
+
+| ID | Tâche | Prio | Phase | Statut | Fichiers | Critères d'acceptation |
+|---|---|---|---|---|---|---|
+| SCP-007 | Rôle `shuttle_operator` géré côté Mobile + dashboard 5 onglets (Accueil, Supervision live, Lignes, Flotte, Horaires) avec parité Web (CRUD complet) | P2 | 2 | DONE | Mobile : `lib/models/user.dart` (enum `UserRole.shuttleOperator` + aliases fromString + apiScope `shuttle-operator`), `lib/services/api/shuttle_operator_api.dart` (ShuttleLine/Stop + ShuttleVehicle + ShuttleSchedule + ShuttleOverview + ShuttleLiveSnapshot + CRUD), `lib/providers/shuttle_operator_provider.dart` (5 FutureProvider.autoDispose), `lib/screens/shuttle_operator/` (overview, live, lines, vehicles, schedules), `lib/screens/dashboard/shuttle_operator_dashboard.dart` (NavigationBar 5 destinations), branchement `dashboard_screen.dart` + `role_identity.dart` + `app_bottom_nav.dart` + `profile_screen.dart` + `role_profile_sections.dart` + `users_management_screen.dart` (cases exhaustifs ajoutés) | `flutter analyze lib/` : 0 erreur ; `flutter analyze` sur fichiers shuttle_operator : No issues found ; dashboard accessible dès que l'API attribue le rôle `shuttle_operator` au compte (compile-enforced via switches exhaustifs) |
+
 ## SCP-011 — Notifications handover
 
 | ID | Tâche | Prio | Phase | Statut | Fichiers | Critères d'acceptation |
