@@ -15,20 +15,24 @@
 import { prisma } from '../config/prisma.js';
 import { logger } from '../config/logger.js';
 import { dispatchWebhook } from './webhook-dispatcher.js';
+import { readTimingsConfig, readTimingsConfigSync, TIMINGS_DEFAULTS } from './timings-config.js';
 
-const BACKOFF_BASE_MS = 30_000; // 30s, 1min, 2min, 4min, 8min, 16min, 32min…
-const BACKOFF_MAX_MS = 60 * 60 * 1000; // 1h
-const DEFAULT_MAX_ATTEMPTS = 6;
-const DEFAULT_POLL_INTERVAL_MS = 15_000;
+// Valeurs par défaut — la config admin (SystemConfig `timings.*`) les surcharge
+// via `readTimingsConfig()`. `BACKOFF_MAX_MS` et `BATCH_SIZE` restent des
+// garde-fous techniques internes non ajustables par admin (risques opérationnels).
+const BACKOFF_BASE_MS = TIMINGS_DEFAULTS.webhookRetryBackoffBaseMs;
+const BACKOFF_MAX_MS = 60 * 60 * 1000; // 1h — plafond dur, non configurable
+const DEFAULT_MAX_ATTEMPTS = TIMINGS_DEFAULTS.webhookMaxAttempts;
+const DEFAULT_POLL_INTERVAL_MS = TIMINGS_DEFAULTS.webhookPollIntervalMs;
 const BATCH_SIZE = 20;
 
 let workerTimer = null;
 let workerRunning = false;
 
-function computeBackoffMs(attempt) {
+function computeBackoffMs(attempt, baseMs = BACKOFF_BASE_MS) {
   // attempt 1 → base, attempt 2 → 2×base, etc. Cap à BACKOFF_MAX_MS.
   const exp = Math.min(attempt, 12);
-  return Math.min(BACKOFF_BASE_MS * Math.pow(2, exp - 1), BACKOFF_MAX_MS);
+  return Math.min(baseMs * Math.pow(2, exp - 1), BACKOFF_MAX_MS);
 }
 
 /**
@@ -42,10 +46,16 @@ export async function enqueueWebhook({
   secret,
   eventType,
   payload,
-  maxAttempts = DEFAULT_MAX_ATTEMPTS
+  maxAttempts
 }) {
   if (typeof url !== 'string' || !/^https?:\/\//.test(url)) return null;
   if (typeof secret !== 'string' || secret.length < 8) return null;
+
+  // La politique admin (SystemConfig `timings.webhookMaxAttempts`) s'applique
+  // au moment de l'insertion : les livraisons déjà planifiées conservent leur
+  // `maxAttempts` historique pour éviter d'amputer un réessai en cours.
+  const timings = await readTimingsConfig();
+  const effectiveMaxAttempts = maxAttempts ?? timings.webhookMaxAttempts ?? DEFAULT_MAX_ATTEMPTS;
 
   try {
     return await prisma.webhookDelivery.create({
@@ -56,7 +66,7 @@ export async function enqueueWebhook({
         secret,
         eventType,
         payload: payload ?? {},
-        maxAttempts
+        maxAttempts: effectiveMaxAttempts
       }
     });
   } catch (error) {
@@ -105,7 +115,10 @@ async function processDelivery(row) {
   }
 
   const giveUp = attempt >= row.maxAttempts;
-  const backoffMs = computeBackoffMs(attempt);
+  // Base de backoff lue en sync : évite un await supplémentaire par ligne
+  // traitée. Le cache 60 s dans `timings-config.js` garantit la fraîcheur.
+  const { webhookRetryBackoffBaseMs: baseMs = BACKOFF_BASE_MS } = readTimingsConfigSync();
+  const backoffMs = computeBackoffMs(attempt, baseMs);
   const next = new Date(Date.now() + backoffMs);
 
   await prisma.webhookDelivery.update({
@@ -164,8 +177,15 @@ export async function tickWebhookWorker({ now = new Date() } = {}) {
  * `intervalMs`. Idempotent (un seul worker même si appelé plusieurs fois).
  * En tests, préférer appeler `tickWebhookWorker` à la main.
  */
-export function startWebhookWorker({ intervalMs = DEFAULT_POLL_INTERVAL_MS } = {}) {
+export function startWebhookWorker({ intervalMs } = {}) {
   if (workerTimer) return workerTimer;
+  // Amorce le cache des timings au boot pour que la première passe
+  // bénéficie des overrides admin dès les premières secondes.
+  void readTimingsConfig().catch(() => {});
+  const effectiveIntervalMs =
+    intervalMs ??
+    readTimingsConfigSync().webhookPollIntervalMs ??
+    DEFAULT_POLL_INTERVAL_MS;
   const run = async () => {
     if (workerRunning) return;
     workerRunning = true;
@@ -175,7 +195,7 @@ export function startWebhookWorker({ intervalMs = DEFAULT_POLL_INTERVAL_MS } = {
       workerRunning = false;
     }
   };
-  workerTimer = setInterval(run, intervalMs);
+  workerTimer = setInterval(run, effectiveIntervalMs);
   // `unref` : pas de blocage au shutdown du process.
   if (typeof workerTimer.unref === 'function') workerTimer.unref();
   return workerTimer;

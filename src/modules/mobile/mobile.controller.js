@@ -17,6 +17,7 @@ import { logger } from '../../config/logger.js';
 import { fail, ok } from '../../utils/api-response.js';
 import { computeEta } from '../../utils/eta-calculator.js';
 import { readEtaConfig } from '../../utils/eta-config.js';
+import { readTimingsConfig, TIMINGS_DEFAULTS } from '../../utils/timings-config.js';
 import { detectAnomalies } from '../../utils/anomaly-detector.js';
 import { readAnomalyConfig } from '../../utils/anomaly-config.js';
 import {
@@ -34,7 +35,12 @@ import { invalidateFraudConfigCache } from '../../utils/fraud-config.js';
 import { scoreBids } from '../../utils/driver-scoring.js';
 import { readDriverScoringConfig } from '../../utils/driver-scoring-config.js';
 import { computePromiseSlots } from '../../utils/promise-time.js';
-import { quoteInternationalShipment } from '../../utils/international-pricing.js';
+import {
+  quoteInternationalShipment,
+  loadInternationalPricingConfig,
+  SUPPORTED_CURRENCIES
+} from '../../utils/international-pricing.js';
+import { loadPaydunyaConfig } from '../../utils/paydunya-config.js';
 import { quoteInsurance } from '../../utils/insurance-quote.js';
 import { generateReferralCode } from '../../utils/referral-rewards.js';
 import { planReferralClaim } from '../../utils/referral-claim-service.js';
@@ -4109,11 +4115,13 @@ export const driverPayWalletDebt = handle('driver.payWalletDebt', async (req, re
 export const withdrawWallet = handle('driver.withdraw', async (req, res) => {
   const amount = Number(req.body.amount || 0);
   // Les trois limites sont administrables en base. Les valeurs max à 0
-  // signifient « sans plafond » ; seul le minimum possède un repli venant de
-  // l'environnement afin que le prestataire ne reçoive jamais un petit montant
-  // qu'il refuserait.
+  // signifient « sans plafond » ; le minimum possède un repli sur la config
+  // PayDunya (`paydunya.minWithdrawal`, elle-même administrable avec repli
+  // final sur `.env`) afin que le prestataire ne reçoive jamais un petit
+  // montant qu'il refuserait.
+  const paydunyaCfg = await loadPaydunyaConfig();
   const [minRaw, maxRaw, dailyRaw] = await Promise.all([
-    getConfigValue('withdrawal.minAmount', env.PAYDUNYA_MIN_WITHDRAWAL),
+    getConfigValue('withdrawal.minAmount', paydunyaCfg.minWithdrawal),
     getConfigValue('withdrawal.maxAmount', 0),
     getConfigValue('withdrawal.maxPerDay', 0)
   ]);
@@ -4557,7 +4565,9 @@ export const favoriteGarages = handle('favorites.garages', async (req, res) => {
 // MESSAGES - Messages
 // ============================================================
 
-const MESSAGE_EDIT_WINDOW_MS = 15 * 60 * 1000;
+// Fallback statique (défaut) — la valeur effective est lue via
+// `readTimingsConfig()` dans `updateMessage` pour permettre un pilotage admin.
+const MESSAGE_EDIT_WINDOW_MS_DEFAULT = TIMINGS_DEFAULTS.messageEditWindowMs;
 const MESSAGE_BODY_MAX_LENGTH = 4000;
 const PRICE_PROPOSAL_PREFIX = '__PRIX__';
 // Roles habilites a lire et purger n'importe quel echange : l'admin et les
@@ -4852,7 +4862,9 @@ export const updateMessage = handle('messages.update', async (req, res) => {
   }
 
   const elapsed = Date.now() - new Date(existing.createdAt).getTime();
-  if (elapsed > MESSAGE_EDIT_WINDOW_MS) {
+  const timings = await readTimingsConfig();
+  const editWindowMs = timings.messageEditWindowMs ?? MESSAGE_EDIT_WINDOW_MS_DEFAULT;
+  if (elapsed > editWindowMs) {
     throw new ConflictError('Le delai de modification de ce message est depasse');
   }
 
@@ -8176,12 +8188,24 @@ async function readPublicConfig() {
     'legal.directorName',
     'legal.directorEmail',
     'legal.technicalDirectorName',
-    'legal.technicalDirectorEmail'
+    'legal.technicalDirectorEmail',
+    // Phase 1 externalisation : règles métier critiques déplacées hors `.env`.
+    'auth.otpExpiryMinutes',
+    'auth.otpMaxAttempts',
+    'international.maxWeightKg',
+    'international.countryPairs',
+    'international.requiredDocuments',
+    'international.customsSurchargeXof',
+    'international.exchangeRates',
+    'currency.default',
+    'currency.supported'
   ];
 
-  const [rows, commissionConfigs] = await Promise.all([
+  const [rows, commissionConfigs, timings, paydunyaCfg] = await Promise.all([
     prisma.systemConfig.findMany({ where: { key: { in: keys } } }),
-    prisma.commissionConfig.findMany({ where: { isActive: true } })
+    prisma.commissionConfig.findMany({ where: { isActive: true } }),
+    readTimingsConfig(),
+    loadPaydunyaConfig()
   ]);
 
   const map = Object.fromEntries(rows.map((row) => [row.key, row.value]));
@@ -8226,7 +8250,7 @@ async function readPublicConfig() {
       packs
     },
     withdrawal: {
-      minAmount: Number(value('withdrawal.minAmount', env.PAYDUNYA_MIN_WITHDRAWAL)),
+      minAmount: Number(value('withdrawal.minAmount', paydunyaCfg.minWithdrawal)),
       maxAmount: Number(value('withdrawal.maxAmount', 0)),
       maxPerDay: Number(value('withdrawal.maxPerDay', 0))
     },
@@ -8266,6 +8290,45 @@ async function readPublicConfig() {
       directorEmail: String(value('legal.directorEmail', '')),
       technicalDirectorName: String(value('legal.technicalDirectorName', '')),
       technicalDirectorEmail: String(value('legal.technicalDirectorEmail', ''))
+    },
+    // Timings de polling / timeouts / fenêtres métier exposés aux clients
+    // (Web + Mobile). Contrat : objet plat de nombres > 0, clés stables.
+    // Les clients conservent des fallbacks locaux si la clé manque (défaut
+    // null-safe : `?? kFallback`).
+    timings: { ...timings },
+    // Phase 1 externalisation : paramètres authentification (durée OTP et
+    // nombre max de tentatives). Permet au mobile de borner la saisie sans
+    // valeur magique côté client (`attempts < 5` historique).
+    auth: {
+      otpExpiryMinutes: Number(value('auth.otpExpiryMinutes', env.OTP_EXPIRES_MINUTES)),
+      otpMaxAttempts: Number(value('auth.otpMaxAttempts', 5))
+    },
+    // Tarification internationale CEDEAO. Les clients l'utilisent pour
+    // afficher les paires desservies / la limite de poids avant de demander
+    // un devis. Les fallbacks viennent de `international-pricing.js`.
+    international: {
+      maxWeightKg: Number(value('international.maxWeightKg', 50)),
+      countryPairs: (() => {
+        const raw = value('international.countryPairs', null);
+        if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+          return Object.keys(raw);
+        }
+        return [];
+      })(),
+      requiredDocuments: (() => {
+        const raw = value('international.requiredDocuments', null);
+        return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+      })()
+    },
+    // Devise d'affichage par défaut + liste autorisée. Permet au mobile de
+    // remplacer les `currency = 'XOF'` codés en dur par la config admin.
+    currency: {
+      default: String(value('currency.default', 'XOF')),
+      supported: (() => {
+        const raw = value('currency.supported', null);
+        if (Array.isArray(raw) && raw.length) return raw.map(String);
+        return ['XOF', 'EUR', 'USD', 'GHS', 'NGN', 'MRU', 'GMD'];
+      })()
     }
   };
 }
@@ -8281,13 +8344,20 @@ export const getPublicConfig = handle('config.public', async (_req, res) => {
 export const getInternationalEstimate = handle('parcel.internationalEstimate', async (req, res) => {
   const q = req.query ?? {};
   const weight = q.weightKg != null ? Number(q.weightKg) : NaN;
-  const result = quoteInternationalShipment({
-    originCountry: typeof q.originCountry === 'string' ? q.originCountry : null,
-    destinationCountry: typeof q.destinationCountry === 'string' ? q.destinationCountry : null,
-    weightKg: Number.isFinite(weight) ? weight : null,
-    displayCurrency: typeof q.displayCurrency === 'string' ? q.displayCurrency : 'XOF',
-    declareValue: q.declareValue === 'true' || q.declareValue === true
-  });
+  // La tarification internationale est administrée via `SystemConfig` : on
+  // recharge à chaque requête pour refléter immédiatement un changement
+  // d'admin. L'opération est O(une poignée de clés) et reste indolore.
+  const config = await loadInternationalPricingConfig();
+  const result = quoteInternationalShipment(
+    {
+      originCountry: typeof q.originCountry === 'string' ? q.originCountry : null,
+      destinationCountry: typeof q.destinationCountry === 'string' ? q.destinationCountry : null,
+      weightKg: Number.isFinite(weight) ? weight : null,
+      displayCurrency: typeof q.displayCurrency === 'string' ? q.displayCurrency : 'XOF',
+      declareValue: q.declareValue === 'true' || q.declareValue === true
+    },
+    { config }
+  );
   res.set('Cache-Control', 'no-store');
   return ok(res, { message: 'Devis international', data: { quote: result } });
 });
@@ -9330,7 +9400,17 @@ export const systemHealth = handle('system.health', async (req, res) => {
 async function activeCommissionConfig(profile = 'local') {
   const configs = await prisma.commissionConfig.findMany({ where: { isActive: true } });
   const cfg = configs.find((c) => c.profile === profile) || configs[0];
-  if (!cfg) return { profile, percentage: 5, minAmount: 100, maxAmount: 500 };
+  if (!cfg) {
+    // Aucune `CommissionConfig` active : on refuse de masquer l'omission
+    // par un barème codé en dur. Les appelants doivent gérer `null` (laisser
+    // l'écran afficher « commission non configurée ») plutôt que d'appliquer
+    // un prélèvement muet qui ne reflète pas l'administration réelle.
+    console.warn(
+      `[commission] Aucune CommissionConfig active pour le profil "${profile}". ` +
+      'L\'administrateur doit configurer une commission explicite (percentage/minAmount/maxAmount).'
+    );
+    return null;
+  }
   return {
     profile: cfg.profile,
     percentage: Number(cfg.percentage),
@@ -9359,6 +9439,9 @@ export const estimateCommission = handle('commission.estimate', async (req, res)
   }
 
   const cfg = await activeCommissionConfig(req.body.profile || 'local');
+  if (!cfg) {
+    throw new ValidationError([{ path: 'body.profile', message: 'Commission non configurée pour ce profil. Contactez le support.' }]);
+  }
   return ok(res, {
     message: 'Estimation commission',
     data: { commission: commissionBreakdown(amount, cfg) }
@@ -9369,6 +9452,9 @@ export const driverParcelCommission = handle('driver.parcelCommission', async (r
   const parcel = await findAccessibleParcelForDriver(req.user, req.params.parcelId);
   const amount = Number(parcel.price || parcel.totalAmount || 0);
   const cfg = await activeCommissionConfig('local');
+  if (!cfg) {
+    throw new ValidationError([{ path: 'params.parcelId', message: 'Commission non configurée. L\'administrateur doit définir CommissionConfig.' }]);
+  }
   const breakdown = amount > 0
     ? commissionBreakdown(amount, cfg)
     : { amount: 0, commission: 0, netAmount: 0, percentage: cfg.percentage, minAmount: cfg.minAmount, maxAmount: cfg.maxAmount, profile: cfg.profile };
@@ -9409,7 +9495,13 @@ export const driverPayCommission = handle('driver.payCommission', async (req, re
   }
 
   const cfg = await activeCommissionConfig('local');
+  if (!cfg) {
+    throw new ValidationError([{ path: 'params.parcelId', message: 'Commission non configurée. L\'administrateur doit définir CommissionConfig.' }]);
+  }
   const commission = calculateCommissionSync(baseAmount, cfg.percentage, cfg.minAmount, cfg.maxAmount);
+  if (commission === null) {
+    throw new ValidationError([{ path: 'params.parcelId', message: 'Commission non calculable (configuration incomplète).' }]);
+  }
 
   const [paidWallet, paidScore] = await Promise.all([
     prisma.walletTransaction.findFirst({

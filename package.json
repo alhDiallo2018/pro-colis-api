@@ -14,6 +14,7 @@
     "seed:zones-sn": "node prisma/seed-zones-senegal.js",
     "seed:support": "node prisma/seed-support.js",
     "seed:transit": "node prisma/seed-transit.js",
+    "seed:reference": "node prisma/seeds/index.js",
     "transit:scrape": "node scripts/transit/scrape.mjs",
     "transit:geocode": "node scripts/transit/geocode.mjs",
     "prisma:generate": "prisma generate",

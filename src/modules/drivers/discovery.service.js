@@ -1,9 +1,12 @@
 import { prisma } from '../../config/prisma.js';
 import { ValidationError, ForbiddenError } from '../../utils/errors.js';
 import { serializePublicDriver } from '../../utils/mobile-serializers.js';
+import { readTimingsConfig, TIMINGS_DEFAULTS } from '../../utils/timings-config.js';
 import { VEHICLE_TYPES, normalizeVehicleType, vehicleTypeFilter } from '../../utils/vehicle-types.js';
 
-export const POSITION_TTL_MS = 10 * 60 * 1000;
+// Conservé pour compat descendante — valeur par défaut si la config n'est pas
+// encore chargée. Les appels internes consomment `readTimingsConfig()`.
+export const POSITION_TTL_MS = TIMINGS_DEFAULTS.positionTtlMs;
 export function coordinate(value, path, min, max) {
   if (!['number', 'string'].includes(typeof value) || String(value).trim() === '' ||
       !Number.isFinite(Number(value)) || Number(value) < min || Number(value) > max) {
@@ -79,11 +82,13 @@ async function discover(query, actor, scope, mapMode) {
     // chauffeur le plus proche. Les profils sans GPS frais restent en fin.
     ...(!near ? { take: limit } : {})
   });
+  const timings = await readTimingsConfig();
+  const positionTtlMs = timings.positionTtlMs;
   const now = Date.now();
   let ranked = drivers.map(driver => {
     const position = driver.discoveryPosition;
     const age = position ? now - new Date(position.updatedAt).getTime() : Infinity;
-    const fresh = near && position && age >= 0 && age <= POSITION_TTL_MS;
+    const fresh = near && position && age >= 0 && age <= positionTtlMs;
     const distance = fresh ? distanceKm(lat, lng, Number(position.latitude), Number(position.longitude)) : null;
     return { driver, distance, updatedAt: fresh ? position.updatedAt : null };
   });

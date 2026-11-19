@@ -836,7 +836,50 @@ async function seedScoreConfigs() {
     { key: 'legal.directorName', value: 'Serigne Fallou Ndao' },
     { key: 'legal.directorEmail', value: 'fallou.edu.uad@gmail.com' },
     { key: 'legal.technicalDirectorName', value: 'Thierno Alhassane Diallo Garki' },
-    { key: 'legal.technicalDirectorEmail', value: 'dialloalhassanegarki2018@gmail.com' }
+    { key: 'legal.technicalDirectorEmail', value: 'dialloalhassanegarki2018@gmail.com' },
+    // --- Phase 1 externalisation : auth OTP ---
+    // Durée de vie d'un code OTP (minutes) et nombre max de tentatives avant
+    // invalidation. Remplace les anciens defaults .env et mobile hardcodé.
+    { key: 'auth.otpExpiryMinutes', value: 10 },
+    { key: 'auth.otpMaxAttempts', value: 5 },
+    // --- Phase 1 externalisation : PayDunya ---
+    // Montant minimum accepté par les canaux PayDunya (pay-in et pay-out).
+    // Ancien défaut `.env` : PAYDUNYA_MIN_AMOUNT=200, PAYDUNYA_MIN_WITHDRAWAL=500.
+    { key: 'paydunya.minAmount', value: 200 },
+    { key: 'paydunya.minWithdrawal', value: 500 },
+    // --- Phase 1 externalisation : tarification internationale ---
+    // Clés historiques déplacées depuis `international-pricing.js` (DEFAULTS).
+    // L'admin peut ajouter/retirer une paire sans redéploiement.
+    { key: 'international.enabled', value: true },
+    { key: 'international.maxWeightKg', value: 50 },
+    { key: 'international.customsSurchargeXof', value: 1500 },
+    { key: 'international.exchangeRates', value: {
+      XOF: 1,
+      GHS: 0.020,
+      NGN: 2.6,
+      MRU: 0.066,
+      GMD: 0.11,
+      EUR: 0.00152,
+      USD: 0.00164
+    } },
+    { key: 'international.countryPairs', value: {
+      'SN-SN': { baseFeeXof: 500, pricePerKgXof: 300, slaDays: 1 },
+      'SN-ML': { baseFeeXof: 5000, pricePerKgXof: 1200, slaDays: 4 },
+      'SN-GN': { baseFeeXof: 4500, pricePerKgXof: 1100, slaDays: 3 },
+      'SN-MR': { baseFeeXof: 4000, pricePerKgXof: 1000, slaDays: 2 },
+      'SN-GM': { baseFeeXof: 3000, pricePerKgXof: 800, slaDays: 1 },
+      'SN-CI': { baseFeeXof: 6000, pricePerKgXof: 1300, slaDays: 4 },
+      'SN-BF': { baseFeeXof: 6500, pricePerKgXof: 1400, slaDays: 5 }
+    } },
+    { key: 'international.requiredDocuments', value: {
+      default: ['invoice'],
+      crossBorder: ['invoice', 'cn22_or_cn23', 'sender_id']
+    } },
+    // --- Phase 1 externalisation : devises ---
+    // `currency.default` sert aux clients pour afficher les montants ;
+    // `currency.supported` cadre les sélecteurs UI.
+    { key: 'currency.default', value: 'XOF' },
+    { key: 'currency.supported', value: ['XOF', 'EUR', 'USD', 'GHS', 'NGN', 'MRU', 'GMD'] }
   ];
 
   for (const cfg of configs) {

@@ -10,6 +10,7 @@ import {
   confirmInvoice as paydunyaConfirmInvoice,
   verifyIpnHash
 } from '../utils/paydunya.js'
+import { loadPaydunyaConfig } from '../utils/paydunya-config.js'
 
 function handle(action, fn) {
   return async (req, res) => {
@@ -279,7 +280,9 @@ export const createPaydunyaPayment = handle('paydunya.create', async (req, res) 
     redirectPath = '/client/colis'
   }
 
-  const minAmount = env.PAYDUNYA_MIN_AMOUNT
+  // Lu depuis SystemConfig (`paydunya.minAmount`), avec repli sur `.env`.
+  const paydunyaCfg = await loadPaydunyaConfig()
+  const minAmount = paydunyaCfg.minAmount
   if (amount < minAmount) {
     throw new ValidationError([{ path: 'body.amount', message: `Le montant minimum est de ${minAmount} FCFA` }])
   }

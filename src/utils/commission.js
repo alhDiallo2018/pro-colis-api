@@ -25,9 +25,28 @@ export async function calculateCommission(price, profile = 'local') {
   return Math.max(min, Math.min(Math.round((pct * price) / 100), max));
 }
 
-export function calculateCommissionSync(price, percentage = 5, minAmount = 100, maxAmount = 500) {
+/**
+ * Variante synchrone du calcul de commission. Les paramètres ne sont PAS
+ * repliés silencieusement sur des valeurs par défaut : l'appelant doit
+ * fournir une configuration explicitement administrée (via `CommissionConfig`
+ * ou `/public/config`). Un `percentage`/`minAmount`/`maxAmount` invalide
+ * retourne `null` et logge un avertissement afin que l'omission soit
+ * détectable en supervision.
+ */
+export function calculateCommissionSync(price, percentage, minAmount, maxAmount) {
   if (!price || price <= 0) return 0;
-  return Math.max(minAmount, Math.min(Math.round((percentage * price) / 100), maxAmount));
+  const pct = Number(percentage);
+  const min = Number(minAmount);
+  const max = Number(maxAmount);
+  if (!Number.isFinite(pct) || !Number.isFinite(min) || !Number.isFinite(max)) {
+    console.warn(
+      '[commission] calculateCommissionSync appelé sans configuration explicite ' +
+      '(percentage/minAmount/maxAmount manquants). Retour null : l\'appelant doit ' +
+      'lire la config admin (CommissionConfig).'
+    );
+    return null;
+  }
+  return Math.max(min, Math.min(Math.round((pct * price) / 100), max));
 }
 
 export async function getCfaPerPoint(tx) {

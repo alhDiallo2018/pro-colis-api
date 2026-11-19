@@ -12,8 +12,12 @@
 import { createHmac } from 'node:crypto';
 
 import { logger } from '../config/logger.js';
+import { readTimingsConfigSync, TIMINGS_DEFAULTS } from './timings-config.js';
 
-const DEFAULT_TIMEOUT_MS = 5000;
+// Valeur par défaut historique : 5 s. Peut être remontée via la config admin
+// (SystemConfig `timings.apiRequestTimeoutMs`) — le dispatcher partage le
+// timeout « sortie API » avec le reste du client HTTP.
+const DEFAULT_TIMEOUT_MS = 5_000;
 const SIGNATURE_HEADER = 'X-SendProColis-Signature';
 const EVENT_HEADER = 'X-SendProColis-Event';
 const TIMESTAMP_HEADER = 'X-SendProColis-Timestamp';
@@ -74,8 +78,14 @@ export async function dispatchWebhook({
   secret,
   eventType,
   data,
-  timeoutMs = DEFAULT_TIMEOUT_MS
+  timeoutMs
 }) {
+  // Préférence : param explicite (tests) > config admin > défaut historique.
+  const effectiveTimeoutMs =
+    timeoutMs ??
+    readTimingsConfigSync().apiRequestTimeoutMs ??
+    TIMINGS_DEFAULTS.apiRequestTimeoutMs ??
+    DEFAULT_TIMEOUT_MS;
   if (typeof url !== 'string' || !/^https?:\/\//.test(url)) {
     logger.warn({ component: 'webhook', url, eventType }, 'URL webhook invalide — envoi ignoré');
     return { ok: false, status: null, error: 'invalid_url' };
@@ -90,7 +100,7 @@ export async function dispatchWebhook({
   const signature = signWebhook(payload, secret, ts);
 
   const controller = new AbortController();
-  const abortTimer = setTimeout(() => controller.abort(), timeoutMs);
+  const abortTimer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
   try {
     const response = await fetch(url, {
       method: 'POST',

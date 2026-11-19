@@ -24,6 +24,10 @@ import { integrationsRouter } from './modules/integrations/integrations.routes.j
 import { observabilityRouter } from './modules/observability/observability.routes.js';
 import { consolidationRouter } from './modules/consolidation/consolidation.routes.js';
 import { fraudRouter } from './modules/fraud/fraud.routes.js';
+import {
+  adminReferenceRouter,
+  publicReferenceRouter
+} from './modules/admin/reference-data/reference-data.routes.js';
 
 import { qualityRouter } from './modules/experience/quality.routes.js';
 import { experienceRouter } from './modules/experience/experience.routes.js';
@@ -90,6 +94,8 @@ apiV1.use('/shuttle-operator', shuttleRouter);
 apiV1.use('/integrations', integrationsRouter);
 apiV1.use('/drivers', consolidationRouter);
 apiV1.use('/super-admin/fraud', fraudRouter);
+apiV1.use('/admin/reference', adminReferenceRouter);
+apiV1.use('/reference', publicReferenceRouter);
 apiV1.use('/', mobileRouter);
 
 app.use('/api/v1', apiV1);

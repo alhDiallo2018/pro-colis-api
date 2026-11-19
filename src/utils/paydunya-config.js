@@ -5,7 +5,19 @@ import { env } from '../config/env.js';
 // clés "paydunya.*" (convention existante du checkout). La base PRIME sur
 // l'env, qui ne sert que de valeur par défaut. Snapshot mémoire TTL 30s.
 const TTL_MS = 30_000;
-const KEYS = ['masterKey', 'privateKey', 'token', 'mode', 'storeName', 'debitAccountNumber'];
+const KEYS = [
+  'masterKey',
+  'privateKey',
+  'token',
+  'mode',
+  'storeName',
+  'debitAccountNumber',
+  // Limites financières désormais administrables (phase 1 externalisation).
+  // Ces clés remplacent `PAYDUNYA_MIN_AMOUNT` et `PAYDUNYA_MIN_WITHDRAWAL`
+  // (conservées en .env comme valeurs par défaut pour compat ascendante).
+  'minAmount',
+  'minWithdrawal'
+];
 
 let dbConfig = null;
 let loadedAt = 0;
@@ -45,13 +57,24 @@ export function invalidatePaydunyaConfigCache() {
 
 function effective() {
   const db = dbConfig ?? {};
+  // `minAmount` / `minWithdrawal` : la valeur `0` ou chaîne vide est traitée
+  // comme « non défini » pour tomber sur l'env, afin qu'une entrée vide côté
+  // admin ne désactive pas accidentellement le plancher de sécurité.
+  const minAmountDb = Number(db.minAmount);
+  const minWithdrawalDb = Number(db.minWithdrawal);
   return {
     masterKey: db.masterKey || env.PAYDUNYA_MASTER_KEY || '',
     privateKey: db.privateKey || env.PAYDUNYA_PRIVATE_KEY || '',
     token: db.token || env.PAYDUNYA_TOKEN || '',
     mode: db.mode || env.PAYDUNYA_MODE || 'test',
     storeName: db.storeName || env.PAYDUNYA_STORE_NAME || 'ProColis',
-    debitAccountNumber: db.debitAccountNumber || env.PAYDUNYA_DEBIT_ACCOUNT_NUMBER || ''
+    debitAccountNumber: db.debitAccountNumber || env.PAYDUNYA_DEBIT_ACCOUNT_NUMBER || '',
+    minAmount: Number.isFinite(minAmountDb) && minAmountDb > 0
+      ? minAmountDb
+      : Number(env.PAYDUNYA_MIN_AMOUNT) || 200,
+    minWithdrawal: Number.isFinite(minWithdrawalDb) && minWithdrawalDb > 0
+      ? minWithdrawalDb
+      : Number(env.PAYDUNYA_MIN_WITHDRAWAL) || 500
   };
 }
 

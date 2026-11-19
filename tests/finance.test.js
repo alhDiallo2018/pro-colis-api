@@ -1,23 +1,36 @@
 import { calculateCommissionSync } from '../src/utils/commission.js';
 
+// Historiquement, `calculateCommissionSync(price)` acceptait des defaults
+// (5 %, 100, 500). Depuis Phase 1 externalisation, les defaults silencieux
+// ont été supprimés : l'appelant DOIT fournir une configuration explicite
+// (CommissionConfig). Les tests ci-dessous valident le nouveau contrat.
 describe('calculateCommission', () => {
+  // Contrat historique utilisé par ces tests : 5 % / min 100 / max 500
+  const PCT = 5;
+  const MIN = 100;
+  const MAX = 500;
+
   it('returns 0 for 0 price', () => {
-    expect(calculateCommissionSync(0)).toBe(0);
+    expect(calculateCommissionSync(0, PCT, MIN, MAX)).toBe(0);
+  });
+
+  it('returns null when configuration is omitted (no silent fallback)', () => {
+    expect(calculateCommissionSync(1000)).toBeNull();
   });
 
   it('applies minimum commission (100 FCFA) for low prices', () => {
-    expect(calculateCommissionSync(1000)).toBe(100);
-    expect(calculateCommissionSync(500)).toBe(100);
+    expect(calculateCommissionSync(1000, PCT, MIN, MAX)).toBe(100);
+    expect(calculateCommissionSync(500, PCT, MIN, MAX)).toBe(100);
   });
 
   it('calculates standard commission (5%)', () => {
-    expect(calculateCommissionSync(5000)).toBe(250);
+    expect(calculateCommissionSync(5000, PCT, MIN, MAX)).toBe(250);
   });
 
   it('caps at maximum commission (500 FCFA)', () => {
-    expect(calculateCommissionSync(10000)).toBe(500);
-    expect(calculateCommissionSync(50000)).toBe(500);
-    expect(calculateCommissionSync(100000)).toBe(500);
+    expect(calculateCommissionSync(10000, PCT, MIN, MAX)).toBe(500);
+    expect(calculateCommissionSync(50000, PCT, MIN, MAX)).toBe(500);
+    expect(calculateCommissionSync(100000, PCT, MIN, MAX)).toBe(500);
   });
 
   it('works with custom parameters', () => {
@@ -107,9 +120,14 @@ describe('Commission scenarios', () => {
 });
 
 describe('Payment flow logic', () => {
+  // Reconstruit l'ancien contrat local 5 % / 100 / 500 pour ces scénarios.
+  const PCT = 5;
+  const MIN = 100;
+  const MAX = 500;
+
   it('PayDunya flow: driver gets net amount after commission', () => {
     const parcelPrice = 10000;
-    const commission = calculateCommissionSync(parcelPrice);
+    const commission = calculateCommissionSync(parcelPrice, PCT, MIN, MAX);
     const driverEarning = parcelPrice - commission;
 
     expect(commission).toBe(500);
@@ -118,7 +136,7 @@ describe('Payment flow logic', () => {
 
   it('Cash flow: driver gets full price, commission deducted from wallet', () => {
     const parcelPrice = 5000;
-    const commission = calculateCommissionSync(parcelPrice);
+    const commission = calculateCommissionSync(parcelPrice, PCT, MIN, MAX);
     const walletBalance = 1000;
 
     // Driver gets full price (cash from client)

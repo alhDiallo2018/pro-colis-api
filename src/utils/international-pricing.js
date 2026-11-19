@@ -7,14 +7,20 @@
  * pivot), prix converti dans la devise d'affichage, supplément douane,
  * et SLA estimé en jours.
  *
- * V1 déterministe : table de tarifs en dur (configurables via
- * SystemConfig), taux de change figés dans un sous-dictionnaire (à
- * rafraîchir manuellement par un admin ou via un cron V2 branché sur
- * une source officielle).
+ * V1 déterministe : table de tarifs administrée via `SystemConfig` sous
+ * les clés `international.countryPairs`, `international.maxWeightKg`,
+ * `international.customsSurchargeXof`, `international.exchangeRates` et
+ * `international.requiredDocuments`. Les valeurs ci-dessous ne sont que
+ * des repères utilisés par les tests unitaires et par
+ * `loadInternationalPricingConfig()` lorsque la configuration admin
+ * est absente — un `console.warn` est alors émis afin que la supervision
+ * détecte l'omission et déclenche un seed.
  *
  * Volontairement simple. Aucun appel douanes réel — on expose le concept
  * et le flux pour les partenariats à venir.
  */
+
+import { prisma } from '../config/prisma.js';
 
 const DEFAULTS = Object.freeze({
   enabled: true,
@@ -156,3 +162,82 @@ export function quoteInternationalShipment({
 
 export const INTERNATIONAL_PRICING_DEFAULTS = DEFAULTS;
 export const SUPPORTED_CURRENCIES = [...KNOWN_CURRENCIES];
+
+/// Clés SystemConfig consommées par la tarification internationale. Toutes
+/// sont administrables : une clé absente laisse la valeur par défaut tout en
+/// loggant un avertissement explicite (cf. `loadInternationalPricingConfig`).
+export const INTERNATIONAL_CONFIG_KEYS = Object.freeze({
+  countryPairs: 'international.countryPairs',
+  maxWeightKg: 'international.maxWeightKg',
+  customsSurchargeXof: 'international.customsSurchargeXof',
+  exchangeRates: 'international.exchangeRates',
+  requiredDocuments: 'international.requiredDocuments',
+  enabled: 'international.enabled'
+});
+
+/// Normalise une entrée SystemConfig : les écritures historiques enveloppent
+/// parfois la valeur dans `{ value }`, qu'on déballe sans confondre un tableau
+/// avec un objet.
+function unwrapConfigValue(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'object' && !Array.isArray(raw) && 'value' in raw) {
+    return raw.value;
+  }
+  return raw;
+}
+
+/// Lit la configuration internationale depuis `SystemConfig`. En cas de clé
+/// manquante, log un warning explicite (plutôt qu'un silence) pour que
+/// l'administrateur alimente les clés.
+export async function loadInternationalPricingConfig(client = prisma) {
+  const keys = Object.values(INTERNATIONAL_CONFIG_KEYS);
+  let rows = [];
+  try {
+    rows = await client.systemConfig.findMany({ where: { key: { in: keys } } });
+  } catch (error) {
+    console.warn(
+      '[international-pricing] Lecture SystemConfig impossible — fallback DEFAULTS. ' +
+      `Cause: ${error?.message || error}`
+    );
+    return DEFAULTS;
+  }
+
+  const map = Object.fromEntries(rows.map((row) => [row.key, unwrapConfigValue(row.value)]));
+  const missing = keys.filter((k) => map[k] === undefined);
+  if (missing.length) {
+    console.warn(
+      `[international-pricing] Admin config manquante — valeurs par défaut utilisées pour: ${missing.join(', ')}. ` +
+      'Exécuter `npm run seed:international` ou configurer via l\'admin.'
+    );
+  }
+
+  const countryPairs = map[INTERNATIONAL_CONFIG_KEYS.countryPairs];
+  const exchangeRates = map[INTERNATIONAL_CONFIG_KEYS.exchangeRates];
+  const requiredDocuments = map[INTERNATIONAL_CONFIG_KEYS.requiredDocuments];
+  const maxWeightKg = map[INTERNATIONAL_CONFIG_KEYS.maxWeightKg];
+  const customsSurchargeXof = map[INTERNATIONAL_CONFIG_KEYS.customsSurchargeXof];
+  const enabled = map[INTERNATIONAL_CONFIG_KEYS.enabled];
+
+  return {
+    enabled: typeof enabled === 'boolean' ? enabled : DEFAULTS.enabled,
+    pivotCurrency: DEFAULTS.pivotCurrency,
+    exchangeRates:
+      exchangeRates && typeof exchangeRates === 'object' && !Array.isArray(exchangeRates)
+        ? exchangeRates
+        : DEFAULTS.exchangeRates,
+    countryPairs:
+      countryPairs && typeof countryPairs === 'object' && !Array.isArray(countryPairs)
+        ? countryPairs
+        : DEFAULTS.countryPairs,
+    customsSurchargeXof: isFiniteNumber(Number(customsSurchargeXof))
+      ? Number(customsSurchargeXof)
+      : DEFAULTS.customsSurchargeXof,
+    maxWeightKg: isFiniteNumber(Number(maxWeightKg))
+      ? Number(maxWeightKg)
+      : DEFAULTS.maxWeightKg,
+    requiredDocuments:
+      requiredDocuments && typeof requiredDocuments === 'object' && !Array.isArray(requiredDocuments)
+        ? requiredDocuments
+        : DEFAULTS.requiredDocuments
+  };
+}

@@ -16,6 +16,7 @@ import {
   verifyRefreshToken
 } from '../../utils/tokens.js';
 import { serializeUser } from '../../utils/mobile-serializers.js';
+import { loadAuthConfig } from '../../utils/auth-config.js';
 
 // Relations a charger des qu'un utilisateur est renvoye au client : sans
 // elles, `garageName` et les champs vehicule sont absents de la reponse.
@@ -322,7 +323,9 @@ export async function sendOtp({ phone, email, purpose }) {
   }
 
   const code = generateOtpCode();
-  const expiresAt = new Date(Date.now() + env.OTP_EXPIRES_MINUTES * 60 * 1000);
+  // Durée OTP désormais administrable (`auth.otpExpiryMinutes`). Fallback env.
+  const authCfg = await loadAuthConfig();
+  const expiresAt = new Date(Date.now() + authCfg.otpExpiryMinutes * 60 * 1000);
 
   await prisma.otpCode.create({
     data: {
@@ -398,7 +401,9 @@ export async function forgotPassword({ identifier }) {
   }
 
   const code = generateOtpCode();
-  const expiresAt = new Date(Date.now() + env.OTP_EXPIRES_MINUTES * 60 * 1000);
+  // Durée OTP désormais administrable (`auth.otpExpiryMinutes`). Fallback env.
+  const authCfg = await loadAuthConfig();
+  const expiresAt = new Date(Date.now() + authCfg.otpExpiryMinutes * 60 * 1000);
   const type = `reset-password:${identifier}`;
 
   await prisma.otpCode.create({
@@ -544,7 +549,9 @@ export async function resendVerification({ identifier }) {
   }
 
   const code = generateOtpCode();
-  const expiresAt = new Date(Date.now() + env.OTP_EXPIRES_MINUTES * 60 * 1000);
+  // Durée OTP désormais administrable (`auth.otpExpiryMinutes`). Fallback env.
+  const authCfg = await loadAuthConfig();
+  const expiresAt = new Date(Date.now() + authCfg.otpExpiryMinutes * 60 * 1000);
 
   await prisma.otpCode.create({
     data: {
