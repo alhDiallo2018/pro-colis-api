@@ -9,6 +9,7 @@ import * as adminIdentityController from '../admin-identity.controller.js';
 import * as adminReputationController from '../admin-reputation.controller.js';
 import * as backupController from '../backups/backup.controller.js';
 import * as paydunyaController from '../paydunya.controller.js';
+import * as adminSystemConfigController from '../admin-system-config.controller.js';
 import * as mobileController from './mobile.controller.js';
 
 export const mobileRouter = Router();
@@ -524,6 +525,18 @@ mobileRouter.get('/payments/paydunya/cancel', paydunyaController.paydunyaCancel)
 mobileRouter.post('/payments/paydunya/disburse-callback', paydunyaController.paydunyaDisburseCallback);
 mobileRouter.get('/admin/payments/paydunya-config', authenticate, requireRoles('super_admin', 'support'), paydunyaController.getPaydunyaAdminConfig);
 mobileRouter.put('/admin/payments/paydunya-config', authenticate, requireRoles('super_admin', 'support'), paydunyaController.updatePaydunyaAdminConfig);
+
+// ============================================================
+// SUPER ADMIN — SystemConfig (clés K-V JSON administrables)
+// ============================================================
+// GET : dump complet groupé (alimente l'UI admin). PUT /:key : mutation
+// unique. PUT /batch : mutation transactionnelle (10-20 clés en une passe).
+// L'invalidation du cache mémoire correspondant est déclenchée à chaque
+// mutation → les changements sont visibles par /public/config immédiatement.
+mobileRouter.get('/admin/system-config', authenticate, requireRoles('super_admin'), adminSystemConfigController.listSystemConfig);
+mobileRouter.put('/admin/system-config/batch', authenticate, requireRoles('super_admin'), adminSystemConfigController.batchUpdateSystemConfig);
+mobileRouter.put('/admin/system-config/:key', authenticate, requireRoles('super_admin'), adminSystemConfigController.updateSystemConfigKey);
+mobileRouter.delete('/admin/system-config/:key', authenticate, requireRoles('super_admin'), adminSystemConfigController.deleteSystemConfigKey);
 
 // ============================================================
 // COUPONS & SEARCH
