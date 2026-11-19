@@ -879,7 +879,60 @@ async function seedScoreConfigs() {
     // `currency.default` sert aux clients pour afficher les montants ;
     // `currency.supported` cadre les sélecteurs UI.
     { key: 'currency.default', value: 'XOF' },
-    { key: 'currency.supported', value: ['XOF', 'EUR', 'USD', 'GHS', 'NGN', 'MRU', 'GMD'] }
+    { key: 'currency.supported', value: ['XOF', 'EUR', 'USD', 'GHS', 'NGN', 'MRU', 'GMD'] },
+    // --- Phase 4 externalisation : limites de formulaires et imports ---
+    // Les clients (Web + Mobile) lisent ces valeurs via `/public/config.limits`.
+    // Correspondent aux constantes historiques (CSV 2 MiB / 50 lignes, photos
+    // colis max 4, description 280 chars, etc.). Toute modification prend effet
+    // dans les 60 s via le cache de `utils/limits-config.js`.
+    // CSV / imports
+    { key: 'limits.csvMaxLines', value: 50 },
+    { key: 'limits.csvMaxBytes', value: 2097152 }, // 2 MiB
+    { key: 'limits.routesCsvMaxBytes', value: 131072 }, // 128 KiB
+    { key: 'limits.maxStopsPerRoute', value: 38 },
+    { key: 'limits.maxDeparturesPerPublish', value: 100 },
+    // Colis
+    { key: 'limits.parcelWeightLightKg', value: 10 },
+    { key: 'limits.parcelPhotosMax', value: 4 },
+    { key: 'limits.parcelDescriptionMaxChars', value: 280 },
+    { key: 'limits.parcelDescriptionLongMaxChars', value: 100000 },
+    { key: 'limits.addressMaxChars', value: 500 },
+    { key: 'limits.phoneMaxChars', value: 30 },
+    // Annonces / cash / messages courts
+    { key: 'limits.annonceDescriptionMaxChars', value: 200 },
+    { key: 'limits.cashJustificationMaxChars', value: 200 },
+    { key: 'limits.disputeDescriptionMaxChars', value: 2000 },
+    // Médias
+    { key: 'limits.imageMaxDimension', value: 1600 },
+    { key: 'limits.imageJpegQuality', value: 0.8 },
+    // Pagination API (zones)
+    { key: 'limits.zonePageSize', value: 100 },
+    { key: 'limits.zoneMaxPages', value: 20 },
+    // --- Phase 6 — branding & notifications ---
+    // Branding PWA + Web : nom affiché, couleurs (manifest + meta theme-color
+    // + CSS variables), logo et icônes. L'admin modifie en runtime ; la PWA
+    // relit via `GET /manifest.webmanifest` au prochain rafraîchissement, et
+    // le web applique les couleurs via `applyBranding()` dès que
+    // `/public/config` répond.
+    { key: 'branding.appName', value: 'ProColis' },
+    { key: 'branding.shortName', value: 'ProColis' },
+    { key: 'branding.themeColor', value: '#018982' },
+    { key: 'branding.backgroundColor', value: '#FFFFFF' },
+    { key: 'branding.logoUrl', value: '/icons/icon-192.png' },
+    { key: 'branding.logoDarkUrl', value: null },
+    { key: 'branding.faviconUrl', value: '/favicon.ico' },
+    { key: 'branding.iconUrl', value: '/icons/icon-192.png' },
+    { key: 'branding.badgeUrl', value: '/icons/icon-72.png' },
+    { key: 'branding.primaryColor', value: '#018982' },
+    { key: 'branding.secondaryColor', value: null },
+    // Fallbacks notifications : titre/corps si le payload push n'en transporte
+    // pas, icône/badge par défaut, et liste des priorités qui déclenchent
+    // `requireInteraction` (notification persistante jusqu'au clic).
+    { key: 'notifications.fallbackTitle', value: 'ProColis' },
+    { key: 'notifications.fallbackBody', value: 'Nouvelle activité' },
+    { key: 'notifications.defaultIconUrl', value: '/icons/icon-192.png' },
+    { key: 'notifications.defaultBadgeUrl', value: '/icons/icon-72.png' },
+    { key: 'notifications.highPriorityValues', value: ['high', 'urgent'] }
   ];
 
   for (const cfg of configs) {

@@ -31,6 +31,7 @@ import {
 
 import { qualityRouter } from './modules/experience/quality.routes.js';
 import { experienceRouter } from './modules/experience/experience.routes.js';
+import { getManifest } from './modules/public.controller.js';
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -96,9 +97,19 @@ apiV1.use('/drivers', consolidationRouter);
 apiV1.use('/super-admin/fraud', fraudRouter);
 apiV1.use('/admin/reference', adminReferenceRouter);
 apiV1.use('/reference', publicReferenceRouter);
+// Phase 6 : manifest PWA dynamique. Monté sous `/api/v1` pour que le
+// `<link rel="manifest">` du HTML puisse pointer vers `/api/v1/manifest.webmanifest`
+// (le fallback statique `public/manifest.webmanifest` reste en place si l'API
+// est injoignable — rollback instantané via la config DNS).
+apiV1.get('/manifest.webmanifest', getManifest);
 apiV1.use('/', mobileRouter);
 
 app.use('/api/v1', apiV1);
+
+// Alias à la racine : certains navigateurs n'honorent pas un `scope` croisé
+// avec le manifest. Servir `/manifest.webmanifest` aussi à la racine couvre le
+// cas où le web est déployé derrière le même reverse proxy que l'API.
+app.get('/manifest.webmanifest', getManifest);
 
 // Temporary aliases keep the current Flutter client working while it migrates to /api/v1.
 app.use('/health', healthRouter);

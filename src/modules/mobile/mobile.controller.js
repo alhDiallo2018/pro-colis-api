@@ -18,6 +18,8 @@ import { fail, ok } from '../../utils/api-response.js';
 import { computeEta } from '../../utils/eta-calculator.js';
 import { readEtaConfig } from '../../utils/eta-config.js';
 import { readTimingsConfig, TIMINGS_DEFAULTS } from '../../utils/timings-config.js';
+import { readLimitsConfig } from '../../utils/limits-config.js';
+import { readBrandingConfig } from '../../utils/branding-config.js';
 import { detectAnomalies } from '../../utils/anomaly-detector.js';
 import { readAnomalyConfig } from '../../utils/anomaly-config.js';
 import {
@@ -8201,11 +8203,15 @@ async function readPublicConfig() {
     'currency.supported'
   ];
 
-  const [rows, commissionConfigs, timings, paydunyaCfg] = await Promise.all([
+  const [rows, commissionConfigs, timings, limits, paydunyaCfg, brandingCfg] = await Promise.all([
     prisma.systemConfig.findMany({ where: { key: { in: keys } } }),
     prisma.commissionConfig.findMany({ where: { isActive: true } }),
     readTimingsConfig(),
-    loadPaydunyaConfig()
+    readLimitsConfig(),
+    loadPaydunyaConfig(),
+    // Phase 6 : branding (nom, couleurs, logo) + notifications fallback.
+    // Lu via son propre cache 60 s pour ne pas pénaliser `/public/config`.
+    readBrandingConfig()
   ]);
 
   const map = Object.fromEntries(rows.map((row) => [row.key, row.value]));
@@ -8296,6 +8302,11 @@ async function readPublicConfig() {
     // Les clients conservent des fallbacks locaux si la clé manque (défaut
     // null-safe : `?? kFallback`).
     timings: { ...timings },
+    // Phase 4 externalisation : limites de formulaires et imports (CSV,
+    // longueurs max, dimensions photo, pagination). Les clients conservent
+    // un fallback compile-time sur les hot paths — cf. `DEFAULT_LIMITS`
+    // côté web et `kLimitsFallback` côté mobile.
+    limits: { ...limits },
     // Phase 1 externalisation : paramètres authentification (durée OTP et
     // nombre max de tentatives). Permet au mobile de borner la saisie sans
     // valeur magique côté client (`attempts < 5` historique).
@@ -8329,7 +8340,17 @@ async function readPublicConfig() {
         if (Array.isArray(raw) && raw.length) return raw.map(String);
         return ['XOF', 'EUR', 'USD', 'GHS', 'NGN', 'MRU', 'GMD'];
       })()
-    }
+    },
+    // Phase 6 externalisation : branding PWA / Web (nom, couleurs, logo,
+    // favicon, icônes notification). Consommé par `applyBranding()` côté web
+    // (CSS vars + meta theme-color + favicon) et par `GET /manifest.webmanifest`.
+    // Mobile ne consomme pas ce bloc (branding natif compilé, hors scope).
+    branding: { ...brandingCfg.branding },
+    // Phase 6 externalisation : fallbacks de notifications (titre/corps quand
+    // le push backend n'en transporte pas) + icône/badge par défaut + liste
+    // de priorités qui déclenchent `requireInteraction`. Consommé par
+    // `pwa/sw.js` via le pont IndexedDB (`BrandingBridge`).
+    notifications: { ...brandingCfg.notifications }
   };
 }
 

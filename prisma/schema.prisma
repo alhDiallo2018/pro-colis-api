@@ -2045,3 +2045,88 @@ model ExpenseCategory {
   @@index([sortOrder])
   @@map("expense_categories")
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Referentiels editables (phase 5 — 2026-11).
+// Quatre nouvelles tables permettent au super-admin d'ajouter/modifier :
+//  - categories de colis (fragile, perissable, electronique...)
+//  - moyens de paiement (wave, orange money, cash...)
+//  - statuts chauffeur (disponible, occupe, en conge...)
+//  - niveaux de severite incidents (low/medium/high/critical avec SLA).
+// Le modele `PaymentMethodOption` est nomme ainsi pour ne pas entrer en
+// collision avec l'enum Prisma `PaymentMethod` existant (encore utilise par
+// les colonnes `parcels.payment_method`). La migration vers la table se fera
+// progressivement cote consommateurs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ParcelCategory {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String   @unique
+  label       String
+  // Emoji ou nom d'icone Material Symbols, pour l'affichage mobile/web.
+  icon        String?
+  maxWeightKg Float?   @map("max_weight_kg")
+  // Indique si la categorie necessite une manutention particuliere.
+  isFragile   Boolean  @default(false) @map("is_fragile")
+  isActive    Boolean  @default(true) @map("is_active")
+  sortOrder   Int      @default(0) @map("sort_order")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([isActive])
+  @@index([sortOrder])
+  @@map("parcel_categories")
+}
+
+model PaymentMethodOption {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  label     String
+  // Prestataire technique ('orange','wave','paydunya','stripe'...), utile
+  // pour l'integration backend (webhook) sans figer la liste des libelles.
+  provider  String?
+  // 'in_app' | 'external' | 'cash' — oriente le flow d'encaissement.
+  channel   String
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([channel])
+  @@index([isActive])
+  @@index([sortOrder])
+  @@map("payment_method_options")
+}
+
+model DriverStatusOption {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  label     String
+  // Code hex pour le badge UI (ex: '#22c55e' pour disponible).
+  color     String?
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([isActive])
+  @@index([sortOrder])
+  @@map("driver_status_options")
+}
+
+model IncidentSeverityLevel {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  label     String
+  color     String?
+  // SLA de reponse en heures (ex: critical=1, high=6, medium=24, low=72).
+  slaHours  Int?     @map("sla_hours")
+  isActive  Boolean  @default(true) @map("is_active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([isActive])
+  @@index([sortOrder])
+  @@map("incident_severity_levels")
+}
