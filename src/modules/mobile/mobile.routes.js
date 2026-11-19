@@ -238,6 +238,7 @@ mobileRouter.get('/public/config', optionalAuthenticate, mobileController.getPub
 // Assistant IA : auth requise pour éviter l'abus (coût LLM par utilisateur).
 mobileRouter.post('/ai/assistant', authenticate, mobileController.aiAssistantAsk);
 mobileRouter.post('/ai/assistant/transcribe', authenticate, mobileController.aiAssistantTranscribe);
+mobileRouter.get('/ai/assistant/config', authenticate, mobileController.aiAssistantGetConfig);
 // Promise-time : créneaux proposés (public, aide à la saisie).
 mobileRouter.get('/parcels/promise-slots', optionalAuthenticate, mobileController.getPromiseSlots);
 // Devis international CEDEAO (public — aide au client avant création colis).

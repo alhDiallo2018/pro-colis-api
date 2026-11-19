@@ -9123,6 +9123,11 @@ export const getPromiseSlots = handle('parcel.promiseSlots', async (req, res) =>
  * mobile. Rate-limit : par utilisateur (une requête à la fois côté app).
  * Pour V1 on ne logge pas les prompts en clair ; on log juste l'action.
  */
+export const aiAssistantGetConfig = handle('ai.assistant.config', async (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  return res.json({ ok: true, data: { configured: isAiAssistantConfigured() } });
+});
+
 export const aiAssistantAsk = handle('ai.assistant.ask', async (req, res) => {
   const message = typeof req.body?.message === 'string' ? req.body.message : '';
   const result = await askAssistant({
