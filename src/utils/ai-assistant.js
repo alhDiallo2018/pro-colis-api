@@ -66,7 +66,7 @@ export function isAiAssistantConfigured() {
  * l'objet parsé (ou null en cas d'erreur). Jamais d'exception vers
  * l'endpoint HTTP — tout échec devient un `answerText` par défaut.
  */
-export async function askAssistant({ userMessage, userContext = {} }) {
+export async function askAssistant({ userMessage, userContext = {}, config = null }) {
   if (!isAiAssistantConfigured()) {
     return {
       intent: 'unknown',
@@ -74,6 +74,15 @@ export async function askAssistant({ userMessage, userContext = {} }) {
       trackingNumber: null,
       answerText:
         "L'assistant IA n'est pas disponible pour le moment. Vous pouvez créer un colis depuis l'onglet « Envoyer »."
+    };
+  }
+  if (config && config.enabled === false) {
+    return {
+      intent: 'unknown',
+      draft: null,
+      trackingNumber: null,
+      answerText:
+        "L'assistant IA est temporairement désactivé. Réessayez plus tard ou créez un colis depuis l'onglet « Envoyer »."
     };
   }
   if (typeof userMessage !== 'string' || userMessage.trim().length === 0) {
@@ -85,13 +94,18 @@ export async function askAssistant({ userMessage, userContext = {} }) {
     };
   }
 
+  const maxPromptChars = config?.maxPromptChars ?? MAX_PROMPT_CHARS;
+  const maxOutputTokens = config?.maxOutputTokens ?? MAX_OUTPUT_TOKENS;
+  const systemPrompt = config?.systemPrompt ?? SYSTEM_PROMPT;
+  const model = config?.model ?? process.env.ANTHROPIC_MODEL ?? DEFAULT_MODEL;
+
   // Tronque les prompts abusifs (prompt-injection volumineux, coût).
-  const trimmed = userMessage.trim().slice(0, MAX_PROMPT_CHARS);
+  const trimmed = userMessage.trim().slice(0, maxPromptChars);
 
   const payload = {
-    model: process.env.ANTHROPIC_MODEL || DEFAULT_MODEL,
-    max_tokens: MAX_OUTPUT_TOKENS,
-    system: SYSTEM_PROMPT,
+    model,
+    max_tokens: maxOutputTokens,
+    system: systemPrompt,
     messages: [
       {
         role: 'user',

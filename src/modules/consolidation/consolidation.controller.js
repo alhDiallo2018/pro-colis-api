@@ -15,12 +15,8 @@
 import { prisma } from '../../config/prisma.js';
 import { logger } from '../../config/logger.js';
 import { matchCompatibleParcels } from '../../utils/consolidation-matcher.js';
+import { readConsolidationConfig } from '../../utils/consolidation-config.js';
 import { NotFoundError, ForbiddenError } from '../../utils/errors.js';
-
-const PARCEL_LOOKBACK_DAYS = 14;
-const PARCEL_LIMIT = 100;
-const REJECTED_PREVIEW_LIMIT = 20;
-const ADOPTABLE_STATUSES = ['pending', 'free'];
 
 function toNumber(decimalLike) {
   if (decimalLike === null || decimalLike === undefined) return null;
@@ -44,6 +40,7 @@ function zoneToPoint(zone) {
 export async function listBackhaulMatches(req, res, next) {
   try {
     const { advertisementId } = req.params;
+    const config = await readConsolidationConfig();
 
     const advertisement = await prisma.advertisement.findUnique({
       where: { id: advertisementId },
@@ -88,10 +85,10 @@ export async function listBackhaulMatches(req, res, next) {
       remainingWeightKg
     };
 
-    const since = new Date(Date.now() - PARCEL_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+    const since = new Date(Date.now() - config.parcelLookbackDays * 24 * 60 * 60 * 1000);
     const rawParcels = await prisma.parcel.findMany({
       where: {
-        status: { in: ADOPTABLE_STATUSES },
+        status: { in: config.adoptableStatuses },
         createdAt: { gte: since },
         deletedAt: null
       },
@@ -100,7 +97,7 @@ export async function listBackhaulMatches(req, res, next) {
         arrivalZone: true
       },
       orderBy: { createdAt: 'desc' },
-      take: PARCEL_LIMIT
+      take: config.parcelLimit
     });
 
     const parcels = rawParcels.map((p) => ({
@@ -116,12 +113,12 @@ export async function listBackhaulMatches(req, res, next) {
       createdAt: p.createdAt
     }));
 
-    const results = matchCompatibleParcels({ trip, parcels });
+    const results = matchCompatibleParcels({ trip, parcels }, { config: config.matcher });
 
     const matches = results
       .filter((r) => r.compatible)
       .sort((a, b) => b.score - a.score);
-    const rejected = results.filter((r) => !r.compatible).slice(0, REJECTED_PREVIEW_LIMIT);
+    const rejected = results.filter((r) => !r.compatible).slice(0, config.rejectedPreviewLimit);
 
     return res.json({
       ok: true,

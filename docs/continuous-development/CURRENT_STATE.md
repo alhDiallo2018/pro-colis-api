@@ -1,6 +1,6 @@
 # État réel du projet
 
-Dernière mise à jour : 2026-11-11.
+Dernière mise à jour : 2026-11-19 (Assistant IA feature flag, consolidation backhaul, fraude admin ; tous les knobs de policy externalisés via `ai.*` / `consolidation.*` / `fraud.*` dans SystemConfig).
 
 ## Opérationnel & testé
 
@@ -35,10 +35,10 @@ Total tests : **299 verts** (230 backend + 69 mobile) à la clôture de la sessi
 | Expédition groupée | `ShipmentBatch` opérationnel : table `shipment_batches` + `Parcel.batchId` nullable, CRUD complet (create / attach / detach / close / get / list), status workflow `draft → open → closed/cancelled`, totaux recalculés auto. 6 endpoints sous `/shipment-batches`. | UI dédiée (dashboard shipper B2B), facturation consolidée, export CSV du lot |
 | Géofencing | Détecteur `stop-arrival-detector` branché dans `updateJourneyLive`, événements persistés dans `journey_stop_events`, endpoint `GET /advertisements/:id/reached-stops`, **notifications auto FCM + WhatsApp (opt-in) aux destinataires dont dropOffStop est atteint**. | Webhook partenaires sur `stop_reached` (API externe) |
 | International | Pricing CEDEAO + assurance + **`parcel_customs` (SCP-040) : déclaration douanière signée immuable** + **`international-carriers.js` (SCP-041) : abstraction + 2 stubs (DHL-like + economy)** + endpoint `GET /parcels/:id/international-offers` | Intégrations API réelles DHL/FedEx/UPS (contrats) |
-| Consolidation backhaul | `consolidation-matcher.js` service pur | Endpoints + persistance |
+| Consolidation backhaul | `consolidation-matcher.js` service pur + endpoint `GET /drivers/backhaul-matches/:advertisementId` (livré 2026-11-19, RBAC driver+shuttle_operator, capacité restante calculée via offres acceptées) | — (UI client/driver à construire si besoin terrain) |
 | Optimisation tournée | `src/utils/tour-optimizer.js` + endpoint `POST /advertisements/:id/optimize-route` (`advertisementOptimizeRoute`). Utilise `arrivalZone.latitude/longitude` comme coord destinataire + `departureZone` (ou `JourneyLive` ou premier arrêt) comme origine. | — |
 | Géofence (lib partagée) | `src/utils/geofence.js` : haversineMeters, effectiveStopRadiusMeters, isWithinStop. Utilisée par stop-arrival-detector. | — |
-| Fraude | `fraud-scoring.js` service pur | Branche admin + alertes |
+| Fraude | `fraud-scoring.js` service pur + modèle `FraudAlert` (migration `20261124_fraud_alerts`) + module `src/modules/fraud/` (4 endpoints super_admin : scores live, alertes ouvertes/résolues, resolve, refresh). Web : 5ᵉ tab « Fraude » dans `/admin/operations`. Livré 2026-11-19. | — (UI mobile super_admin volontairement non livrée — desktop-first) |
 
 ## Absent
 

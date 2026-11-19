@@ -24,6 +24,7 @@
  * bloc.
  */
 import { scoreFraud } from '../../utils/fraud-scoring.js';
+import { readFraudConfig } from '../../utils/fraud-config.js';
 
 const DAY_MS = 24 * 3600 * 1000;
 
@@ -126,7 +127,8 @@ export async function buildSignalsForUser(prisma, userId) {
     distinctDevices,
   };
 
-  const result = scoreFraud(signals, { now });
+  const { scoringConfig } = await readFraudConfig();
+  const result = scoreFraud(signals, { now, config: scoringConfig });
   return { user, signals, result };
 }
 
@@ -165,7 +167,8 @@ async function findActiveUserIds(prisma, since) {
  * `resolvedAt IS NULL` (≤ 1 alerte ouverte par user à tout instant).
  */
 export async function refreshFraudAlerts(prisma, { now = new Date() } = {}) {
-  const since = new Date(now.getTime() - 30 * DAY_MS);
+  const { activeLookbackDays } = await readFraudConfig();
+  const since = new Date(now.getTime() - activeLookbackDays * DAY_MS);
   const userIds = await findActiveUserIds(prisma, since);
 
   let scanned = 0;

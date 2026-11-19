@@ -28,6 +28,9 @@ import {
   countWhatsAppStatuses
 } from '../../utils/whatsapp-journal.js';
 import { askAssistant, isAiAssistantConfigured } from '../../utils/ai-assistant.js';
+import { readAiAssistantConfig, invalidateAiAssistantConfigCache } from '../../utils/ai-assistant-config.js';
+import { invalidateConsolidationConfigCache } from '../../utils/consolidation-config.js';
+import { invalidateFraudConfigCache } from '../../utils/fraud-config.js';
 import { scoreBids } from '../../utils/driver-scoring.js';
 import { readDriverScoringConfig } from '../../utils/driver-scoring-config.js';
 import { computePromiseSlots } from '../../utils/promise-time.js';
@@ -9125,21 +9128,27 @@ export const getPromiseSlots = handle('parcel.promiseSlots', async (req, res) =>
  */
 export const aiAssistantGetConfig = handle('ai.assistant.config', async (_req, res) => {
   res.set('Cache-Control', 'no-store');
-  return res.json({ ok: true, data: { configured: isAiAssistantConfigured() } });
+  const config = await readAiAssistantConfig();
+  return res.json({
+    ok: true,
+    data: { configured: isAiAssistantConfigured() && config.enabled }
+  });
 });
 
 export const aiAssistantAsk = handle('ai.assistant.ask', async (req, res) => {
   const message = typeof req.body?.message === 'string' ? req.body.message : '';
+  const config = await readAiAssistantConfig();
   const result = await askAssistant({
     userMessage: message,
     userContext: {
       city: typeof req.body?.city === 'string' ? req.body.city : undefined
-    }
+    },
+    config
   });
   res.set('Cache-Control', 'no-store');
   return ok(res, {
     message: 'Reponse assistant',
-    data: { result, configured: isAiAssistantConfigured() }
+    data: { result, configured: isAiAssistantConfigured() && config.enabled }
   });
 });
 
@@ -9203,6 +9212,14 @@ export const updateSystemConfig = handle('super.configUpdate', async (req, res) 
       create: { key, value, updatedBy: req.user.id }
     });
   }
+
+  // Invalidation ciblée des caches des readers impactés : le TTL est de 10 s
+  // mais un super-admin qui vient de modifier une valeur doit voir l'effet
+  // immédiatement sur le prochain appel.
+  const touchedPrefixes = new Set(entries.map(([key]) => key.split('.')[0]));
+  if (touchedPrefixes.has('ai')) invalidateAiAssistantConfigCache();
+  if (touchedPrefixes.has('consolidation')) invalidateConsolidationConfigCache();
+  if (touchedPrefixes.has('fraud')) invalidateFraudConfigCache();
 
   return ok(res, { message: 'Configuration mise a jour' });
 });
