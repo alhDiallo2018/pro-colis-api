@@ -284,10 +284,23 @@ export function resolveCancellationRule({ config, parcel, actorRole, reason, req
  */
 export function selectableCancellationReasons(config, actorRole) {
   const reasons = Array.isArray(config?.reasons) ? config.reasons : [];
-  if (isStaffRole(actorRole)) return reasons.map((r) => ({ value: r.value, label: r.label }));
+  // Expose un `scope` dérivé de `responsibility` ('client'→client,
+  // 'driver'→driver, 'shared'→both) pour que le front puisse filtrer les
+  // motifs qui concernent réellement le rôle du viewer. Les règles financières
+  // restent côté serveur ; le scope est purement un indice d'affichage.
+  const mapReason = (r) => ({
+    value: r.value,
+    label: r.label,
+    scope: r.responsibility === 'client'
+      ? 'client'
+      : r.responsibility === 'driver'
+        ? 'driver'
+        : 'both'
+  });
+  if (isStaffRole(actorRole)) return reasons.map(mapReason);
   return reasons
     .filter((r) => !r.exempt && r.responsibility !== 'exempt')
-    .map((r) => ({ value: r.value, label: r.label }));
+    .map(mapReason);
 }
 
 /**

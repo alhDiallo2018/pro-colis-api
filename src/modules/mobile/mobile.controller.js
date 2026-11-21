@@ -8275,11 +8275,27 @@ async function readPublicConfig() {
       faqs: listValue('help.faqs', []),
       guides: listValue('help.guides', []).filter(g => g?.published === true && ['fr', 'wo'].includes(g.language) && typeof g.title === 'string' && typeof g.text === 'string').map(g => ({ id: String(g.id ?? ''), language: g.language, title: g.title, text: g.text, audioUrl: typeof g.audioUrl === 'string' && (/^https:\/\//.test(g.audioUrl) || g.audioUrl.startsWith('/api/v1/public/help-audio/')) ? g.audioUrl : null }))
     },
-    // Motifs d'annulation (value/label uniquement) : les règles financières
-    // restent côté serveur, seul le libellé est exposé pour l'affichage.
+    // Motifs d'annulation : value/label + scope (client / driver / both) pour
+    // que le client/chauffeur ne voie que les motifs qui le concernent. Les
+    // règles financières (pénalité, exemption) restent côté serveur ; le scope
+    // dérive de `responsibility` ('client'→client, 'driver'→driver, 'shared'→
+    // both). Les motifs `exempt` (staff only) sont retirés — `/public/config`
+    // est consommé par client + driver, jamais par le support.
     cancellation: {
       reasons: listValue('cancellation.reasons', [])
-        .map((r) => ({ value: String(r?.value ?? '').trim(), label: String(r?.label ?? r?.value ?? '').trim() }))
+        .filter((r) => r?.responsibility !== 'exempt' && r?.exempt !== true)
+        .map((r) => {
+          const scopeFromResp = r?.responsibility === 'client'
+            ? 'client'
+            : r?.responsibility === 'driver'
+              ? 'driver'
+              : 'both';
+          return {
+            value: String(r?.value ?? '').trim(),
+            label: String(r?.label ?? r?.value ?? '').trim(),
+            scope: scopeFromResp
+          };
+        })
         .filter((r) => r.value && r.label)
     },
     // Identité légale configurée par l'administrateur. Les champs vides sont
