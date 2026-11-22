@@ -76,8 +76,8 @@ import urllib.request
 BASE = Path('/home/debian/procolis')
 API = BASE / 'SendProColis-Api'
 WEB = BASE / 'SendProColis-Web'
-REVISIONS = {API: '49f0b2a3bd7c3b5d4c5e6a25d7152384f4e511e5',
-             WEB: 'fc2150fcd2840fa665dedc1bc49e3c0a649e4690'}
+REVISIONS = {API: '1e6168d52e0f14d5f7688d3e55e3e64cb6c2565f',
+             WEB: '0dac364b1358d7ec920217108f7d40712c740c9b'}
 CLIENT = '856894814285-liup8k5nqvth5f10h2bcnd82obc4v5vi.apps.googleusercontent.com'
 STATE = Path('/var/lib/procolis-deploy')
 RUNTIME = Path('/etc/procolis/deployment-runtime.json')
@@ -432,8 +432,8 @@ import sys
 
 STATE = Path('/var/lib/procolis-deploy')
 BASE = Path('/home/debian/procolis')
-REVISIONS = {'SendProColis-Api': '49f0b2a3bd7c3b5d4c5e6a25d7152384f4e511e5',
-             'SendProColis-Web': 'fc2150fcd2840fa665dedc1bc49e3c0a649e4690'}
+REVISIONS = {'SendProColis-Api': '1e6168d52e0f14d5f7688d3e55e3e64cb6c2565f',
+             'SendProColis-Web': '0dac364b1358d7ec920217108f7d40712c740c9b'}
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8'}
 
 
