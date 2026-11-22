@@ -117,7 +117,7 @@ def trusted_tree(repo, debian_uid):
     # modifiables par un tiers qui pourraient detourner les entrees de build.
     for current, directories, files in os.walk(repo, followlinks=False):
         if Path(current) == repo:
-            excluded = {'.git', 'node_modules'} | ({'uploads', 'backups'} if repo == API else set())
+            excluded = {'.git', 'node_modules'} | ({'uploads', 'backups', 'data'} if repo == API else set())
             directories[:] = [name for name in directories if name not in excluded]
         for path in [Path(current), *(Path(current) / name for name in directories + files)]:
             info = path.lstat()
@@ -128,7 +128,11 @@ def trusted_tree(repo, debian_uid):
 
 def validate_config(config):
     """Limiter Docker aux deux services et volumes connus ; aucun acces hote."""
-    for name, container, targets in [('api', 'sendprocolis-api', {'/app/uploads'}),
+    # Bind mount en lecture seule pour exposer les artefacts transit scrappes
+    # (data/ est gitignore, genere par scripts/transit/scrape.mjs). Source figee
+    # au chemin absolu du repo API jumeau pour empecher tout detournement.
+    api_bind = {'source': str(API / 'data'), 'target': '/app/data'}
+    for name, container, targets in [('api', 'sendprocolis-api', {'/app/uploads', '/app/data'}),
                                       ('caddy', 'sendprocolis-caddy', {'/data', '/config'})]:
         service = config['services'][name]
         if service.get('container_name') != container:
@@ -142,6 +146,10 @@ def validate_config(config):
             raise RuntimeError('Reseaux inattendus.')
         expected_sources = {'api-uploads': '/app/uploads'} if name == 'api' else {'caddy-data': '/data', 'caddy-config': '/config'}
         for volume in service.get('volumes', []):
+            if name == 'api' and volume.get('type') == 'bind' and volume.get('target') == api_bind['target']:
+                if volume.get('source') != api_bind['source']:
+                    raise RuntimeError('Source bind inattendue pour ' + api_bind['target'])
+                continue
             if volume.get('type') != 'volume' or volume.get('target') not in targets:
                 raise RuntimeError('Montage Docker non autorise.')
             if expected_sources.get(volume.get('source')) != volume.get('target'):
