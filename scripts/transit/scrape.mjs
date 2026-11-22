@@ -30,43 +30,87 @@ async function fetchCached(url, cacheName) {
 // ─────────────────────────────────────────────────────────────────────────────
 // DDD : page unique avec accordéons. Chaque LIGNE = titre + bloc de <div>stop</div>.
 export function parseDddSection(html, kind = 'urban') {
-  // Deux passes indépendantes : (1) titres, (2) contenus. Appariement par ordre d'apparition,
-  // car id tab-title et id tab-content partagent le même suffixe numérique.
   const items = [];
-  // Les titres contiennent du texte avec `<-->` : on autorise `<` dans la capture.
-  const titles = [...html.matchAll(/<a class="elementor-accordion-title"[^>]*>(.*?)<\/a>/g)]
-    .map(m => decode(m[1]).trim());
-  // Le contenu est enveloppé de 3 `</div>` à fermer (outer tab-content > wrapper > last stop).
-  const contents = [...html.matchAll(/<div[^>]*id="elementor-tab-content-\d+"[^>]*>([\s\S]*?<\/div>)\s*<\/div>\s*<\/div>/g)]
-    .map(m => m[1]);
-  const n = Math.min(titles.length, contents.length);
-  for (let i = 0; i < n; i++) {
-    const match = titles[i].match(/LIGNE\s+([0-9A-Z]+)\s*:\s*(.+?)\s*<-+>\s*(.+)/i);
-    if (!match) continue;
-    const [, number, from, to] = match;
-    const stops = [...contents[i].matchAll(/<div>([^<]+)<\/div>/g)]
-      .map(s => decode(s[1]).replace(/^[\s–\-]+/, '').trim())
-      .filter(s => s.length > 1 && s.length < 120);
+
+  // Les marqueurs Elementor déterminent les sections réelles.
+  const markers = [...html.matchAll(
+    /<span[^>]*class="[^"]*elementor-alert-title[^"]*"[^>]*>(.*?)<\/span>/gi
+  )];
+
+  let urbanPos = -1;
+  let suburbanPos = -1;
+
+  for (const marker of markers) {
+    const label = decode(marker[1]).trim().toUpperCase();
+    if (label === 'LIGNES URBAINES') urbanPos = marker.index;
+    if (label === 'LIGNES BANLIEUE') suburbanPos = marker.index;
+  }
+
+  // Index des contenus par identifiant Elementor.
+  const contents = new Map();
+  const contentRe =
+    /<div[^>]*id="elementor-tab-content-(\d+)"[^>]*>([\s\S]*?<\/div>)\s*<\/div>\s*<\/div>/gi;
+
+  for (const m of html.matchAll(contentRe)) {
+    contents.set(m[1], m[2]);
+  }
+
+  // Chaque titre est associé uniquement au contenu portant le même ID.
+  const titleRe =
+    /<div[^>]*id="elementor-tab-title-(\d+)"[^>]*>([\s\S]*?)<\/div>/gi;
+
+  for (const m of html.matchAll(titleRe)) {
+    const id = m[1];
+    const titleBlock = m[2];
+    const titleMatch = titleBlock.match(
+      /<a[^>]*class="[^"]*elementor-accordion-title[^"]*"[^>]*>(.*?)<\/a>/i
+    );
+    if (!titleMatch) continue;
+
+    const title = decode(titleMatch[1]).trim();
+    const lineMatch = title.match(
+      /LIGNE\s+([0-9A-Z]+)\s*:\s*(.+?)\s*<-+>\s*(.+)/i
+    );
+    if (!lineMatch) continue;
+
+    const content = contents.get(id);
+    if (!content) continue;
+
+    const stops = [...content.matchAll(/<div>([^<]+)<\/div>/g)]
+      .map(x => decode(x[1]).replace(/^[\s–\-]+/, '').trim())
+      .filter(x => x.length > 1 && x.length < 120);
+
     if (stops.length < 2) continue;
+
+    let lineKind = kind;
+    if (kind === null && urbanPos >= 0 && suburbanPos >= 0) {
+      lineKind = m.index > suburbanPos ? 'suburban' : 'urban';
+    }
+
+    const [, number, from, to] = lineMatch;
     items.push({
       operator: 'DDD',
-      kind,
+      kind: lineKind ?? 'urban',
       number: number.trim(),
       origin: from.trim(),
       destination: to.trim(),
       stops,
       source: 'https://demdikk.sn/reseau-urbain-dakar/',
+      sourceRef: `elementor-tab-${id}`,
     });
   }
+
   return items;
 }
 
 async function scrapeDdd() {
-  const html = await fetchCached('https://demdikk.sn/reseau-urbain-dakar/', 'ddd-main.html');
-  // Le document a deux sections (urbain / banlieue). On les parse ensemble puis on marque.
-  // La séparation visuelle "LIGNES BANLIEUE" dans le markup n'est pas structurelle,
-  // on marque comme "urban" par défaut, l'opérateur ne distingue pas dans la BDD.
-  return parseDddSection(html, 'urban');
+  const html = await fetchCached(
+    'https://demdikk.sn/reseau-urbain-dakar/',
+    'ddd-main.html'
+  );
+
+  // null active la classification par marqueurs HTML.
+  return parseDddSection(html, null);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,31 +136,90 @@ async function scrapeAftu() {
 }
 
 export function parseAftuLine(html, number, kind = 'urban', url = '') {
-  // 1) Start / finish : extraits du GeoJSON embarqué dans load_json(...).
   const geoMatch = html.match(/load_json\(\s*(\{[\s\S]*?\})\s*\);/);
-  let start = null, finish = null;
+
+  let start = null;
+  let finish = null;
+  const pointFeatures = [];
+
   if (geoMatch) {
     try {
       const geo = JSON.parse(geoMatch[1]);
+
       for (const f of geo.features ?? []) {
-        if (f.properties?.type === 'start') {
-          start = { name: f.properties.title, lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] };
-        } else if (f.properties?.type === 'finish') {
-          finish = { name: f.properties.title, lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] };
-        }
+        if (f.geometry?.type !== 'Point') continue;
+
+        const props = f.properties ?? {};
+        const coords = f.geometry.coordinates ?? [];
+        if (
+          coords.length < 2 ||
+          !Number.isFinite(coords[0]) ||
+          !Number.isFinite(coords[1])
+        ) continue;
+
+        const point = {
+          name: props.title?.trim() || null,
+          lat: coords[1],
+          lng: coords[0],
+          type: props.type,
+        };
+
+        pointFeatures.push(point);
+
+        if (props.type === 'start' && !start) start = point;
+        if (props.type === 'finish') finish = point;
       }
     } catch {}
   }
-  // 2) Itinéraire texte : liste des rues/repères entre terminus.
-  const itiMatch = html.match(/<strong>ITINERAIRE<\/strong><\/p>\s*<p>([\s\S]*?)<\/p>/i);
-  const route = itiMatch ? decode(itiMatch[1]).replace(/<[^>]+>/g, '').trim() : '';
-  const landmarks = route
-    .split(/\s*[-–]\s*/)
-    .map(s => s.trim())
-    .filter(s => s.length > 1 && s.length < 120);
 
-  if (!start || !finish || landmarks.length < 2) return null;
-  const stops = [start.name, ...landmarks.slice(1, -1), finish.name];
+  let inferredFinish = false;
+
+  // Certaines pages AFTU typent par erreur le second terminus "start".
+  if (
+    !finish &&
+    pointFeatures.length === 2 &&
+    pointFeatures[0].type === 'start' &&
+    pointFeatures[1].type === 'start' &&
+    pointFeatures[0].name !== pointFeatures[1].name
+  ) {
+    finish = pointFeatures[1];
+    inferredFinish = true;
+  }
+
+  const itiMatch = html.match(
+    /<strong>ITINERAIRE<\/strong><\/p>\s*<p>([\s\S]*?)<\/p>/i
+  );
+
+  const route = itiMatch
+    ? decode(itiMatch[1]).replace(/<[^>]+>/g, '').trim()
+    : '';
+
+  const landmarks = route
+    ? route.split(/\s*–\s*|\s+-\s+/)
+        .map(x => x.trim())
+        .filter(x => x.length > 1 && x.length < 120)
+    : [];
+
+  // Certaines pages AFTU ont un point de départ sans titre.
+  // On récupère son nom depuis le premier arrêt de l'itinéraire.
+  if (start && !start.name && landmarks.length >= 2) {
+    start.name = landmarks[0];
+  }
+
+  if (!start || !finish || !start.name || !finish.name) return null;
+
+  const stops = landmarks.length >= 2
+    ? [start.name, ...landmarks.slice(1, -1), finish.name]
+    : [start.name, finish.name];
+
+  const warnings = [];
+  if (!route || landmarks.length < 2) {
+    warnings.push('missing_text_itinerary');
+  }
+  if (inferredFinish) {
+    warnings.push('finish_inferred_from_second_start_point');
+  }
+
   return {
     operator: 'AFTU',
     kind,
@@ -127,6 +230,8 @@ export function parseAftuLine(html, number, kind = 'urban', url = '') {
     startCoords: { lat: start.lat, lng: start.lng },
     finishCoords: { lat: finish.lat, lng: finish.lng },
     source: url,
+    extractionStatus: warnings.length ? 'partial' : 'complete',
+    warnings,
   };
 }
 
