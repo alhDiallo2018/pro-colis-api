@@ -2,7 +2,7 @@
 
 La cle SSH dediee et le compte `procolis-ops` servent aux interventions depuis
 le poste operateur. L'outil `procolis-ops` installe dans `/usr/local/sbin` fournit
-cinq diagnostics fixes via sudo, sans joker ni arguments supplementaires :
+six diagnostics fixes via sudo, sans joker ni arguments supplementaires :
 
 - `status` : etat des quatre conteneurs ProColis connus, images et labels Compose.
 - `routing` : reseaux, alias et resolution de `api` depuis le conteneur Caddy.
@@ -14,6 +14,11 @@ cinq diagnostics fixes via sudo, sans joker ni arguments supplementaires :
   Compare aussi la configuration effective des deux API : presence et egalite
   des secrets JWT, URL de base et delais de session, sans afficher leurs valeurs
   ni leurs empreintes. Les empreintes HMAC temporaires restent internes au diagnostic sur le VPS.
+- `sysdiag` : lecture seule du service fail2ban (actif + jails connues, sans IP),
+  parefeu (`ufw status verbose` et `nft list ruleset`), mises a jour en attente
+  (`/usr/lib/update-notifier/apt-check --human-readable`, sans toucher a apt),
+  uptime, trois derniers redemarrages, disque racine et memoire. Sorties bornees
+  a 4 Ko/1 Ko. Un binaire absent produit `available: false` sans arret.
 
 Le script utilise un interpreteur Python isole, des executables et des cibles
 fixes, un environnement minimal et le dossier courant `/`. Il ne lance aucun
@@ -218,3 +223,74 @@ repetition Git sur les bundles reels API/web et le patch web du VPS, puis
 installation neuve et mise a jour dans un conteneur Debian Bookworm. Les appels
 sudo non autorises et les arguments supplementaires sont refuses pendant le
 test Debian. Ces controles ne remplacent pas la verification de production.
+
+
+## Acces operateur additionnel : sas d'entree SSH
+
+> Documentation operateur complete : [`../../docs/infra/acces-vps-claude.md`](../../docs/infra/acces-vps-claude.md)
+> et section 19 du runbook HTML [`../../docs/infra/guide-deploiement-postgresql-natif.html#acces-claude`](../../docs/infra/guide-deploiement-postgresql-natif.html).
+
+Pour qu'un deuxieme operateur (par exemple un assistant pilote par un humain
+depuis son poste) partage le compte `procolis-ops` sans recevoir de shell libre,
+le sas `/usr/local/sbin/procolis-ops-entry` est ajoute. Il ne confere aucun droit
+sudo propre : il lit `SSH_ORIGINAL_COMMAND`, valide un verbe exact parmi
+`status`, `routing`, `health`, `logs`, `deployment-info`, `sysdiag`, `deploy`,
+`deploy-report`, et appelle la commande sudo correspondante deja autorisee.
+Aucun argument additionnel n'est accepte ; un verbe inconnu produit le code 2
+et aucune commande.
+
+Installation depuis la session administrateur, apres `install-procolis-ops.sh` et
+`install-procolis-deploy.sh` (ou leurs mises a jour) :
+
+```sh
+# Copier l'installateur recu dans /root, verifier son SHA-256, puis :
+sudo bash /root/install-procolis-ops-entry.sh
+```
+
+L'installateur refuse de remplacer une version existante, controle que
+`procolis-ops` est deja installe, valide la syntaxe Python du sas et met le
+fichier en place atomiquement en `root:root 0555`. Il ne modifie aucun sudoers.
+
+### Enregistrement de la cle publique additionnelle
+
+Depuis la session administrateur, ajouter la cle publique de l'operateur
+additionnel dans `~procolis-ops/.ssh/authorized_keys` avec options strictes :
+
+```
+restrict,permitopen="localhost:3000",permitopen="localhost:9090",permitopen="localhost:3100",from="<IP_OU_CIDR>",command="/usr/local/sbin/procolis-ops-entry" ssh-ed25519 AAAA... claude@sendprocolis-ops <date>
+```
+
+- `restrict` desactive X11, agent, pty et tous les forwardings.
+- Les trois `permitopen` reautorisent uniquement les tunnels locaux Grafana,
+  Prometheus et Loki, pour inspecter les dashboards sans exposer ces services
+  publiquement.
+- `from=` restreint l'origine a l'IP/CIDR de l'operateur. En l'absence d'IP fixe,
+  omettre et conserver fail2ban + unicite de la cle comme garde-fous.
+- `command=` force le passage par le sas ; une connexion sans `SSH_ORIGINAL_COMMAND`
+  valide retourne un refus.
+
+Revocation : retirer la ligne correspondante dans `authorized_keys`. Le sas et
+les sudoers sont conserves pour les autres cles.
+
+Verification cote operateur apres installation :
+
+```sh
+ssh procolis-prod status          # doit renvoyer le JSON des conteneurs
+ssh procolis-prod sysdiag         # doit renvoyer le JSON systeme
+ssh procolis-prod bash            # doit echouer (verbe inconnu, code 2)
+ssh -N -L 3000:localhost:3000 procolis-prod &   # tunnel Grafana
+```
+
+La fiche de deploiement locale `ssh-config` se situe cote operateur, hors de ce
+depot :
+
+```
+Host procolis-prod
+    HostName <IP_OU_FQDN_VPS>
+    User procolis-ops
+    IdentityFile ~/.ssh/claude_sendprocolis_ops
+    IdentitiesOnly yes
+    ServerAliveInterval 30
+    ForwardAgent no
+    ForwardX11 no
+```

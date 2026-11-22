@@ -1,6 +1,11 @@
 # Point d'entrée pour la session suivante
 
 > **Lire d'abord** : ce fichier → `TASK_TRACKER.md` → sections pertinentes de `CURRENT_STATE.md`.
+>
+> **Infra / accès VPS** : [`../../CLAUDE.md`](../../CLAUDE.md) et
+> [`../../docs/infra/acces-vps-claude.md`](../../docs/infra/acces-vps-claude.md)
+> décrivent le modèle d'accès SSH de Claude au VPS (`procolis-prod`, compte
+> `procolis-ops` via sas d'entrée). Ajouté le 2026-11-22.
 
 ## État cumulé (final absolu)
 

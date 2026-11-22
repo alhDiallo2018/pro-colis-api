@@ -905,13 +905,20 @@
                 <li><a href="#incidents"><span>18</span><span>Dépannage</span></a></li>
               </ul>
             </li>
+
+            <li class="nav-group">
+              <div class="nav-group-title">Opérateurs</div>
+              <ul class="nav-sub">
+                <li><a href="#acces-claude"><span>19</span><span>Accès SSH Claude</span></a></li>
+              </ul>
+            </li>
           </ul>
         </nav>
 
         <div class="sidebar-foot">
           Debian · Docker · Caddy<br />
           PostgreSQL 16 · Prisma<br />
-          Révision : 2026-08-01
+          Révision : 2026-11-22
         </div>
       </aside>
 
@@ -2358,6 +2365,182 @@ for (const name of required) {
 }
 '</code></pre>
           </div>
+        </section>
+
+        <section class="section" id="acces-claude">
+          <div class="section-heading">
+            <span class="section-number">19 / OPÉRATEURS</span>
+            <h2>Accès SSH de Claude au VPS</h2>
+          </div>
+          <p class="section-intro">
+            Claude dispose d’un accès SSH restreint au VPS pour auditer, superviser et déployer
+            SendProColis. Aucun shell interactif, aucun droit sudo générique : un sas d’entrée
+            contraint les commandes à une whitelist stricte de huit verbes, tous appelés via les
+            règles sudoers existantes. La procédure détaillée est dans
+            <code>docs/infra/acces-vps-claude.md</code> et le modèle de sécurité commun est dans
+            <code>deploy/operations/README.md</code>.
+          </p>
+
+          <h3>Principes</h3>
+          <ul>
+            <li>Clé ed25519 dédiée, jamais réutilisée ailleurs, chiffrée par
+              <code>-a 100</code> rounds KDF et stockée dans <code>~/.ssh/claude_sendprocolis_ops</code>.</li>
+            <li><code>authorized_keys</code> applique <code>restrict</code>, <code>from=</code>
+              (IP opérateur), <code>permitopen=</code> (Grafana, Prometheus, Loki uniquement)
+              et <code>command="/usr/local/sbin/procolis-ops-entry"</code> pour forcer le sas.</li>
+            <li>Le sas lit <code>SSH_ORIGINAL_COMMAND</code>, refuse tout verbe hors whitelist
+              ou argument additionnel, puis invoque <code>sudo -n</code> (NOSETENV) sur la
+              commande figée correspondante.</li>
+            <li>Chaque helper appartient à <code>root:root</code> en <code>0555</code>, sudoers en
+              <code>0440</code>. Le compte <code>procolis-ops</code> n’a aucun accès en écriture
+              aux sources ni à <code>/home/debian</code> (<code>0700</code>).</li>
+          </ul>
+
+          <h3>Verbes autorisés</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Verbe</th><th>Appel sudo</th><th>Rôle</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>status</code></td>
+                  <td><code>procolis-ops status</code></td>
+                  <td>État Docker des 4 conteneurs (image, health, labels Compose).</td>
+                </tr>
+                <tr>
+                  <td><code>routing</code></td>
+                  <td><code>procolis-ops routing</code></td>
+                  <td>Réseaux et résolution DNS de <code>api</code> depuis Caddy.</td>
+                </tr>
+                <tr>
+                  <td><code>health</code></td>
+                  <td><code>procolis-ops health</code></td>
+                  <td>GET <code>/health</code> sur <code>api:8080</code> depuis Caddy.</td>
+                </tr>
+                <tr>
+                  <td><code>logs</code></td>
+                  <td><code>procolis-ops logs</code></td>
+                  <td>120 dernières lignes, fenêtre 15 min, pour les deux API.</td>
+                </tr>
+                <tr>
+                  <td><code>deployment-info</code></td>
+                  <td><code>procolis-ops deployment-info</code></td>
+                  <td>Révisions Git + config Compose filtrée + comparaison HMAC des configs API.</td>
+                </tr>
+                <tr>
+                  <td><code>sysdiag</code></td>
+                  <td><code>procolis-ops sysdiag</code></td>
+                  <td>fail2ban (sans IP), UFW, nftables, apt pending, uptime, df /, free.</td>
+                </tr>
+                <tr>
+                  <td><code>deploy</code></td>
+                  <td><code>procolis-deploy</code></td>
+                  <td>Déploie la révision whitelistée (confirmation utilisateur toujours requise).</td>
+                </tr>
+                <tr>
+                  <td><code>deploy-report</code></td>
+                  <td><code>procolis-deploy-report</code></td>
+                  <td>Rapport du dernier déploiement (étape, code sortie, revisions, cause).</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Appels côté opérateur</h3>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · diagnostic lecture seule</span></div>
+            <pre><code>ssh procolis-prod status
+ssh procolis-prod routing
+ssh procolis-prod health
+ssh procolis-prod logs
+ssh procolis-prod deployment-info
+ssh procolis-prod sysdiag
+ssh procolis-prod deploy-report</code></pre>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · tunnels observabilité</span></div>
+            <pre><code>ssh -N -L 3000:localhost:3000 procolis-prod   # Grafana
+ssh -N -L 9090:localhost:9090 procolis-prod   # Prometheus
+ssh -N -L 3100:localhost:3100 procolis-prod   # Loki</code></pre>
+          </div>
+
+          <div class="command-block">
+            <div class="command-label"><span>Shell · refus attendus</span></div>
+            <pre><code>ssh procolis-prod bash              # code 2 : verbe inconnu
+ssh procolis-prod 'logs --tail=5'    # code 2 : argument libre refusé</code></pre>
+          </div>
+
+          <h3>Workflow de déploiement</h3>
+          <ol>
+            <li>Claude lit l’état courant via <code>deployment-info</code> et <code>deploy-report</code>.</li>
+            <li>Claude pousse ses changements sur <code>master</code>/<code>main</code>.</li>
+            <li>L’administrateur régénère <code>update-procolis-deploy.sh</code> avec le nouveau
+              SHA whitelist via <code>python3 deploy/operations/build-deployment-installers.py</code>,
+              transfère l’installateur dans <code>/root</code>, vérifie son SHA-256 et l’exécute.</li>
+            <li>Claude demande une confirmation utilisateur explicite dans la conversation avant
+              d’exécuter <code>ssh procolis-prod deploy</code>.</li>
+            <li>Après succès, Claude vérifie via <code>deploy-report</code> puis <code>health</code>.</li>
+          </ol>
+
+          <h3>Hors périmètre Claude</h3>
+          <ul>
+            <li>Shell interactif, <code>sudo</code> libre, <code>docker</code> direct, <code>git push</code> côté VPS.</li>
+            <li>Modification des sources, des sudoers, des images, des <code>.env</code>, du Caddyfile.</li>
+            <li>Ajout d’une nouvelle révision whitelistée pour <code>procolis-deploy</code>
+              (reste à la main de l’administrateur via <code>update-procolis-deploy.sh</code>).</li>
+            <li>Requêtes SQL ad-hoc hors des diagnostics déjà fournis.</li>
+          </ul>
+
+          <h3>Révocation</h3>
+          <div class="command-block">
+            <div class="command-label"><span>Shell · session administrateur VPS</span></div>
+            <pre><code>sudo sed -i.bak '/claude@sendprocolis-ops/d' ~procolis-ops/.ssh/authorized_keys</code></pre>
+          </div>
+          <p>
+            Cette action retire uniquement la clé Claude, sans toucher au sas ni aux sudoers partagés
+            avec les autres opérateurs légitimes. Pour désinstaller le sas lui-même :
+            <code>sudo rm /usr/local/sbin/procolis-ops-entry</code>.
+          </p>
+
+          <h3>Vérifications périodiques</h3>
+          <ul>
+            <li><code>sudo grep procolis-ops /var/log/auth.log | tail -50</code> — chaque commande
+              Claude doit être dans la whitelist.</li>
+            <li><code>sudo sha256sum /usr/local/sbin/procolis-ops{,-entry} /usr/local/sbin/procolis-deploy{,-report}</code>
+              — empreintes conformes à <code>build-deployment-installers.py</code>.</li>
+            <li><code>sudo visudo -c</code> — syntaxe sudoers correcte.</li>
+            <li><code>python3 -m unittest discover -s deploy/operations -p 'test_*.py'</code>
+              après toute modification locale (actuellement 70 tests).</li>
+          </ul>
+
+          <h3>Topologie DB : symétrique entre local et VPS</h3>
+          <p>
+            L’intégralité de ce runbook repose sur une seule règle structurante :
+            <strong>PostgreSQL n’est jamais conteneurisé</strong>. Sur le VPS c’est l’installation
+            APT native (section 07), côté développement c’est l’installation Homebrew de la
+            machine locale. Les containers API s’y connectent via le gateway Docker
+            (<code>172.17.0.1</code>/<code>172.21.0.1</code> en production,
+            <code>host.docker.internal</code> en développement).
+          </p>
+          <p>
+            Un container <code>sendprocolis-postgres:16-alpine</code> peut encore apparaître
+            <em>running</em> dans <code>docker ps</code> sur le VPS : c’est un reliquat antérieur
+            à la bascule vers l’instance native. Les règles UFW
+            (<code>172.17.0.1 5432/tcp ALLOW IN 172.19.0.0/16</code> et équivalents) et la
+            comparaison des sessions via <code>check-database-identity.py</code> prouvent que
+            seul le PostgreSQL de l’hôte sert les requêtes. Le container peut être retiré en
+            session administrateur après confirmation du diagnostic.
+          </p>
+          <p>
+            Côté développement, le fallback <code>host.docker.internal:5433</code> présent
+            dans <code>docker-compose.yml</code> cible une ancienne installation
+            EDB-installer v18 (voir <code>deploy/setup-local-db.sh</code>). Sur les postes
+            actuels utilisant Homebrew <code>postgresql@15</code> sur le port 5432, surcharger
+            <code>DATABASE_URL</code> dans le <code>.env</code> local — le compose ne définit
+            volontairement aucun service <code>postgres</code>.
+          </p>
         </section>
 
         <footer class="footer">

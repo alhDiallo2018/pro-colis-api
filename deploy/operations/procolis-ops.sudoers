@@ -1,3 +1,3 @@
 # Diagnostic uniquement : commandes et arguments exacts, aucun joker.
-Cmnd_Alias PROCOLIS_DIAGNOSTICS = /usr/local/sbin/procolis-ops status, /usr/local/sbin/procolis-ops routing, /usr/local/sbin/procolis-ops health, /usr/local/sbin/procolis-ops logs, /usr/local/sbin/procolis-ops deployment-info
+Cmnd_Alias PROCOLIS_DIAGNOSTICS = /usr/local/sbin/procolis-ops status, /usr/local/sbin/procolis-ops routing, /usr/local/sbin/procolis-ops health, /usr/local/sbin/procolis-ops logs, /usr/local/sbin/procolis-ops deployment-info, /usr/local/sbin/procolis-ops sysdiag
 procolis-ops ALL=(root) NOPASSWD: NOSETENV: PROCOLIS_DIAGNOSTICS

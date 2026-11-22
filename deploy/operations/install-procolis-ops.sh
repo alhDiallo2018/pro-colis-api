@@ -33,6 +33,15 @@ import subprocess
 import sys
 
 DOCKER = '/usr/bin/docker'
+SYSTEMCTL = '/usr/bin/systemctl'
+FAIL2BAN = '/usr/bin/fail2ban-client'
+UFW = '/usr/sbin/ufw'
+NFT = '/usr/sbin/nft'
+APT_CHECK = '/usr/lib/update-notifier/apt-check'
+UPTIME = '/usr/bin/uptime'
+LAST = '/usr/bin/last'
+DF = '/bin/df'
+FREE = '/usr/bin/free'
 API_NAMES = ('sendprocolis-api', 'procolis-node-api')
 CONTAINERS = (*API_NAMES, 'sendprocolis-caddy', 'sendprocolis-postgres')
 PROJECTS = (
@@ -53,7 +62,18 @@ def run(args, optional=False):
 
 
 def containers():
-    return json.loads(run([DOCKER, 'inspect', *CONTAINERS]).stdout)
+    # docker inspect echoue si un conteneur attendu a ete retire (ancien
+    # orphelin nettoye). On tolere ces absences : la commande renvoie les
+    # objets existants sur stdout et des messages d'erreur ligne par ligne
+    # sur stderr avec code non nul. Un JSON vide ou absent est renvoye vide.
+    result = run([DOCKER, 'inspect', *CONTAINERS], optional=True)
+    payload = result.stdout.strip()
+    if not payload:
+        return []
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return []
 
 
 def summary(row):
@@ -189,8 +209,47 @@ def deployment_info():
     return {'projects': projects, 'sessionConfiguration': session_configuration()}
 
 
+def probe(args, timeout=15):
+    # Commandes systeme auxiliaires : binaire eventuellement absent, sortie bornee.
+    # Aucun argument n'est construit a partir du compte operateur ; les chemins
+    # absolus restent fixes. Un binaire manquant produit un diagnostic explicite
+    # plutot qu'une erreur fatale, pour que sysdiag reste utilisable en audit.
+    try:
+        result = subprocess.run(args, cwd='/', env=ENV, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return {'available': False, 'reason': 'binary-missing',
+                'exitCode': None, 'stdout': '', 'stderr': ''}
+    except subprocess.TimeoutExpired:
+        return {'available': False, 'reason': 'timeout',
+                'exitCode': None, 'stdout': '', 'stderr': ''}
+    except OSError:
+        return {'available': False, 'reason': 'os-error',
+                'exitCode': None, 'stdout': '', 'stderr': ''}
+    return {'available': True, 'reason': None, 'exitCode': result.returncode,
+            'stdout': result.stdout[:4000], 'stderr': result.stderr[:1000]}
+
+
+def sysdiag():
+    # Diagnostics systeme en lecture seule : service fail2ban, parefeu, mises a
+    # jour en attente, uptime, dernier redemarrage, disque racine, memoire. Les
+    # listes d'IP bannies ne sont pas demandees ; fail2ban-client status retourne
+    # seulement les jails actives et un decompte. Aucun argument libre.
+    return {
+        'fail2banActive': probe([SYSTEMCTL, 'is-active', 'fail2ban']),
+        'fail2banStatus': probe([FAIL2BAN, 'status']),
+        'ufw': probe([UFW, 'status', 'verbose']),
+        'nftRuleset': probe([NFT, 'list', 'ruleset']),
+        'aptPending': probe([APT_CHECK, '--human-readable']),
+        'uptime': probe([UPTIME]),
+        'lastReboots': probe([LAST, '-F', '-n', '3', 'reboot']),
+        'diskRoot': probe([DF, '-h', '/']),
+        'memory': probe([FREE, '-h']),
+    }
+
+
 ACTIONS = {'status': status, 'routing': routing, 'health': health,
-           'logs': logs, 'deployment-info': deployment_info}
+           'logs': logs, 'deployment-info': deployment_info, 'sysdiag': sysdiag}
 
 
 def main(argv):
@@ -221,7 +280,7 @@ if __name__ == '__main__':
 PROCOLIS_HELPER_EOF
 cat > "$rules_tmp" <<'PROCOLIS_RULES_EOF'
 # Diagnostic uniquement : commandes et arguments exacts, aucun joker.
-Cmnd_Alias PROCOLIS_DIAGNOSTICS = /usr/local/sbin/procolis-ops status, /usr/local/sbin/procolis-ops routing, /usr/local/sbin/procolis-ops health, /usr/local/sbin/procolis-ops logs, /usr/local/sbin/procolis-ops deployment-info
+Cmnd_Alias PROCOLIS_DIAGNOSTICS = /usr/local/sbin/procolis-ops status, /usr/local/sbin/procolis-ops routing, /usr/local/sbin/procolis-ops health, /usr/local/sbin/procolis-ops logs, /usr/local/sbin/procolis-ops deployment-info, /usr/local/sbin/procolis-ops sysdiag
 procolis-ops ALL=(root) NOPASSWD: NOSETENV: PROCOLIS_DIAGNOSTICS
 PROCOLIS_RULES_EOF
 chown root:root "$helper_tmp" "$rules_tmp"
@@ -237,5 +296,5 @@ if ! visudo -c; then
   echo "Validation globale echouee : autorisations retirees." >&2
   exit 1
 fi
-echo "Diagnostics ProColis installes : status, routing, health, logs, deployment-info."
+echo "Diagnostics ProColis installes : status, routing, health, logs, deployment-info, sysdiag."
 echo "Les droits de deploiement et de redemarrage ne sont pas encore accordes."

@@ -65,6 +65,47 @@ class OperationsSecurityTests(unittest.TestCase):
             self.assertIn('/usr/local/sbin/procolis-ops ' + action, rules)
         self.assertIn('NOSETENV:', rules)
 
+    def test_sysdiag_returns_unavailable_for_missing_binary(self):
+        # Un binaire absent produit un diagnostic explicite sans arret du verbe.
+        def missing(*args, **kwargs):
+            raise FileNotFoundError('inexistant')
+        with patch.object(ops.subprocess, 'run', side_effect=missing):
+            result = ops.sysdiag()
+        for probe in result.values():
+            self.assertFalse(probe['available'])
+            self.assertEqual(probe['reason'], 'binary-missing')
+            self.assertEqual(probe['stdout'], '')
+            self.assertEqual(probe['stderr'], '')
+
+    def test_sysdiag_truncates_oversized_output(self):
+        oversized = Mock(returncode=0, stdout='A' * 10000, stderr='B' * 5000)
+        with patch.object(ops.subprocess, 'run', return_value=oversized):
+            result = ops.sysdiag()
+        for probe in result.values():
+            self.assertLessEqual(len(probe['stdout']), 4000)
+            self.assertLessEqual(len(probe['stderr']), 1000)
+
+    def test_sysdiag_timeout_is_bounded(self):
+        # Un probe pendu ne doit pas faire exploser le verbe. Le diagnostic reporte
+        # un timeout sans propager l'exception.
+        def slow(*args, **kwargs):
+            raise ops.subprocess.TimeoutExpired(cmd=args[0], timeout=15)
+        with patch.object(ops.subprocess, 'run', side_effect=slow):
+            result = ops.sysdiag()
+        for probe in result.values():
+            self.assertFalse(probe['available'])
+            self.assertEqual(probe['reason'], 'timeout')
+
+    def test_sysdiag_uses_isolated_environment(self):
+        captured = Mock(returncode=0, stdout='ok', stderr='')
+        with patch.object(ops.subprocess, 'run', return_value=captured) as run:
+            ops.sysdiag()
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs['cwd'], '/')
+            self.assertEqual(call.kwargs['env'], ops.ENV)
+            self.assertNotIn('shell', call.kwargs)
+            self.assertEqual(call.kwargs['stdin'], ops.subprocess.DEVNULL)
+
 
 if __name__ == '__main__':
     unittest.main()

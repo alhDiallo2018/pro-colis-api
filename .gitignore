@@ -19,3 +19,7 @@ docker-compose.override.yml
 # Artefacts regenerables du scraping/geocodage transit (DDD + AFTU).
 # scripts/transit/scrape.mjs + geocode.mjs reconstruisent tout a la demande.
 data/
+
+# Caches Python (helpers deploy/operations testes via unittest).
+__pycache__/
+*.pyc
