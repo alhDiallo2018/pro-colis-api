@@ -237,8 +237,15 @@ def deploy(backup):
                 or labels.get('com.docker.compose.project.working_dir') != str(WEB)):
             raise RuntimeError('Projet Compose actif inattendu.')
         docker('tag', row['Image'], 'procolis-rollback-' + row['Name'].lstrip('/') + ':' + backup.name)
+    api_bind = {'source': str(API / 'data'), 'target': '/app/data'}
     for row in current:
         for mount in row.get('Mounts', []):
+            if (row.get('Name', '').lstrip('/') == 'sendprocolis-api'
+                    and mount.get('Type') == 'bind'
+                    and mount.get('Destination') == api_bind['target']):
+                if mount.get('Source') != api_bind['source']:
+                    raise RuntimeError('Source bind active inattendue pour ' + api_bind['target'])
+                continue
             if mount.get('Type') != 'volume':
                 raise RuntimeError('Montage actif inattendu.')
             volume = json.loads(docker('volume', 'inspect', mount['Name']))[0]
