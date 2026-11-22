@@ -33,7 +33,7 @@ REPORT_PATH = None
 REPORT = {}
 # Le patch du VPS a ete examine : routage/configuration integres aux commits,
 # remplacement npm install inutile depuis la correction du lockfile Linux.
-REVIEWED_WEB_PATCH = '23aa6d9a273b5395d38335d6a5e85c4b5ff6fd53c9b9bef92ff57e3678172268'
+REVIEWED_WEB_PATCH = 'c87edb6f976c76ffabac5ee7543cee4aa07b53a3f8c0374ac21c402676ae39cc'
 
 
 def report(**values):
