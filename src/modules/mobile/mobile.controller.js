@@ -4056,6 +4056,55 @@ export const getDriverWallet = handle('driver.wallet', async (req, res) => {
   });
 });
 
+export const getClientWallet = handle('client.wallet', async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+
+  const wallet = await prisma.wallet.upsert({
+    where: { userId: req.user.id },
+    update: {},
+    create: { userId: req.user.id }
+  });
+
+  const where = { walletUserId: req.user.id };
+  const [total, transactionRows] = await Promise.all([
+    prisma.walletTransaction.count({ where }),
+    prisma.walletTransaction.findMany({
+      where,
+      include: {
+        parcel: { select: { trackingNumber: true } }
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit
+    })
+  ]);
+  const transactions = transactionRows.map(serializeDriverWalletTransaction);
+  const serializedWallet = {
+    id: wallet.userId,
+    userId: wallet.userId,
+    balance: number(wallet.balance),
+    pendingBalance: number(wallet.pendingBalance),
+    totalDeposited: number(wallet.totalDeposited),
+    totalSpent: number(wallet.totalSpent),
+    totalRefunded: number(wallet.totalRefunded),
+    status: wallet.status,
+    lastDepositAt: wallet.lastDepositAt,
+    lastActivityAt: wallet.lastActivityAt,
+    createdAt: wallet.createdAt,
+    updatedAt: wallet.updatedAt,
+    transactions
+  };
+
+  return ok(res, {
+    message: 'Portefeuille',
+    data: {
+      wallet: serializedWallet,
+      transactions
+    },
+    meta: paginationMeta({ page, limit, total })
+  });
+});
+
 export const driverPayWalletDebt = handle('driver.payWalletDebt', async (req, res) => {
   const amount = number(req.body.amount);
 
